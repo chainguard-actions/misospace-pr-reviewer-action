@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v1.2.9 | [`v1.2.9`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.2.9) | [`4126a27`](https://github.com/misospace/pr-reviewer-action/commit/4126a2701a5e9adcf7c48ac6eb678e2e3a2bb2a0) |
+| v1.3.0 | [`v1.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.3.0) | [`3479bf5`](https://github.com/misospace/pr-reviewer-action/commit/3479bf51ab9133414ae07af783bff985d3929884) |
 
 ## Privacy
 
