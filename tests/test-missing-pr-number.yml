@@ -1,0 +1,61 @@
+name: Test missing PR number handling
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Install gh CLI if not already present (act containers may not include it)
+      - name: Install gh CLI if missing
+        run: |
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "gh not found, installing..."
+            type -p curl >/dev/null || (apt-get update && apt-get install curl -y)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            apt-get update
+            apt-get install gh -y
+            echo "gh installed: $(gh --version | head -1)"
+          else
+            echo "gh already present: $(gh --version | head -1)"
+          fi
+
+      # Invoke the action without a pr_number and without a pull_request event context.
+      # The precheck script exits 1 with "Missing REPO or PR_NUMBER for review precheck"
+      # when neither pr_number input nor github.event.pull_request.number is available.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token
+          ai_base_url: http://localhost:11434
+          ai_model: test-model
+          # pr_number intentionally omitted — no pull_request event context either
+
+      # The action must fail because there is no PR number
+      - name: Assert action failed due to missing PR number
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "action outcome: $OUTCOME"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "FAIL: expected action to fail when no PR number is available"
+            exit 1
+          fi
+          echo "PASS: action correctly failed when no PR number was provided"
+
+      # Verify the should_review output is not set to 'true' (no review should run)
+      - name: Assert should_review is not true
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "should_review: '$SHOULD_REVIEW'"
+          if [ "$SHOULD_REVIEW" = "true" ]; then
+            echo "FAIL: should_review should not be 'true' when action failed"
+            exit 1
+          fi
+          echo "PASS: should_review is not 'true' as expected"

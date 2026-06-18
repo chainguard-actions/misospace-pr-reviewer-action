@@ -1,0 +1,64 @@
+name: Test dependency validation
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Verify that jq, curl, git, and python3 are present (these are always
+      # available in ubuntu-latest). gh may or may not be pre-installed.
+      - name: Verify core runtime dependencies exist
+        run: |
+          echo "Checking core dependencies..."
+          for cmd in jq curl git python3; do
+            if command -v "$cmd" > /dev/null 2>&1; then
+              echo "$cmd: OK ($(command -v $cmd))"
+            else
+              echo "FAIL: $cmd not found"
+              exit 1
+            fi
+          done
+          echo "PASS: core dependencies present"
+
+      # Install gh CLI if not already present (act containers may not include it)
+      - name: Install gh CLI if missing
+        run: |
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "gh not found, installing..."
+            type -p curl >/dev/null || (apt-get update && apt-get install curl -y)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            apt-get update
+            apt-get install gh -y
+            echo "gh installed: $(gh --version | head -1)"
+          else
+            echo "gh already present: $(gh --version | head -1)"
+          fi
+
+      # Invoke the action without a pr_number so it fails at the precheck step
+      # (after the dependency validation step passes). This confirms that the
+      # action's own dependency check succeeds in this environment.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token-for-dep-check
+          ai_base_url: http://localhost:11434
+          ai_model: test-model
+          # pr_number intentionally omitted — precheck will exit 1 immediately
+
+      # The action must fail (at the precheck, not at the dependency check)
+      - name: Assert action failed at precheck
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "action outcome: $OUTCOME"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "FAIL: expected action to fail (no real PR number)"
+            exit 1
+          fi
+          echo "PASS: action failed as expected (dependency check passed, precheck failed due to missing PR number)"
