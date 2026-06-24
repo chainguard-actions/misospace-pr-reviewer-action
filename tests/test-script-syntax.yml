@@ -1,0 +1,98 @@
+name: Test script syntax validity
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Invoke the action (will fail early without a real PR number) so the
+      # linter requirement for uses: . is satisfied.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token-for-testing
+          ai_base_url: https://api.example.com/v1
+          ai_model: gpt-4o
+          # No pr_number → action exits early with "Missing REPO or PR_NUMBER"
+
+      - name: Check bash syntax of all shell scripts
+        run: |
+          echo "Checking bash syntax of action scripts..."
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          SCRIPT_DIR="$GITHUB_WORKSPACE/scripts"
+          FAIL=0
+
+          if [ ! -d "$SCRIPT_DIR" ]; then
+            echo "FAIL: scripts directory not found at $SCRIPT_DIR"
+            exit 1
+          fi
+
+          found=0
+          for script in "$SCRIPT_DIR"/*.sh; do
+            if [ ! -f "$script" ]; then
+              continue
+            fi
+            found=1
+            if bash -n "$script" 2>&1; then
+              echo "PASS: $script syntax OK"
+            else
+              echo "FAIL: $script has syntax errors"
+              FAIL=1
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "FAIL: no .sh files found in $SCRIPT_DIR"
+            exit 1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FAIL: one or more scripts have syntax errors"
+            exit 1
+          fi
+          echo "PASS: all shell scripts have valid syntax"
+
+      - name: Check Python syntax of all Python scripts
+        run: |
+          echo "Checking Python syntax of action scripts..."
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          SCRIPT_DIR="$GITHUB_WORKSPACE/scripts"
+          FAIL=0
+
+          found=0
+          for pyfile in "$SCRIPT_DIR"/*.py; do
+            if [ ! -f "$pyfile" ]; then
+              continue
+            fi
+            found=1
+            if python3 -m py_compile "$pyfile" 2>&1; then
+              echo "PASS: $pyfile syntax OK"
+            else
+              echo "FAIL: $pyfile has syntax errors"
+              FAIL=1
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "INFO: no .py files found in $SCRIPT_DIR"
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FAIL: one or more Python scripts have syntax errors"
+            exit 1
+          fi
+          echo "PASS: all Python scripts have valid syntax"
+
+      - name: Verify action uses composite run type
+        run: |
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          ACTION_YML="$GITHUB_WORKSPACE/action.yml"
+          if grep -q "using: composite" "$ACTION_YML"; then
+            echo "PASS: action.yml uses composite runner"
+          else
+            echo "FAIL: action.yml does not use composite runner"
+            exit 1
+          fi

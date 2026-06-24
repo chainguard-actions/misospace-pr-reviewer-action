@@ -1,0 +1,113 @@
+name: Test default input values
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The action requires a real PR number; without one it exits early.
+      # We invoke it with continue-on-error so the static checks below still run.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token-for-testing
+          ai_base_url: https://api.example.com/v1
+          ai_model: gpt-4o
+          # No pr_number → action exits early with "Missing REPO or PR_NUMBER"
+
+      - name: Locate action.yml
+        id: locate
+        run: |
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          # action.yml is at the root of the action directory.
+          if [ -f "$GITHUB_WORKSPACE/action.yml" ]; then
+            echo "action_yml=$GITHUB_WORKSPACE/action.yml" >> "$GITHUB_OUTPUT"
+            echo "Found action.yml at $GITHUB_WORKSPACE/action.yml"
+          else
+            echo "FAIL: action.yml not found at $GITHUB_WORKSPACE/action.yml"
+            exit 1
+          fi
+
+      - name: Verify default input values in action.yml
+        run: |
+          ACTION_YML="${{ steps.locate.outputs.action_yml }}"
+          echo "Verifying default input values in $ACTION_YML..."
+
+          check_default() {
+            local input_name="$1"
+            local expected="$2"
+            # Extract the default value for the given input using awk
+            local actual
+            actual=$(awk "
+              /^  ${input_name}:/ { found=1; next }
+              found && /^    default:/ {
+                sub(/^    default: */, \"\")
+                gsub(/^[\"']|[\"']\$/, \"\")
+                print
+                found=0
+                next
+              }
+              found && /^  [a-z]/ { found=0 }
+            " "$ACTION_YML" | head -1)
+            if [ "$actual" = "$expected" ]; then
+              echo "PASS: ${input_name} default='${actual}'"
+            else
+              echo "FAIL: ${input_name} expected='${expected}' actual='${actual}'"
+              return 1
+            fi
+          }
+
+          FAIL=0
+          check_default "ai_api_format" "openai" || FAIL=1
+          check_default "ai_max_tokens" "8192" || FAIL=1
+          check_default "publish_mode" "comment" || FAIL=1
+          check_default "allow_approve" "false" || FAIL=1
+          check_default "approve_forks" "false" || FAIL=1
+          check_default "tool_mode" "off" || FAIL=1
+          check_default "review_scope" "auto" || FAIL=1
+          check_default "verdict_policy" "model" || FAIL=1
+          check_default "on_model_failure" "fail" || FAIL=1
+          check_default "platform" "auto" || FAIL=1
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FAIL: one or more default values did not match"
+            exit 1
+          fi
+          echo "PASS: all checked default input values are correct"
+
+      - name: Verify required inputs are declared
+        run: |
+          ACTION_YML="${{ steps.locate.outputs.action_yml }}"
+          FAIL=0
+          for input in github_token ai_base_url ai_model; do
+            if grep -q "^  ${input}:" "$ACTION_YML"; then
+              echo "PASS: required input '${input}' found in action.yml"
+            else
+              echo "FAIL: required input '${input}' not found in action.yml"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "PASS: all required inputs are declared"
+
+      - name: Verify outputs are declared
+        run: |
+          ACTION_YML="${{ steps.locate.outputs.action_yml }}"
+          FAIL=0
+          for output in verdict should_review diff_fingerprint review_markdown analysis_engine; do
+            if grep -q "^  ${output}:" "$ACTION_YML"; then
+              echo "PASS: output '${output}' declared"
+            else
+              echo "FAIL: output '${output}' not declared"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "PASS: all expected outputs are declared"

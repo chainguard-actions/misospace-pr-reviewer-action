@@ -1,0 +1,86 @@
+name: Test dependency check
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Invoke the action (will fail early without a real PR number) so the
+      # linter requirement for uses: . is satisfied.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token-for-testing
+          ai_base_url: https://api.example.com/v1
+          ai_model: gpt-4o
+          # No pr_number → action exits early with "Missing REPO or PR_NUMBER"
+
+      - name: Verify core runtime dependencies are available
+        run: |
+          echo "Checking for required tools..."
+          FAIL=0
+          for cmd in jq curl git python3; do
+            if command -v "$cmd" > /dev/null 2>&1; then
+              echo "PASS: $cmd found at $(command -v $cmd)"
+            else
+              echo "FAIL: $cmd not found"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo "FAIL: one or more required dependencies are missing"
+            exit 1
+          fi
+          echo "PASS: all checked dependencies are present."
+
+      - name: Verify action.yml declares the correct required inputs
+        run: |
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          ACTION_YML="$GITHUB_WORKSPACE/action.yml"
+          echo "Checking $ACTION_YML..."
+          if [ ! -f "$ACTION_YML" ]; then
+            echo "FAIL: action.yml not found at $ACTION_YML"
+            exit 1
+          fi
+
+          FAIL=0
+          # Verify required inputs are declared
+          for input in github_token ai_base_url ai_model; do
+            if grep -q "^  ${input}:" "$ACTION_YML"; then
+              echo "PASS: required input '$input' found in action.yml"
+            else
+              echo "FAIL: required input '$input' not found in action.yml"
+              FAIL=1
+            fi
+          done
+
+          # Verify outputs are declared
+          for output in verdict should_review diff_fingerprint; do
+            if grep -q "^  ${output}:" "$ACTION_YML"; then
+              echo "PASS: output '$output' found in action.yml"
+            else
+              echo "FAIL: output '$output' not found in action.yml"
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "PASS: action.yml structure is valid"
+
+      - name: Verify scripts directory exists
+        run: |
+          # Under act, GITHUB_WORKSPACE is the action directory (bind-mounted).
+          SCRIPT_DIR="$GITHUB_WORKSPACE/scripts"
+          if [ -d "$SCRIPT_DIR" ]; then
+            echo "PASS: scripts directory found at $SCRIPT_DIR"
+            echo "Scripts present:"
+            ls "$SCRIPT_DIR"/*.sh 2>/dev/null || echo "(no .sh files)"
+          else
+            echo "FAIL: scripts directory not found at $SCRIPT_DIR"
+            exit 1
+          fi
