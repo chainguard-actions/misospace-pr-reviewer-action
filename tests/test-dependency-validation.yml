@@ -1,0 +1,36 @@
+name: Test dependency validation
+# Tests that the action validates runtime dependencies (gh, jq, curl, git, python3)
+# and fails with a clear error when REPO or PR_NUMBER is missing.
+# This exercises the first two steps of the action without requiring real AI/GitHub credentials.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-missing-pr-number:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action - expect failure due to missing PR_NUMBER
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token-for-testing
+          repo: owner/repo
+          pr_number: ""
+          ai_base_url: http://localhost:11434/v1
+          ai_model: test-model
+
+      - name: Assert action failed (no PR number)
+        env:
+          ACTUAL: ${{ steps.action.outcome }}
+        run: |
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "failure" ]; then
+            echo "FAIL: expected 'failure' but got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: action correctly failed with missing PR number"

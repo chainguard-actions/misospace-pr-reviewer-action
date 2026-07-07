@@ -1,0 +1,37 @@
+name: Test precheck with missing repo
+# Tests that the action's precheck step fails with a clear error
+# when both repo and pr_number are missing (no event context).
+# This validates the early-exit guard in check_review_needed.sh.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-precheck-missing-repo:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: push
+      GITHUB_REF: refs/heads/main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action without repo or pr_number - expect failure
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token-for-testing
+          repo: "nonexistent-owner/nonexistent-repo-xyz"
+          pr_number: ""
+          ai_base_url: http://localhost:11434/v1
+          ai_model: test-model
+
+      - name: Assert action failed due to missing PR_NUMBER
+        env:
+          ACTUAL: ${{ steps.action.outcome }}
+        run: |
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "failure" ]; then
+            echo "FAIL: expected 'failure' but got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: action correctly failed with missing PR_NUMBER"

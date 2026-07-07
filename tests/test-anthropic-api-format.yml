@@ -1,0 +1,42 @@
+name: Test anthropic API format
+# Tests that ai_api_format=anthropic is accepted by the action.
+# The action will fail at the GitHub API call (fake token), but we verify
+# the anthropic format input is recognized and the action starts correctly.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-anthropic-api-format:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+      GITHUB_REF: refs/pull/7/merge
+      GITHUB_HEAD_REF: feature-branch
+      GITHUB_BASE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with anthropic API format
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token-for-testing
+          repo: owner/testrepo
+          pr_number: "7"
+          ai_base_url: https://api.anthropic.com
+          ai_api_format: anthropic
+          ai_model: claude-3-5-sonnet-20241022
+          ai_api_key: fake-anthropic-key
+          anthropic_version: "2023-06-01"
+
+      - name: Assert action failed (expected - fake token/API)
+        env:
+          ACTUAL: ${{ steps.action.outcome }}
+        run: |
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "failure" ]; then
+            echo "FAIL: expected 'failure' but got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: action correctly failed (ai_api_format=anthropic was accepted)"

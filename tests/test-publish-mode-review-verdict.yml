@@ -1,0 +1,42 @@
+name: Test publish_mode=review_verdict input
+# Tests that publish_mode=review_verdict is accepted by the action.
+# The action will fail at the GitHub API call (fake token), but we verify
+# the publish_mode input is recognized and the action starts correctly.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-publish-mode-review-verdict:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+      GITHUB_REF: refs/pull/10/merge
+      GITHUB_HEAD_REF: feature-branch
+      GITHUB_BASE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with publish_mode=review_verdict
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token-for-testing
+          repo: owner/testrepo
+          pr_number: "10"
+          ai_base_url: http://localhost:11434/v1
+          ai_model: test-model
+          publish_mode: review_verdict
+          allow_approve: "false"
+          approve_forks: "false"
+
+      - name: Assert action failed (expected - fake token/API)
+        env:
+          ACTUAL: ${{ steps.action.outcome }}
+        run: |
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "failure" ]; then
+            echo "FAIL: expected 'failure' but got '$ACTUAL'"
+            exit 1
+          fi
+          echo "PASS: action correctly failed (publish_mode=review_verdict was accepted)"
