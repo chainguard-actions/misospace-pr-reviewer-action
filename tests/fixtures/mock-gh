@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Mock gh CLI for act-based tests.
+# Returns fake PR data so the action can proceed past the GitHub API calls.
+
+ARGS=("$@")
+
+case "${ARGS[0]:-}" in
+  pr)
+    case "${ARGS[1]:-}" in
+      diff)
+        # gh pr diff <pr_number> --repo <repo>
+        cat <<'DIFF'
+diff --git a/README.md b/README.md
+index 1234567..abcdefg 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,4 @@
+ # Test Repository
+ 
+ This is a test repository.
++Added a new line for testing.
+DIFF
+        exit 0
+        ;;
+      comment)
+        # gh pr comment ... (publish step)
+        echo "Comment posted (mock)"
+        exit 0
+        ;;
+      review)
+        # gh pr review ... (publish step)
+        echo "Review posted (mock)"
+        exit 0
+        ;;
+    esac
+    ;;
+  api)
+    # Determine what API endpoint is being called
+    ENDPOINT="${ARGS[1]:-}"
+    case "$ENDPOINT" in
+      repos/*/pulls/*/files*)
+        # PR files list
+        echo '[]'
+        exit 0
+        ;;
+      repos/*/pulls/*/reviews*)
+        # PR reviews list
+        echo '[]'
+        exit 0
+        ;;
+      repos/*/pulls/*/comments*)
+        # PR review comments
+        echo '[]'
+        exit 0
+        ;;
+      repos/*/pulls/*)
+        # PR object
+        cat <<'JSON'
+{
+  "number": 1,
+  "title": "Test PR",
+  "body": "This is a test pull request.",
+  "state": "open",
+  "html_url": "https://github.com/owner/repo/pull/1",
+  "changed_files": 1,
+  "additions": 1,
+  "deletions": 0,
+  "head": {
+    "sha": "aaaa111122223333aaaa111122223333aaaa1111",
+    "ref": "feature-branch",
+    "repo": {
+      "full_name": "owner/repo"
+    }
+  },
+  "base": {
+    "sha": "bbbb111122223333bbbb111122223333bbbb1111",
+    "ref": "main",
+    "repo": {
+      "full_name": "owner/repo"
+    }
+  },
+  "user": {
+    "login": "testuser"
+  }
+}
+JSON
+        exit 0
+        ;;
+      repos/*/issues/*/comments*)
+        # Issue comments (for sticky comment lookup)
+        echo '[]'
+        exit 0
+        ;;
+      repos/*/issues/*/labels/*)
+        # Label deletion (clear re-review label)
+        exit 0
+        ;;
+      repos/*/issues/*)
+        # Issue object
+        echo '{"number":1,"title":"Test issue","state":"open","html_url":"https://github.com/owner/repo/issues/1","labels":[],"body":"Test issue body"}'
+        exit 0
+        ;;
+      repos/*/commits/*/check-runs*)
+        echo '{"check_runs":[],"total_count":0}'
+        exit 0
+        ;;
+      repos/*/commits/*/status*)
+        echo '{"state":"success","statuses":[],"total_count":0}'
+        exit 0
+        ;;
+      *)
+        # Default: return empty object
+        echo '{}'
+        exit 0
+        ;;
+    esac
+    ;;
+  *)
+    echo "mock-gh: unknown command: ${ARGS[*]}" >&2
+    exit 1
+    ;;
+esac

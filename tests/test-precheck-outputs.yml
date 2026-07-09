@@ -1,0 +1,75 @@
+name: Test precheck outputs
+# Tests that the action's precheck step produces expected outputs.
+# With a mock gh and on_model_failure=notice, the action succeeds and
+# we can verify the precheck outputs.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+      GITHUB_REF: refs/pull/1/merge
+      GITHUB_HEAD_REF: feature-branch
+      GITHUB_BASE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install mock gh CLI
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/mock-gh" /usr/local/bin/gh
+          chmod +x /usr/local/bin/gh
+          echo "Mock gh installed"
+
+      - name: Run action with mock gh
+        id: action
+        uses: .
+        with:
+          github_token: fake-token-for-test
+          ai_base_url: https://203.0.113.1/v1
+          ai_model: gpt-4o
+          repo: owner/repo
+          pr_number: "1"
+          skip_if_diff_unchanged: "false"
+          on_model_failure: "notice"
+          ai_request_timeout_sec: "3"
+          ai_connect_timeout_sec: "3"
+          ai_primary_retries: "0"
+
+      - name: Assert should_review output is true
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "should_review: $SHOULD_REVIEW"
+          if [ "$SHOULD_REVIEW" != "true" ]; then
+            echo "FAIL: expected should_review=true, got: '$SHOULD_REVIEW'"
+            exit 1
+          fi
+          echo "PASS: should_review=true"
+
+      - name: Assert diff_fingerprint output is set
+        env:
+          FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+        run: |
+          echo "diff_fingerprint: $FINGERPRINT"
+          if [ -z "$FINGERPRINT" ]; then
+            echo "FAIL: expected diff_fingerprint to be set, got empty"
+            exit 1
+          fi
+          echo "PASS: diff_fingerprint is set: $FINGERPRINT"
+
+      - name: Assert effective_review_scope output is set
+        env:
+          SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+        run: |
+          echo "effective_review_scope: $SCOPE"
+          if [ -z "$SCOPE" ]; then
+            echo "FAIL: expected effective_review_scope to be set, got empty"
+            exit 1
+          fi
+          if [ "$SCOPE" != "full" ] && [ "$SCOPE" != "incremental" ]; then
+            echo "FAIL: expected effective_review_scope to be 'full' or 'incremental', got: '$SCOPE'"
+            exit 1
+          fi
+          echo "PASS: effective_review_scope=$SCOPE"

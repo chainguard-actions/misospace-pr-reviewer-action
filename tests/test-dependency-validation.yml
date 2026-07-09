@@ -1,0 +1,59 @@
+name: Test dependency validation
+# Tests that the action's runtime dependency check passes (gh, jq, curl, git, python3 are available)
+# and that the action can proceed past the dependency check step.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+      GITHUB_REF: refs/pull/1/merge
+      GITHUB_HEAD_REF: feature-branch
+      GITHUB_BASE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify core runtime dependencies are available
+        run: |
+          echo "Checking runtime dependencies..."
+          command -v jq      && echo "jq: OK"      || { echo "FAIL: jq not found"; exit 1; }
+          command -v curl    && echo "curl: OK"    || { echo "FAIL: curl not found"; exit 1; }
+          command -v git     && echo "git: OK"     || { echo "FAIL: git not found"; exit 1; }
+          command -v python3 && echo "python3: OK" || { echo "FAIL: python3 not found"; exit 1; }
+          echo "PASS: core runtime dependencies present"
+
+      - name: Install mock gh CLI
+        run: |
+          # Install a mock gh that returns fake PR data so the action can proceed
+          cp "$GITHUB_WORKSPACE/tests/fixtures/mock-gh" /usr/local/bin/gh
+          chmod +x /usr/local/bin/gh
+          echo "Mock gh installed at $(which gh)"
+          gh --version 2>/dev/null || echo "mock gh (no version)"
+
+      - name: Run action with mock gh and on_model_failure=notice
+        id: action
+        uses: .
+        with:
+          github_token: fake-token-for-test
+          ai_base_url: https://203.0.113.1/v1
+          ai_model: gpt-4o
+          repo: owner/repo
+          pr_number: "1"
+          on_model_failure: "notice"
+          skip_if_diff_unchanged: "false"
+          ai_request_timeout_sec: "3"
+          ai_connect_timeout_sec: "3"
+          ai_primary_retries: "0"
+
+      - name: Assert should_review output is set
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "should_review: $SHOULD_REVIEW"
+          if [ "$SHOULD_REVIEW" != "true" ]; then
+            echo "FAIL: expected should_review=true, got: '$SHOULD_REVIEW'"
+            exit 1
+          fi
+          echo "PASS: dependency check passed and action produced should_review=true"
