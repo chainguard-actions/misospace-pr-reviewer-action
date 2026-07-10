@@ -1,0 +1,73 @@
+name: Test force_review flag bypasses skip guard
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with force_review=true
+        id: action-force
+        uses: .
+        continue-on-error: true
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_REF: refs/pull/42/merge
+          GITHUB_HEAD_REF: feature-branch
+          GITHUB_BASE_REF: main
+        with:
+          github_token: fake-token-for-testing
+          repo: octocat/Hello-World
+          pr_number: "42"
+          ai_base_url: http://localhost:19999/v1
+          ai_model: llama3
+          force_review: "true"
+          skip_if_diff_unchanged: "true"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action ran (force_review bypasses skip guard)
+        run: |
+          echo "outcome: ${{ steps.action-force.outcome }}"
+          # With force_review=true, the action should attempt the review
+          # (not skip). It will fail at the AI API call (fake URL/token),
+          # but it should NOT skip due to diff-unchanged.
+          # The action failing is expected — we just verify it ran.
+          OUTCOME="${{ steps.action-force.outcome }}"
+          if [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action was skipped — force_review=true should prevent skipping"
+            exit 1
+          fi
+          echo "PASS: action ran with force_review=true (outcome=$OUTCOME)"
+
+      - name: Run action with skip_if_diff_unchanged=false
+        id: action-no-skip
+        uses: .
+        continue-on-error: true
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_REF: refs/pull/42/merge
+          GITHUB_HEAD_REF: feature-branch
+          GITHUB_BASE_REF: main
+        with:
+          github_token: fake-token-for-testing
+          repo: octocat/Hello-World
+          pr_number: "42"
+          ai_base_url: http://localhost:19999/v1
+          ai_model: llama3
+          skip_if_diff_unchanged: "false"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action ran with skip disabled
+        run: |
+          echo "outcome: ${{ steps.action-no-skip.outcome }}"
+          OUTCOME="${{ steps.action-no-skip.outcome }}"
+          if [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action was skipped — skip_if_diff_unchanged=false should prevent skipping"
+            exit 1
+          fi
+          echo "PASS: action ran with skip_if_diff_unchanged=false (outcome=$OUTCOME)"

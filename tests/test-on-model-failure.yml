@@ -1,0 +1,40 @@
+name: Test on_model_failure behavior
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with on_model_failure=fail (default) and unreachable AI
+        id: action-fail-mode
+        uses: .
+        continue-on-error: true
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_REF: refs/pull/1/merge
+          GITHUB_HEAD_REF: feature-branch
+          GITHUB_BASE_REF: main
+        with:
+          github_token: fake-token-for-testing
+          repo: octocat/Hello-World
+          pr_number: "1"
+          ai_base_url: http://localhost:19999/v1
+          ai_model: nonexistent-model
+          on_model_failure: fail
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action failed (on_model_failure=fail with unreachable AI)
+        run: |
+          echo "outcome: ${{ steps.action-fail-mode.outcome }}"
+          # The action should fail because the AI endpoint is unreachable
+          # and on_model_failure=fail. The precheck may also fail first
+          # (fake GitHub token), but either way the action should not succeed.
+          if [ "${{ steps.action-fail-mode.outcome }}" = "success" ]; then
+            echo "FAIL: expected action to fail with unreachable AI and on_model_failure=fail"
+            exit 1
+          fi
+          echo "PASS: action correctly failed (outcome=${{ steps.action-fail-mode.outcome }})"

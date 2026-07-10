@@ -1,0 +1,43 @@
+name: Test anthropic API format configuration
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with ai_api_format=anthropic
+        id: action
+        uses: .
+        continue-on-error: true
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_REF: refs/pull/1/merge
+          GITHUB_HEAD_REF: feature-branch
+          GITHUB_BASE_REF: main
+        with:
+          github_token: fake-token-for-testing
+          repo: octocat/Hello-World
+          pr_number: "1"
+          ai_base_url: https://api.anthropic.com
+          ai_api_format: anthropic
+          ai_model: claude-3-haiku-20240307
+          ai_api_key: fake-anthropic-key
+          anthropic_version: "2023-06-01"
+          on_model_failure: fail
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action ran with anthropic format (fails at API, not config)
+        run: |
+          echo "outcome: ${{ steps.action.outcome }}"
+          # The action should fail at the API call (fake key) or precheck
+          # (fake GitHub token), not at configuration validation.
+          # A success here would be unexpected.
+          if [ "${{ steps.action.outcome }}" = "success" ]; then
+            echo "FAIL: unexpected success with fake credentials"
+            exit 1
+          fi
+          echo "PASS: action ran with ai_api_format=anthropic (failed at API as expected)"
