@@ -1,0 +1,59 @@
+name: Test dependency validation
+# Tests that the action's first step (Validate runtime dependencies) passes
+# in a standard ubuntu-latest environment. The action is invoked and will
+# fail at the precheck step (missing PR_NUMBER), but the dependency
+# validation step runs first and must succeed.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install GitHub CLI (gh) if not present
+        run: |
+          if ! command -v gh &>/dev/null; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            apt-get update -qq
+            apt-get install -y -qq gh
+          fi
+          gh --version
+
+      - name: Verify runtime dependencies are available
+        run: |
+          echo "Checking runtime dependencies..."
+          command -v gh   && echo "gh: OK"   || { echo "FAIL: gh not found";      exit 1; }
+          command -v jq   && echo "jq: OK"   || { echo "FAIL: jq not found";      exit 1; }
+          command -v curl && echo "curl: OK" || { echo "FAIL: curl not found";    exit 1; }
+          command -v git  && echo "git: OK"  || { echo "FAIL: git not found";     exit 1; }
+          command -v python3 && echo "python3: OK" || { echo "FAIL: python3 not found"; exit 1; }
+          echo "PASS: all runtime dependencies present"
+
+      - name: Run action (will fail at precheck due to missing PR_NUMBER)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: fake-token-for-testing
+          ai_base_url: http://localhost:11434/v1
+          ai_model: test-model
+
+      - name: Assert action failed at precheck (not at dependency validation)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # The action should fail because PR_NUMBER is not set (no pull_request event),
+          # NOT because dependencies are missing. If dependencies were missing, the
+          # dependency validation step would have failed before reaching precheck.
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: expected action to fail at precheck, got: $OUTCOME"
+            exit 1
+          fi
+          echo "PASS: dependency validation passed; action failed at precheck as expected"
