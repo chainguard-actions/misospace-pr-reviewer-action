@@ -50,10 +50,10 @@ jobs:
             PRERELEASE=false
           fi
           {
-            echo "tag=v$VERSION"
-            echo "major_tag=v${VERSION%%.*}"
-            echo "sha=$(git rev-parse HEAD)"
-            echo "prerelease=$PRERELEASE"
+            printf 'tag=%s\n' "$(printf '%s' "v$VERSION" | tr -d '\n\r')"
+            printf 'major_tag=%s\n' "$(printf '%s' "v${VERSION%%.*}" | tr -d '\n\r')"
+            printf 'sha=%s\n' "$(git rev-parse HEAD | tr -d '\n\r')"
+            printf 'prerelease=%s\n' "$(printf '%s' "$PRERELEASE" | tr -d '\n\r')"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create immutable version tag

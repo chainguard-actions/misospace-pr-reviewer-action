@@ -38,8 +38,6 @@ if [[ "$RESOLVED_PLATFORM" == "forgejo" ]]; then
 else
   EFFECTIVE_FORGEJO_API_URL=""
 fi
-# Sanitize before writing to GITHUB_OUTPUT to prevent newline injection
-EFFECTIVE_FORGEJO_API_URL="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
 
 # ── Label-driven re-review (#231) ─────────────────────────────────────
 # A `labeled` pull_request event is the easy re-review trigger: adding the
@@ -67,7 +65,7 @@ if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" && -f "${GITHUB_EVENT_PATH:-}" 
         echo "is_fork_pr="
         echo "diff_fingerprint="
         echo "resolved_platform=$RESOLVED_PLATFORM"
-        echo "effective_forgejo_api_url=$EFFECTIVE_FORGEJO_API_URL"
+        printf 'effective_forgejo_api_url=%s\n' "$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
       } >> "$OUTPUT_FILE"
       exit 0
     fi
@@ -323,7 +321,7 @@ if [[ "$should_review" == "false" ]]; then
     echo "should_review=$should_review"
     echo "skip_reason=$skip_reason"
     echo "resolved_platform=$RESOLVED_PLATFORM"
-    echo "effective_forgejo_api_url=$EFFECTIVE_FORGEJO_API_URL"
+    printf 'effective_forgejo_api_url=%s\n' "$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
   } >> "$OUTPUT_FILE"
   exit 0
 fi
@@ -546,4 +544,4 @@ echo "skip_reason=$skip_reason" >> "$OUTPUT_FILE"
 
 # Platform resolution (resolved once near the top; see the #367 block).
 echo "resolved_platform=$RESOLVED_PLATFORM" >> "$OUTPUT_FILE"
-echo "effective_forgejo_api_url=$EFFECTIVE_FORGEJO_API_URL" >> "$OUTPUT_FILE"
+printf 'effective_forgejo_api_url=%s\n' "$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')" >> "$OUTPUT_FILE"

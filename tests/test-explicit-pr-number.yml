@@ -1,0 +1,44 @@
+name: Test explicit pr_number input with invalid PR
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Provide an explicit but non-existent PR number (999999).
+      # The precheck script tolerates a failed diff fetch (creates empty pr.diff)
+      # and continues with should_review=true. The AI review step then runs and
+      # fails because there is no valid AI API key. With on_model_failure=fail
+      # (the default) and ai_primary_retries=0, the action fails quickly.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          repo: ${{ github.repository }}
+          pr_number: "999999"
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          force_review: "false"
+          skip_if_diff_unchanged: "false"
+          on_model_failure: "fail"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action failed for non-existent PR
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # The action should fail: either the precheck cannot fetch PR 999999
+          # (and exits with an error), or the AI review step fails because there
+          # is no valid API key. Either way, success is not acceptable.
+          if [ "$OUTCOME" = "success" ]; then
+            echo "FAIL: expected action to fail for non-existent PR 999999, but it succeeded"
+            exit 1
+          fi
+          echo "PASS: action correctly failed for non-existent PR number"

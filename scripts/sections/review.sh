@@ -281,13 +281,24 @@ fi
 
 apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE" "$CARRY_FORWARD_ACTIVE"
 
-safe_analysis_engine="$(printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r')"
-echo "analysis_engine=$safe_analysis_engine" >> "$OUTPUT_FILE"
-echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
-echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
-echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
-echo "review_route=${REVIEW_ROUTE:-legacy}" >> "$OUTPUT_FILE"
-echo "escalation_reason=${ESCALATION_REASONS:-}" >> "$OUTPUT_FILE"
+# Sanitize each single-line output value to strip embedded newlines/carriage
+# returns before writing to $GITHUB_OUTPUT. Without this, a caller-supplied
+# value containing '\n' (e.g. in ai_model / ai_base_url / ai_api_format) could
+# inject additional key=value pairs and override downstream step outputs such as
+# `verdict`. Values that are model-controlled (verdict, verdict_source,
+# required_checks) are equally sanitized for defence-in-depth.
+_safe_analysis_engine="$(printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r')"
+_safe_verdict="$(jq -r '.verdict' ai-output.json | tr -d '\n\r')"
+_safe_verdict_source="$(jq -r '.verdict_source // "model"' ai-output.json | tr -d '\n\r')"
+_safe_required_checks="$(jq -r '.required_checks // "none"' ai-output.json | tr -d '\n\r')"
+_safe_review_route="$(printf '%s' "${REVIEW_ROUTE:-legacy}" | tr -d '\n\r')"
+_safe_escalation_reason="$(printf '%s' "${ESCALATION_REASONS:-}" | tr -d '\n\r')"
+echo "analysis_engine=${_safe_analysis_engine}" >> "$OUTPUT_FILE"
+echo "verdict=${_safe_verdict}" >> "$OUTPUT_FILE"
+echo "verdict_source=${_safe_verdict_source}" >> "$OUTPUT_FILE"
+echo "required_checks=${_safe_required_checks}" >> "$OUTPUT_FILE"
+echo "review_route=${_safe_review_route}" >> "$OUTPUT_FILE"
+echo "escalation_reason=${_safe_escalation_reason}" >> "$OUTPUT_FILE"
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the
