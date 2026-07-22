@@ -54,6 +54,7 @@ if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" && -f "${GITHUB_EVENT_PATH:-}" 
     else
       echo "Label '$added_label' is not the re-review trigger ('$REREVIEW_LABEL') — reviews run on open/push, not on label adds; this run is a no-op." >&2
       echo "::notice title=AI review: label no-op::Triggered by adding the '$added_label' label, not a code change. The PR is reviewed automatically on open/push; add the '$REREVIEW_LABEL' label only to force a re-review."
+      _safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
       {
         echo "should_review=false"
         echo "skip_reason=unrelated-label"
@@ -65,8 +66,7 @@ if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" && -f "${GITHUB_EVENT_PATH:-}" 
         echo "is_fork_pr="
         echo "diff_fingerprint="
         echo "resolved_platform=$RESOLVED_PLATFORM"
-        safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
-        echo "effective_forgejo_api_url=$safe_forgejo_api_url"
+        echo "effective_forgejo_api_url=${_safe_forgejo_api_url}"
       } >> "$OUTPUT_FILE"
       exit 0
     fi
@@ -311,6 +311,7 @@ fi
 # API call — all of it feeds steps that are gated on should_review=true, so
 # skip it entirely when the review is being skipped.
 if [[ "$should_review" == "false" ]]; then
+  _safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
   {
     echo "effective_review_scope=full"
     echo "previous_head_sha="
@@ -322,8 +323,7 @@ if [[ "$should_review" == "false" ]]; then
     echo "should_review=$should_review"
     echo "skip_reason=$skip_reason"
     echo "resolved_platform=$RESOLVED_PLATFORM"
-    safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
-    echo "effective_forgejo_api_url=$safe_forgejo_api_url"
+    echo "effective_forgejo_api_url=${_safe_forgejo_api_url}"
   } >> "$OUTPUT_FILE"
   exit 0
 fi
@@ -546,5 +546,5 @@ echo "skip_reason=$skip_reason" >> "$OUTPUT_FILE"
 
 # Platform resolution (resolved once near the top; see the #367 block).
 echo "resolved_platform=$RESOLVED_PLATFORM" >> "$OUTPUT_FILE"
-safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
-echo "effective_forgejo_api_url=$safe_forgejo_api_url" >> "$OUTPUT_FILE"
+_safe_forgejo_api_url="$(printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r')"
+echo "effective_forgejo_api_url=${_safe_forgejo_api_url}" >> "$OUTPUT_FILE"

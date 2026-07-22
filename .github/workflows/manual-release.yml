@@ -49,11 +49,15 @@ jobs:
           if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             PRERELEASE=false
           fi
+          SAFE_TAG=$(printf '%s' "v$VERSION" | tr -d '\n\r')
+          SAFE_MAJOR_TAG=$(printf '%s' "v${VERSION%%.*}" | tr -d '\n\r')
+          SAFE_SHA=$(printf '%s' "$(git rev-parse HEAD)" | tr -d '\n\r')
+          SAFE_PRERELEASE=$(printf '%s' "$PRERELEASE" | tr -d '\n\r')
           {
-            echo "tag=v$VERSION"
-            echo "major_tag=v${VERSION%%.*}"
-            echo "sha=$(git rev-parse HEAD)"
-            echo "prerelease=$PRERELEASE"
+            echo "tag=$SAFE_TAG"
+            echo "major_tag=$SAFE_MAJOR_TAG"
+            echo "sha=$SAFE_SHA"
+            echo "prerelease=$SAFE_PRERELEASE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create immutable version tag

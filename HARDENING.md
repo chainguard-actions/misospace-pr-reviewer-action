@@ -8,31 +8,34 @@
 
 **Test Policy SHA:** `843adf9e4b8f85d0c08b27b9d0b09dd094b54702`
 
-**Harden Agent Version:** `1`
+**Harden Agent Version:** `2`
 
-Action **misospace--pr-reviewer-action/v2.1.2** was hardened automatically. 2 finding(s) were identified and resolved across 2 iteration(s).
+Action **misospace--pr-reviewer-action/v2.1.2** was hardened automatically. 2 finding(s) were identified and resolved across 3 iteration(s).
 
 ## Findings Fixed
 
 ### script-injection (severity: high)
 
-Rule (a): Three `run:` blocks in action.yml directly interpolate `${{ github.action_path }}` inside shell command strings. Any `${{ ... }}` expression inside a `run:` block is a script-injection risk because the value is substituted by the YAML template engine before the shell sees it, bypassing shell quoting. The safe pattern is to route the value through an `env:` variable (as the publish step already does with `GITHUB_ACTION_PATH: ${{ github.action_path }}`). Offending lines: `run: bash "${{ github.action_path }}/scripts/check_review_needed.sh"`, `run: bash "${{ github.action_path }}/scripts/wait_for_ci.sh"`, and `run: bash "${{ github.action_path }}/scripts/run_review.sh"`.
+Three `run:` blocks in action.yml interpolate `${{ github.action_path }}` directly inside the shell command string (rule a). Any `${{ ... }}` expression embedded in a `run:` script is a script-injection finding regardless of which context it reads from. The safe pattern — already used by the 'Publish review' step — is to hoist the value into an `env:` variable (e.g. `GITHUB_ACTION_PATH: ${{ github.action_path }}`) and reference it as `${GITHUB_ACTION_PATH}` in the shell body. Affected lines:
+- `run: bash "${{ github.action_path }}/scripts/check_review_needed.sh"` (step: 'Check whether review is needed')
+- `run: bash "${{ github.action_path }}/scripts/wait_for_ci.sh"` (step: 'Wait for CI checks to complete')
+- `run: bash "${{ github.action_path }}/scripts/run_review.sh"` (step: 'Run AI review')
 
 Locations:
 
-- `action.yml:700`
-- `action.yml:730`
-- `action.yml:800`
+- `action.yml:530`
+- `action.yml:545`
+- `action.yml:620`
 
 ### github-env-injection (severity: high)
 
-The `EFFECTIVE_FORGEJO_API_URL` variable — derived directly from `inputs.forgejo_api_url` (a caller-controlled composite-action input) — is written to `$GITHUB_OUTPUT` without the required sanitization step (`printf '%s' "$VAR" | tr -d '\n\r'`). A value containing a newline character would allow injection of arbitrary additional key=value pairs into the step outputs, potentially overwriting outputs such as `should_review`, `resolved_platform`, or `is_fork_pr`. This write occurs in three places in scripts/check_review_needed.sh: the main output block at the end of the script, and two early-exit paths.
+In scripts/check_review_needed.sh, the variable `EFFECTIVE_FORGEJO_API_URL` — derived directly from `${FORGEJO_API_URL:-}`, which is set from `inputs.forgejo_api_url` in the action's env block — is written to `$GITHUB_OUTPUT` (via `$OUTPUT_FILE`) without the required sanitization step (`printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r'`). A caller-supplied URL containing embedded newline characters could inject additional `key=value` pairs into GITHUB_OUTPUT, potentially overwriting step outputs such as `resolved_platform`, `should_review`, or `diff_fingerprint`. The unsanitized write occurs at three locations (early-exit for unrelated-label, early-exit for diff-unchanged, and the normal completion path).
 
 Locations:
 
-- `scripts/check_review_needed.sh:88`
-- `scripts/check_review_needed.sh:340`
-- `scripts/check_review_needed.sh:580`
+- `scripts/check_review_needed.sh:80`
+- `scripts/check_review_needed.sh:310`
+- `scripts/check_review_needed.sh:540`
 
 ## Iteration Notes
 
@@ -42,7 +45,7 @@ Locations:
 
 **Notes:**
 
-Fixed script-injection in action.yml: added GITHUB_ACTION_PATH: ${{ github.action_path }} to the env: blocks of the 'Check whether review is needed', 'Wait for CI checks to complete', and 'Run AI review' steps, and updated their run: commands to use $GITHUB_ACTION_PATH instead of the ${{ github.action_path }} template expression. Fixed github-env-injection in scripts/check_review_needed.sh: sanitized EFFECTIVE_FORGEJO_API_URL with `printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r'` before writing to $GITHUB_OUTPUT in all three locations (early exit for unrelated label, early exit when should_review=false, and the main output block at the end of the script).
+Fixed script-injection in action.yml: added GITHUB_ACTION_PATH env var to the 'Check whether review is needed', 'Wait for CI checks to complete', and 'Run AI review' steps, replacing inline ${{ github.action_path }} expressions in run: blocks with ${GITHUB_ACTION_PATH}. Fixed github-env-injection in scripts/check_review_needed.sh: sanitized EFFECTIVE_FORGEJO_API_URL with `printf '%s' "$EFFECTIVE_FORGEJO_API_URL" | tr -d '\n\r'` before writing to $GITHUB_OUTPUT at all three locations (unrelated-label early exit ~line 80, diff-unchanged early exit ~line 310, and normal completion path ~line 540).
 
 ### Iteration 2
 
@@ -50,5 +53,13 @@ Fixed script-injection in action.yml: added GITHUB_ACTION_PATH: ${{ github.actio
 
 **Notes:**
 
-Fixed github-env-injection in hardened/action/scripts/sections/review.sh at line 300. The ANALYSIS_ENGINE variable (composed from user-controlled inputs like ai_model, ai_base_url, ai_fallback_model, ai_fallback_base_url, ai_smart_model, ai_smart_base_url) was written directly to $OUTPUT_FILE (GITHUB_OUTPUT) without sanitization. The fix introduces a `safe_analysis_engine` variable that strips newlines and carriage returns using `printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r'` before writing to $OUTPUT_FILE, preventing newline injection attacks that could override other step outputs such as 'verdict'.
+In hardened/action/scripts/sections/review.sh, added sanitization of the ANALYSIS_ENGINE variable before writing it to $GITHUB_OUTPUT (via $OUTPUT_FILE). The fix introduces a `safe_analysis_engine` variable that strips newlines and carriage returns using `printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r'`, then writes `safe_analysis_engine` instead of the raw `ANALYSIS_ENGINE` to the output file. This prevents injection of arbitrary key=value pairs into GITHUB_OUTPUT via embedded newlines in user-controlled inputs (ai_model, ai_base_url, ai_api_format, and their fallback/smart counterparts).
+
+### Iteration 3
+
+**Fixes applied:** github-env-injection
+
+**Notes:**
+
+In .github/workflows/manual-release.yml, the 'Normalize release metadata' step now sanitizes all four GITHUB_OUTPUT writes using the prescribed pattern: each value (tag, major_tag, sha, prerelease) is first passed through `printf '%s' ... | tr -d '\n\r'` into a SAFE_* variable, and the SAFE_* variables are then written to $GITHUB_OUTPUT. This satisfies the required sanitization pattern while preserving the existing regex validation and overall step logic.
 

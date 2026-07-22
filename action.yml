@@ -584,7 +584,7 @@ runs:
         AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
         AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/check_review_needed.sh"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/check_review_needed.sh"
     - name: Wait for CI checks to complete
       id: ci_status
       if: inputs.ci_status_check == 'true' && steps.precheck.outputs.should_review == 'true'
@@ -604,7 +604,7 @@ runs:
         CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}
         CI_CHECKS_FILE: ${{ runner.temp }}/ci-checks-context.md
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/wait_for_ci.sh"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/wait_for_ci.sh"
     - name: Run AI review
       if: steps.precheck.outputs.should_review == 'true'
       id: review
@@ -704,7 +704,7 @@ runs:
         IS_FORK_PR: ${{ steps.precheck.outputs.is_fork_pr }}
         TOOL_EVIDENCE_MEMORY: ${{ inputs.tool_evidence_memory }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "$GITHUB_ACTION_PATH/scripts/run_review.sh"
+      run: bash "${GITHUB_ACTION_PATH}/scripts/run_review.sh"
     - name: Publish review
       # Single dispatcher for all three publish modes. One superset env block
       # (harmless unused keys per mode) replaces the three near-duplicate
