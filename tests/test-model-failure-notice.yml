@@ -1,0 +1,60 @@
+name: Test on_model_failure=notice produces request_changes verdict
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install fake gh to intercept PR API calls
+        run: |
+          mkdir -p /tmp/fake-bin
+          REAL_GH="$(command -v gh || echo /usr/bin/gh)"
+          echo "REAL_GH=$REAL_GH" >> "$GITHUB_ENV"
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-gh.sh" /tmp/fake-bin/gh
+          chmod +x /tmp/fake-bin/gh
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      - name: Run action with unreachable AI and on_model_failure=notice
+        id: action
+        uses: .
+        with:
+          github_token: ${{ github.token }}
+          repo: ${{ github.repository }}
+          pr_number: "99999"
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
+          # Minimize wait time: 1 retry, 0s delay, 3s timeout
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "3"
+          ai_connect_timeout_sec: "2"
+          # With notice mode, the step must NOT fail even when the AI is unreachable
+          on_model_failure: "notice"
+          skip_if_diff_unchanged: "false"
+          force_review: "true"
+          # Do not publish — we only care about the outputs
+          publish_review_comment: "false"
+
+      - name: Assert verdict is request_changes (notice mode on failure)
+        env:
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "verdict: $VERDICT"
+          if [ "$VERDICT" != "request_changes" ]; then
+            echo "FAIL: expected verdict=request_changes when AI is unreachable and on_model_failure=notice, got '$VERDICT'"
+            exit 1
+          fi
+          echo "PASS: verdict=request_changes as expected for notice mode"
+
+      - name: Assert should_review output is true
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "should_review: $SHOULD_REVIEW"
+          if [ "$SHOULD_REVIEW" != "true" ]; then
+            echo "FAIL: expected should_review=true, got '$SHOULD_REVIEW'"
+            exit 1
+          fi
+          echo "PASS: should_review=true"

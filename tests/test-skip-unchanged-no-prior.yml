@@ -1,0 +1,63 @@
+name: Test skip_if_diff_unchanged with no prior review
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install fake gh to intercept PR API calls
+        run: |
+          mkdir -p /tmp/fake-bin
+          REAL_GH="$(command -v gh || echo /usr/bin/gh)"
+          echo "REAL_GH=$REAL_GH" >> "$GITHUB_ENV"
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fake-gh.sh" /tmp/fake-bin/gh
+          chmod +x /tmp/fake-bin/gh
+          echo "/tmp/fake-bin" >> "$GITHUB_PATH"
+
+      # When there is no prior managed review comment, skip_if_diff_unchanged
+      # cannot find a fingerprint to compare against, so should_review must be
+      # true even with skip_if_diff_unchanged=true and force_review=false.
+      - name: Run action with skip_if_diff_unchanged=true and no prior review
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          repo: ${{ github.repository }}
+          pr_number: "99999"
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "3"
+          ai_connect_timeout_sec: "2"
+          on_model_failure: "notice"
+          skip_if_diff_unchanged: "true"
+          force_review: "false"
+          publish_review_comment: "false"
+
+      - name: Assert should_review is true (no prior fingerprint to compare)
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "should_review: $SHOULD_REVIEW"
+          # With no prior managed review, there is no stored fingerprint,
+          # so the diff-unchanged guard cannot skip — should_review must be true.
+          if [ "$SHOULD_REVIEW" != "true" ]; then
+            echo "FAIL: expected should_review=true when no prior review exists, got '$SHOULD_REVIEW'"
+            exit 1
+          fi
+          echo "PASS: should_review=true as expected (no prior fingerprint)"
+
+      - name: Assert diff_fingerprint is non-empty
+        env:
+          DIFF_FP: ${{ steps.action.outputs.diff_fingerprint }}
+        run: |
+          echo "diff_fingerprint: $DIFF_FP"
+          if [ -z "$DIFF_FP" ]; then
+            echo "FAIL: expected diff_fingerprint to be non-empty"
+            exit 1
+          fi
+          echo "PASS: diff_fingerprint='$DIFF_FP'"
