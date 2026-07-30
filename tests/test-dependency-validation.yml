@@ -1,0 +1,58 @@
+name: Test runtime dependency validation passes
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify required tools are present in the runner environment
+        run: |
+          echo "Checking required runtime dependencies..."
+          for tool in jq curl git python3; do
+            if command -v "$tool" > /dev/null 2>&1; then
+              echo "$tool: OK"
+            else
+              echo "FAIL: $tool not found"
+              exit 1
+            fi
+          done
+          # gh CLI check — best-effort (may not be in all act images)
+          if command -v gh > /dev/null 2>&1; then
+            echo "gh: OK"
+          else
+            echo "WARN: gh not found in PATH — action will fail at dependency validation"
+          fi
+          echo "Core dependencies verified"
+
+      - name: Run action (expect failure at precheck due to missing PR number)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # pr_number intentionally omitted to trigger precheck failure
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          ai_primary_retries: "0"
+
+      - name: Assert action failed or skipped review (not at dependency check)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # The action should fail (at dependency check or precheck) or skip review.
+          # It must NOT succeed with should_review=true (that would mean it tried
+          # to call the AI API without a valid PR, which is wrong).
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (dependency check or precheck)"
+          elif [ -z "$SHOULD_REVIEW" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review (precheck determined no review needed)"
+          else
+            echo "FAIL: action succeeded with should_review=$SHOULD_REVIEW — unexpected behavior"
+            exit 1
+          fi

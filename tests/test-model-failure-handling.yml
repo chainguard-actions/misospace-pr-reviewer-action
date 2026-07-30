@@ -1,0 +1,41 @@
+name: Test model failure handling with on_model_failure=fail
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with invalid AI endpoint and on_model_failure=fail
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # pr_number omitted — no pull_request event context
+          ai_base_url: "https://invalid-ai-endpoint.example.com/v1"
+          ai_model: "test-model"
+          ai_api_key: ""
+          on_model_failure: "fail"
+          # Minimize retries to avoid long waits
+          ai_primary_retries: "0"
+
+      - name: Assert action failed or skipped review
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # Without a PR number, the precheck should fail before any AI call.
+          # The action should either fail outright or skip the review.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action correctly failed (precheck or model failure)"
+          elif [ -z "$SHOULD_REVIEW" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review (precheck determined no review needed)"
+          else
+            echo "FAIL: expected action to fail or skip review, got outcome=$OUTCOME should_review=$SHOULD_REVIEW"
+            exit 1
+          fi

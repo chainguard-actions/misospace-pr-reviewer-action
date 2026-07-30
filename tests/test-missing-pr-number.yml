@@ -1,0 +1,41 @@
+name: Test missing PR number fails gracefully
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action without PR number (expect failure or skip)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # pr_number intentionally omitted — no pull_request event context
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          # Minimize retries to avoid long waits
+          ai_primary_retries: "0"
+
+      - name: Assert action did not perform a review without a PR number
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # The action should either:
+          # (a) fail outright (outcome=failure) — precheck exits 1 on missing PR_NUMBER
+          # (b) succeed but not review (should_review empty or false) — precheck
+          #     emitted should_review=false before the composite action propagated failure
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action correctly failed when PR number was missing"
+          elif [ -z "$SHOULD_REVIEW" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review when PR number was missing"
+          else
+            echo "FAIL: expected action to fail or skip review, but got outcome=$OUTCOME should_review=$SHOULD_REVIEW"
+            exit 1
+          fi

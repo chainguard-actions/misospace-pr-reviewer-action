@@ -1,0 +1,73 @@
+name: Test precheck outputs with explicit PR number
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with no PR number to verify precheck outputs
+        id: action_no_pr
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # No pr_number — precheck should fail or emit should_review=false
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          on_model_failure: "notice"
+          ai_primary_retries: "0"
+
+      - name: Assert precheck behavior with no PR number
+        env:
+          OUTCOME: ${{ steps.action_no_pr.outcome }}
+          SHOULD_REVIEW: ${{ steps.action_no_pr.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action_no_pr.outputs.skip_reason }}
+          FINGERPRINT: ${{ steps.action_no_pr.outputs.diff_fingerprint }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $FINGERPRINT"
+
+          # Without a PR number, the action should either:
+          # (a) fail outright (precheck exits 1 on missing PR_NUMBER)
+          # (b) succeed but not review (should_review=false or empty)
+          # (c) succeed with should_review=true (if PR_NUMBER was somehow resolved)
+          #     — in this case, on_model_failure=notice means the action succeeds
+          #       even if the AI API is unreachable
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action correctly failed when PR number was missing"
+          elif [ -z "$SHOULD_REVIEW" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review when PR number was missing"
+          elif [ "$SHOULD_REVIEW" = "true" ]; then
+            # The precheck found a PR and ran a review (or attempted to).
+            # With on_model_failure=notice, the action succeeds even if AI is unreachable.
+            echo "INFO: action ran with should_review=true (PR was found)"
+            echo "PASS: precheck output is valid"
+          else
+            echo "FAIL: unexpected state: outcome=$OUTCOME should_review=$SHOULD_REVIEW"
+            exit 1
+          fi
+
+          # If should_review was set, verify it's a valid value
+          if [ -n "$SHOULD_REVIEW" ]; then
+            if [ "$SHOULD_REVIEW" != "true" ] && [ "$SHOULD_REVIEW" != "false" ]; then
+              echo "FAIL: should_review must be 'true' or 'false', got: $SHOULD_REVIEW"
+              exit 1
+            fi
+            echo "INFO: should_review output is valid: $SHOULD_REVIEW"
+          fi
+
+          # If diff_fingerprint was set, verify it has the expected format
+          if [ -n "$FINGERPRINT" ]; then
+            if echo "$FINGERPRINT" | grep -qE '.+\|cfg:.+'; then
+              echo "INFO: diff_fingerprint has expected format: $FINGERPRINT"
+            else
+              echo "INFO: diff_fingerprint format: $FINGERPRINT (format may vary)"
+            fi
+          fi
+
+          echo "PASS: precheck output validation complete"

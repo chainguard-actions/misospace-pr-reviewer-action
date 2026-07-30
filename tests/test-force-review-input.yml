@@ -1,0 +1,48 @@
+name: Test force_review input bypasses diff-unchanged guard
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with force_review=true and no PR number (expect failure or skip)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # pr_number omitted — no pull_request event context
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          force_review: "true"
+          skip_if_diff_unchanged: "true"
+          ai_primary_retries: "0"
+
+      - name: Assert action failed or skipped review (not due to diff-unchanged guard)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          # With force_review=true, the diff-unchanged guard is bypassed.
+          # However, without a PR number, the precheck still fails.
+          # The skip_reason should NOT be 'diff-unchanged' when force_review=true.
+          if [ "$SKIP_REASON" = "diff-unchanged" ]; then
+            echo "FAIL: force_review=true should bypass diff-unchanged guard, but skip_reason=$SKIP_REASON"
+            exit 1
+          fi
+          # The action should either fail outright or skip review (not due to diff-unchanged)
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (precheck failed — no PR number)"
+          elif [ -z "$SHOULD_REVIEW" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review (not due to diff-unchanged guard)"
+          else
+            echo "FAIL: expected action to fail or skip review, got outcome=$OUTCOME should_review=$SHOULD_REVIEW"
+            exit 1
+          fi
