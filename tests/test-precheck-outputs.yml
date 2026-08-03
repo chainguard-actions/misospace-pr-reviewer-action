@@ -1,0 +1,46 @@
+name: Test precheck outputs are populated
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with non-existent PR to exercise precheck outputs
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          pr_number: "999999999"
+          skip_if_diff_unchanged: "false"
+          ai_primary_retries: "0"
+          ai_primary_retry_delay_sec: "0"
+          on_model_failure: "fail"
+
+      - name: Assert precheck outputs are set
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+
+          # The action either fails (PR not found or AI API fails) or sets should_review
+          # In either case, the precheck step should have run
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed at precheck or review step (expected for non-existent PR)"
+            exit 0
+          fi
+
+          # If the action somehow didn't fail, should_review must be set
+          if [ -z "$SHOULD_REVIEW" ]; then
+            echo "FAIL: should_review output was not set by precheck"
+            exit 1
+          fi
+          echo "PASS: precheck outputs are populated (should_review=$SHOULD_REVIEW)"

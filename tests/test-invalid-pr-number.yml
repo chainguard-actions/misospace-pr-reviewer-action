@@ -1,0 +1,42 @@
+name: Test invalid PR number handling
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with non-existent PR number (expect failure)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          pr_number: "999999999"
+          ai_primary_retries: "0"
+          ai_primary_retry_delay_sec: "0"
+          on_model_failure: "fail"
+          # repo defaults to current repo; PR 999999999 should not exist
+
+      - name: Assert action failed or skipped for non-existent PR
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # The action should either:
+          # 1. Fail (can't fetch PR or can't call AI API), OR
+          # 2. Set should_review=false (skipped)
+          # It should NOT succeed with a verdict since the PR doesn't exist
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action correctly failed for non-existent PR number"
+          elif [ "$SHOULD_REVIEW" = "false" ]; then
+            echo "PASS: action correctly skipped review for non-existent PR"
+          else
+            echo "FAIL: action unexpectedly succeeded for PR 999999999"
+            exit 1
+          fi
