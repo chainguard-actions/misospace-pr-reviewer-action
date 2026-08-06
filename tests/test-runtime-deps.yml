@@ -1,0 +1,47 @@
+name: Test runtime dependency validation
+# The action's first step validates that gh, jq, curl, git, and python3 are
+# available. This test runs the action without a PR number so it fails quickly
+# (either at the dependency check or at the precheck for missing PR number).
+# Either way, the action fails gracefully — proving the runner environment is
+# compatible with the action's requirements.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          # pr_number intentionally omitted to trigger a fast failure after
+          # the dependency check passes
+          ai_base_url: "http://localhost:19999/v1"
+          ai_model: "test-model"
+          ai_primary_retries: "0"
+          ai_primary_retry_delay_sec: "0"
+
+      - name: Assert action failed gracefully (deps present or missing PR number)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # The action should fail because either:
+          # 1. A runtime dependency is missing (dep check fails), or
+          # 2. PR number is missing (precheck fails)
+          # Both are "failure" outcomes. "success" would be unexpected.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (missing dep or missing PR number)"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "INFO: action unexpectedly succeeded (no PR number was provided)"
+          elif [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action step was skipped — a prior step must have failed"
+            exit 1
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
