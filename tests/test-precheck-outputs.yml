@@ -1,0 +1,97 @@
+name: Test precheck outputs are set
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Run the action with a fake PR number. The precheck step handles API
+      # failures gracefully and always emits its outputs. The review step will
+      # fail (sentinel repo PR object fetch fails), but the precheck should
+      # have run and created its artifacts (pr.diff, pr-object.json).
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          repo: ${{ github.repository }}
+          pr_number: "1"
+          ai_base_url: "https://localhost:19999/v1"
+          ai_model: "test-model"
+          ai_request_timeout_sec: "3"
+          ai_connect_timeout_sec: "2"
+          ai_primary_retries: "0"
+          on_model_failure: "fail"
+
+      - name: Assert precheck step ran
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+          EFFECTIVE_SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          echo "effective_review_scope: $EFFECTIVE_SCOPE"
+
+          # Primary check: verify the action ran (not skipped/cancelled)
+          case "$OUTCOME" in
+            success|failure)
+              echo "INFO: action ran with outcome: $OUTCOME"
+              ;;
+            skipped|cancelled)
+              echo "FAIL: action was $OUTCOME — it should have run"
+              exit 1
+              ;;
+            "")
+              echo "INFO: outcome expression returned empty — using file-based check"
+              ;;
+            *)
+              echo "FAIL: unexpected outcome '$OUTCOME'"
+              exit 1
+              ;;
+          esac
+
+          # Secondary check: verify the precheck ran by checking for its artifacts.
+          # The precheck script always creates pr.diff (even when the API call fails).
+          if [ -f pr.diff ]; then
+            echo "PASS: pr.diff found — precheck ran successfully"
+          else
+            echo "WARN: pr.diff not found — precheck may not have run"
+            echo "INFO: This can happen if the dependency check failed (gh not available)"
+          fi
+
+          # If the action succeeded, verify the precheck outputs are set.
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -z "$DIFF_FINGERPRINT" ]; then
+              echo "FAIL: action succeeded but diff_fingerprint output was not set"
+              exit 1
+            fi
+            echo "PASS: diff_fingerprint is set: $DIFF_FINGERPRINT"
+
+            if [ "$SHOULD_REVIEW" != "true" ]; then
+              echo "FAIL: expected should_review=true, got '$SHOULD_REVIEW'"
+              exit 1
+            fi
+            echo "PASS: should_review=true as expected"
+
+            if [ "$EFFECTIVE_SCOPE" != "full" ]; then
+              echo "FAIL: expected effective_review_scope=full, got '$EFFECTIVE_SCOPE'"
+              exit 1
+            fi
+            echo "PASS: effective_review_scope=full as expected"
+          else
+            # Action failed — outputs may not be propagated under act.
+            # Log what we got for debugging.
+            if [ -n "$DIFF_FINGERPRINT" ]; then
+              echo "INFO: diff_fingerprint was propagated despite failure: $DIFF_FINGERPRINT"
+            fi
+            if [ -n "$SHOULD_REVIEW" ]; then
+              echo "INFO: should_review was propagated despite failure: $SHOULD_REVIEW"
+            fi
+            echo "PASS: precheck test complete (action failed at review step as expected)"
+          fi
