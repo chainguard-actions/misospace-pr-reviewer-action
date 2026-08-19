@@ -1,0 +1,66 @@
+name: Test on_model_failure=notice with unreachable AI endpoint
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up mock gh binary
+        run: |
+          mkdir -p /tmp/mock-bin
+          cp "$GITHUB_WORKSPACE/tests/fixtures/mock-gh.sh" /tmp/mock-bin/gh
+          chmod +x /tmp/mock-bin/gh
+          echo "/tmp/mock-bin" >> "$GITHUB_PATH"
+
+      - name: Run action with unreachable AI endpoint and on_model_failure=notice
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          repo: "test/repo"
+          pr_number: "1"
+          # Use a port that is not listening — connection will be refused immediately
+          ai_base_url: "http://127.0.0.1:19999/v1"
+          ai_model: "test-model"
+          ai_api_key: "test-key"
+          on_model_failure: "notice"
+          # Zero retries so the test completes quickly
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+          # Disable publishing to avoid side effects
+          publish_review_comment: "false"
+          publish_mode: "comment"
+          # Force review to bypass skip-if-unchanged
+          force_review: "true"
+          skip_if_diff_unchanged: "false"
+
+      - name: Assert precheck output should_review is true
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # The precheck step should set should_review=true since we forced a review
+          if [ "$SHOULD_REVIEW" != "true" ]; then
+            echo "FAIL: expected should_review=true when force_review=true, got: '$SHOULD_REVIEW'"
+            exit 1
+          fi
+          echo "PASS: should_review=true as expected"
+
+      - name: Assert action succeeded (on_model_failure=notice prevents step failure)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # With on_model_failure=notice, the action should succeed even when
+          # the AI endpoint is unreachable — it posts a notice instead of failing.
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected action to succeed with on_model_failure=notice, got outcome=$OUTCOME"
+            exit 1
+          fi
+          echo "PASS: action succeeded with on_model_failure=notice"
