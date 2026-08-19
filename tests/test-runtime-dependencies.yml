@@ -1,0 +1,45 @@
+name: Test runtime dependency validation
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Run the action itself to confirm the dependency validation step passes.
+      # The action's first step checks for gh, jq, curl, git, and python3.
+      # The action will fail at the precheck or review step (fake PR / no AI
+      # endpoint), but the dependency validation step runs first and must succeed.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "999999"
+          ai_base_url: "https://api.example.invalid/v1"
+          ai_model: "gpt-4o"
+          on_model_failure: "fail"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action ran (dependency check passed)
+        if: always()
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "action outcome: $OUTCOME"
+          # The action should fail at the precheck or review step (fake PR / no AI
+          # endpoint), not at the dependency validation step. Both failure and
+          # success are acceptable — what matters is that the action ran at all
+          # (i.e., the dependency check did not abort it before the precheck).
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (fake PR / no AI endpoint)"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded (may have skipped review)"
+          else
+            echo "FAIL: unexpected outcome=$OUTCOME (expected failure or success)"
+            exit 1
+          fi

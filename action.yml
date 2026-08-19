@@ -574,7 +574,7 @@ runs:
         AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
         AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "${GITHUB_ACTION_PATH}/scripts/check_review_needed.sh"
+      run: bash "$GITHUB_ACTION_PATH/scripts/check_review_needed.sh"
     - name: Wait for CI checks to complete
       id: ci_status
       if: inputs.ci_status_check == 'true' && steps.precheck.outputs.should_review == 'true'
@@ -592,7 +592,7 @@ runs:
         CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}
         CI_CHECKS_FILE: ${{ runner.temp }}/ci-checks-context.md
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "${GITHUB_ACTION_PATH}/scripts/wait_for_ci.sh"
+      run: bash "$GITHUB_ACTION_PATH/scripts/wait_for_ci.sh"
     - name: Run AI review
       if: steps.precheck.outputs.should_review == 'true'
       id: review
@@ -691,7 +691,7 @@ runs:
         PREVIOUS_HEAD_SHA: ${{ steps.precheck.outputs.previous_head_sha }}
         TOOL_EVIDENCE_MEMORY: ${{ inputs.tool_evidence_memory }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-      run: bash "${GITHUB_ACTION_PATH}/scripts/run_review.sh"
+      run: bash "$GITHUB_ACTION_PATH/scripts/run_review.sh"
     - name: Publish review comment
       if: inputs.publish_review_comment == 'true' && steps.precheck.outputs.should_review == 'true' && inputs.publish_mode == 'comment'
       shell: bash
@@ -713,9 +713,9 @@ runs:
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope }}
+        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
         BASE_SHA: ${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}
-        PREVIOUS_HEAD_SHA_RAW: ${{ steps.precheck.outputs.previous_head_sha }}
+        PREVIOUS_HEAD_SHA_INPUT: ${{ steps.precheck.outputs.previous_head_sha || '' }}
       run: |
         set -euo pipefail
         source "${GITHUB_ACTION_PATH}/scripts/publish_helpers.sh"
@@ -734,7 +734,7 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${BASE_SHA}" "${PREVIOUS_HEAD_SHA_RAW:-}")"
+        METADATA_MARKER="$(build_metadata_marker "$BASE_SHA" "$PREVIOUS_HEAD_SHA_INPUT")"
 
         if [ "$VERDICT" = "request_changes" ]; then
           VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
@@ -786,7 +786,7 @@ runs:
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope }}
+        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
         BASE_SHA: ${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}
       run: |
         set -euo pipefail
@@ -810,7 +810,7 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${BASE_SHA}" "")"
+        METADATA_MARKER="$(build_metadata_marker "$BASE_SHA" "")"
         REVIEW_HEADER="# AI Automated Review"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
           REVIEW_HEADER="# AI Automated Review (incremental)"
@@ -899,10 +899,10 @@ runs:
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
-        IS_FORK_PR_RAW: ${{ steps.precheck.outputs.is_fork_pr }}
-        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope }}
-        PREVIOUS_HEAD_SHA_RAW: ${{ steps.precheck.outputs.previous_head_sha }}
-        BASELINE_CLEAN_RAW: ${{ steps.precheck.outputs.baseline_clean }}
+        IS_FORK_PR_INPUT: ${{ steps.precheck.outputs.is_fork_pr }}
+        EFFECTIVE_REVIEW_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
+        PREVIOUS_HEAD_SHA_INPUT: ${{ steps.precheck.outputs.previous_head_sha || '' }}
+        BASELINE_CLEAN_INPUT: ${{ steps.precheck.outputs.baseline_clean || 'false' }}
         BASE_SHA: ${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}
       run: |
         set -euo pipefail
@@ -920,22 +920,22 @@ runs:
 
         # Determine if the PR is from a fork. The precheck step already fetched
         # the PR object; only fall back to the API when its output is missing.
-        IS_FORK_PR="${IS_FORK_PR_RAW:-}"
+        IS_FORK_PR="$IS_FORK_PR_INPUT"
         if [ -z "$IS_FORK_PR" ]; then
           IS_FORK_PR="$(platform_pr_get "$REPO" "$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
         fi
 
         # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${EFFECTIVE_REVIEW_SCOPE:-full}"
-        PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA_RAW:-}"
-        BASELINE_CLEAN="${BASELINE_CLEAN_RAW:-false}"
+        PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA_INPUT:-}"
+        BASELINE_CLEAN="${BASELINE_CLEAN_INPUT:-false}"
         REVIEW_RESULT="clean"
         if [ "$VERDICT" = "request_changes" ]; then
           REVIEW_RESULT="issues"
         fi
 
         # Build metadata marker with verdict safety for incremental
-        METADATA_MARKER="$(build_metadata_marker "${BASE_SHA}" "$PREVIOUS_HEAD_SHA")"
+        METADATA_MARKER="$(build_metadata_marker "$BASE_SHA" "$PREVIOUS_HEAD_SHA")"
         REVIEW_HEADER="# AI Automated Review"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
           REVIEW_HEADER="# AI Automated Review (incremental)"

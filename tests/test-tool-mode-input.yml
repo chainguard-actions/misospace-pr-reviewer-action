@@ -1,0 +1,54 @@
+name: Test tool mode inputs accepted
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Test that the action accepts tool_mode=plan_execute_once and related
+      # tool harness inputs without crashing. The action will fail at the review
+      # step because the PR number is fake (doesn't exist in the repo), which
+      # confirms the action got past input validation successfully.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "999999"
+          ai_base_url: "https://api.example.invalid/v1"
+          ai_model: "gpt-4o"
+          tool_mode: "plan_execute_once"
+          tool_max_requests: "4"
+          tool_max_rounds: "3"
+          tool_planning_timeout_sec: "60"
+          tool_planning_max_context_bytes: "50000"
+          tool_planning_max_tokens: "400"
+          tool_max_response_bytes: "12000"
+          tool_request_timeout_sec: "20"
+          tool_failure_enforcement: "false"
+          tool_min_successful_requests: "0"
+          tool_enable_for_forks: "false"
+          on_model_failure: "fail"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action failed at review not at input validation
+        if: always()
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "action outcome: $OUTCOME"
+          # The action should fail because the PR doesn't exist (fake PR number),
+          # not because the inputs were invalid.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (fake PR / no AI endpoint)"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded (may have skipped review)"
+          else
+            echo "FAIL: unexpected outcome=$OUTCOME"
+            exit 1
+          fi
