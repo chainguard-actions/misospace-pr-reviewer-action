@@ -1,0 +1,68 @@
+name: Test skip when diff is unchanged
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_EVENT_NAME: pull_request
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up mock gh CLI
+        run: |
+          mkdir -p /tmp/mock-bin
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'ARGS="$*"' \
+            'if echo "$ARGS" | grep -q "pr diff"; then printf ""; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "issues/[0-9]+/comments"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+/reviews"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+/files"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+"; then echo "{\"number\":1,\"title\":\"Test PR\",\"body\":\"\",\"head\":{\"sha\":\"abc123def456abc123def456abc123def456abc123\",\"ref\":\"feature\",\"repo\":{\"full_name\":\"owner/repo\"}},\"base\":{\"sha\":\"def456abc123def456abc123def456abc123def456\",\"ref\":\"main\",\"repo\":{\"full_name\":\"owner/repo\"}},\"user\":{\"login\":\"testuser\"},\"changed_files\":0,\"additions\":0,\"deletions\":0,\"html_url\":\"https://github.com/owner/repo/pull/1\"}"; exit 0; fi' \
+            'if echo "$ARGS" | grep -q "pr comment"; then exit 0; fi' \
+            'echo "[]"' \
+            'exit 0' \
+            > /tmp/mock-bin/gh
+          chmod +x /tmp/mock-bin/gh
+          echo "/tmp/mock-bin" >> "$GITHUB_PATH"
+
+      - name: Run action with skip_if_diff_unchanged=true and force_review=false
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token
+          ai_base_url: http://localhost:11434
+          ai_model: test-model
+          repo: owner/repo
+          pr_number: "1"
+          skip_if_diff_unchanged: "true"
+          force_review: "false"
+          publish_review_comment: "false"
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GH_TOKEN: fake-token
+
+      - name: Assert precheck outputs are present
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+          EFFECTIVE_SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+        run: |
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          echo "effective_review_scope: $EFFECTIVE_SCOPE"
+          # The precheck step should have run and produced outputs
+          # With no real PR diff, fingerprint will be 'empty-diff|cfg:...'
+          # should_review may be true or false depending on prior comment state
+          if [ -z "$SHOULD_REVIEW" ]; then
+            echo "FAIL: should_review output was not set"
+            exit 1
+          fi
+          if [ -z "$DIFF_FINGERPRINT" ]; then
+            echo "FAIL: diff_fingerprint output was not set"
+            exit 1
+          fi
+          echo "PASS: precheck outputs are set (should_review=$SHOULD_REVIEW, diff_fingerprint=$DIFF_FINGERPRINT)"

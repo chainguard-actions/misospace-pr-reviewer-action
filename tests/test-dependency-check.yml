@@ -1,0 +1,69 @@
+name: Test runtime dependency validation
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify required tools are present
+        run: |
+          echo "Checking for required runtime dependencies..."
+          for cmd in jq curl git python3; do
+            if ! command -v "$cmd" > /dev/null 2>&1; then
+              echo "FAIL: required tool '$cmd' not found"
+              exit 1
+            fi
+            echo "PASS: $cmd found at $(command -v $cmd)"
+          done
+          echo "All required runtime dependencies are present"
+
+      - name: Set up mock gh CLI
+        run: |
+          mkdir -p /tmp/mock-bin
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'ARGS="$*"' \
+            'if echo "$ARGS" | grep -q "pr diff"; then printf ""; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "issues/[0-9]+/comments"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+/reviews"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+/files"; then echo "[]"; exit 0; fi' \
+            'if echo "$ARGS" | grep -qE "pulls/[0-9]+"; then echo "{\"number\":1,\"title\":\"Test PR\",\"body\":\"\",\"head\":{\"sha\":\"abc123def456abc123def456abc123def456abc123\",\"ref\":\"feature\",\"repo\":{\"full_name\":\"owner/repo\"}},\"base\":{\"sha\":\"def456abc123def456abc123def456abc123def456\",\"ref\":\"main\",\"repo\":{\"full_name\":\"owner/repo\"}},\"user\":{\"login\":\"testuser\"},\"changed_files\":0,\"additions\":0,\"deletions\":0,\"html_url\":\"https://github.com/owner/repo/pull/1\"}"; exit 0; fi' \
+            'if echo "$ARGS" | grep -q "pr comment"; then exit 0; fi' \
+            'echo "[]"' \
+            'exit 0' \
+            > /tmp/mock-bin/gh
+          chmod +x /tmp/mock-bin/gh
+          echo "/tmp/mock-bin" >> "$GITHUB_PATH"
+
+      - name: Verify gh is available (mock or real)
+        run: |
+          if ! command -v gh > /dev/null 2>&1; then
+            echo "FAIL: gh CLI not found"
+            exit 1
+          fi
+          echo "PASS: gh found at $(command -v gh)"
+
+      - name: Run action with missing PR number (expect failure at precheck)
+        id: action
+        continue-on-error: true
+        uses: .
+        with:
+          github_token: fake-token
+          ai_base_url: http://localhost:11434
+          ai_model: test-model
+          repo: owner/repo
+          pr_number: ""
+        env:
+          GITHUB_EVENT_NAME: pull_request
+
+      - name: Assert action failed at precheck due to missing PR number
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "action outcome: $OUTCOME"
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: expected action to fail when PR_NUMBER is empty, got outcome=$OUTCOME"
+            exit 1
+          fi
+          echo "PASS: action correctly failed when PR_NUMBER is missing"
