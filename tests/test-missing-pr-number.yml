@@ -4,30 +4,30 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_EVENT_NAME: pull_request
-      GITHUB_REF: refs/pull/1/merge
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Run action without PR number (expect failure at precheck)
-        id: action
-        uses: .
+      - id: action
+        uses: ./action
         continue-on-error: true
         with:
-          github_token: fake-token
-          ai_base_url: http://localhost:9999
-          ai_model: test-model
-          # pr_number intentionally omitted — precheck should exit 1 with
-          # "Missing REPO or PR_NUMBER"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Intentionally omit pr_number so the precheck exits 1
+          # with "Missing REPO or PR_NUMBER" — no AI API calls needed.
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
 
       - name: Assert action failed due to missing PR number
+        if: always()
         env:
           OUTCOME: ${{ steps.action.outcome }}
         run: |
           echo "outcome: $OUTCOME"
           if [ "$OUTCOME" != "failure" ]; then
-            echo "FAIL: expected action to fail when PR number is missing, got '$OUTCOME'"
+            echo "FAIL: expected action to fail when pr_number is not provided, got outcome=$OUTCOME"
             exit 1
           fi
-          echo "PASS: action correctly failed when PR number was missing"
+          echo "PASS: action correctly failed when pr_number was missing"

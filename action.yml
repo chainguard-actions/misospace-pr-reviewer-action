@@ -509,7 +509,6 @@ runs:
         AI_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_connect_timeout_sec }}
         AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
         AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
-        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: bash "$GITHUB_ACTION_PATH/scripts/check_review_needed.sh"
     - name: Wait for CI checks to complete
       id: ci_status
@@ -527,7 +526,6 @@ runs:
         CI_INTERVAL_SEC: ${{ inputs.ci_interval_sec }}
         CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}
         CI_CHECKS_FILE: ${{ runner.temp }}/ci-checks-context.md
-        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: bash "$GITHUB_ACTION_PATH/scripts/wait_for_ci.sh"
     - name: Run AI review
       if: steps.precheck.outputs.should_review == 'true'
@@ -614,7 +612,6 @@ runs:
         REVIEW_SCOPE: ${{ inputs.review_scope }}
         EFFECTIVE_SCOPE: ${{ steps.precheck.outputs.effective_review_scope }}
         PREVIOUS_HEAD_SHA: ${{ steps.precheck.outputs.previous_head_sha }}
-        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run_review.sh"
     - name: Publish review comment
       if: inputs.publish_review_comment == 'true' && steps.precheck.outputs.should_review == 'true' && inputs.publish_mode == 'comment'

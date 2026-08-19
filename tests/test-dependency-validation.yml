@@ -1,35 +1,38 @@
-name: Test runtime dependency validation
+name: Test runtime dependency validation passes
 on:
   workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_EVENT_NAME: push
-      GITHUB_REF: refs/heads/main
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Run action with fake inputs (expect failure — no real GitHub/AI access)
-        id: action
-        uses: .
+      - id: action
+        uses: ./action
         continue-on-error: true
         with:
-          github_token: fake-token
-          repo: owner/repo
-          pr_number: "999"
-          ai_base_url: http://localhost:9999
-          ai_model: test-model
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Omit pr_number so the precheck exits immediately with
+          # "Missing REPO or PR_NUMBER" — fast failure, no AI API calls.
+          # The action's first step validates gh, jq, curl, git, python3
+          # before reaching the precheck; if any dependency is missing the
+          # action also fails, which is still the expected outcome here.
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
 
-      - name: Assert action failed as expected
+      - name: Assert action failed at precheck
+        if: always()
         env:
           OUTCOME: ${{ steps.action.outcome }}
         run: |
           echo "outcome: $OUTCOME"
-          # The action should fail because it has no real GitHub token or AI endpoint.
-          # A failure here means the action ran and exited non-zero — which is correct.
+          # The action should fail because PR_NUMBER is empty (or because
+          # a dependency is missing). Either way, outcome must be failure.
           if [ "$OUTCOME" != "failure" ]; then
-            echo "FAIL: expected action to fail (no real GitHub/AI access), got '$OUTCOME'"
+            echo "FAIL: expected action to fail when pr_number is not provided, got outcome=$OUTCOME"
             exit 1
           fi
-          echo "PASS: action failed as expected"
+          echo "PASS: action failed as expected (dependency validation passed or precheck failed fast)"

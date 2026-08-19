@@ -8,7 +8,7 @@
 
 **Test Policy SHA:** `843adf9e4b8f85d0c08b27b9d0b09dd094b54702`
 
-**Harden Agent Version:** `1`
+**Harden Agent Version:** `2`
 
 Action **misospace--pr-reviewer-action/v1.2.9** was hardened automatically. 1 finding(s) were identified and resolved across 2 iteration(s).
 
@@ -16,36 +16,19 @@ Action **misospace--pr-reviewer-action/v1.2.9** was hardened automatically. 1 fi
 
 ### script-injection (severity: high)
 
-Multiple `${{ }}` expressions are interpolated directly inside `run:` shell command strings in action.yml, violating sub-rule (a). This allows template substitution to inject arbitrary shell content before the shell parses the command.
-
-1. Step 'Check whether review is needed': `run: bash "${{ github.action_path }}/scripts/check_review_needed.sh"` — `${{ github.action_path }}` is interpolated directly into the shell command string.
-
-2. Step 'Wait for CI checks to complete': `run: bash "${{ github.action_path }}/scripts/wait_for_ci.sh"` — same issue.
-
-3. Step 'Run AI review': `run: bash "${{ github.action_path }}/scripts/run_review.sh"` — same issue.
-
-4. Step 'Publish review comment' (shell script body): `EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"` and `METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"` — steps.* and github.* expressions interpolated directly in the multi-line shell script body.
-
-5. Step 'Publish review comment (non-blocking)' (shell script body): same EFFECTIVE_SCOPE and METADATA_MARKER patterns with ${{ steps.* }} and ${{ github.* }} expressions directly in the shell script body.
-
-6. Step 'Publish review verdict' (shell script body): `IS_FORK_PR="${{ steps.precheck.outputs.is_fork_pr }}"`, `EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"`, `PREVIOUS_HEAD_SHA="${{ steps.precheck.outputs.previous_head_sha || '' }}"`, `BASELINE_CLEAN="${{ steps.precheck.outputs.baseline_clean || 'false' }}"`, and `METADATA_MARKER` with `${{ github.event.pull_request.base.sha }}` — all directly interpolated in the shell script body.
-
-All of these should be moved to env: blocks and referenced as shell variables.
+Rule (a) violation: Multiple `${{ ... }}` expressions are directly interpolated inside `run:` shell script bodies in three composite action steps, bypassing the env: indirection safety layer. In the 'Publish review comment' step, `EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"` and `METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"` are assigned inline in the shell script body. The same pattern repeats in 'Publish review comment (non-blocking)' and 'Publish review verdict' steps, which additionally inline `IS_FORK_PR="${{ steps.precheck.outputs.is_fork_pr }}"`, `PREVIOUS_HEAD_SHA="${{ steps.precheck.outputs.previous_head_sha || '' }}"`, and `BASELINE_CLEAN="${{ steps.precheck.outputs.baseline_clean || 'false' }}"`. The `github.event.pull_request.base.sha` value comes from the PR event payload and is attacker-influenced; all `steps.*.outputs.*` values flow from earlier steps that process PR content. Any of these values containing shell metacharacters will be interpreted by the shell before assignment.
 
 Locations:
 
-- `action.yml:486`
-- `action.yml:502`
-- `action.yml:612`
-- `action.yml:640`
-- `action.yml:645`
-- `action.yml:700`
-- `action.yml:705`
-- `action.yml:805`
-- `action.yml:811`
-- `action.yml:813`
-- `action.yml:815`
-- `action.yml:820`
+- `action.yml:480`
+- `action.yml:483`
+- `action.yml:530`
+- `action.yml:533`
+- `action.yml:596`
+- `action.yml:600`
+- `action.yml:601`
+- `action.yml:602`
+- `action.yml:605`
 
 ## Iteration Notes
 
@@ -55,25 +38,19 @@ Locations:
 
 **Notes:**
 
-Fixed all 6 script injection locations in action.yml:
+Fixed script injection in three composite action steps by moving all ${{ ... }} expressions from run: shell script bodies into the step's env: block. Changes made to hardened/action/action.yml:
 
-1. 'Check whether review is needed' step: Added GITHUB_ACTION_PATH to env block, changed run command from `bash "${{ github.action_path }}/scripts/check_review_needed.sh"` to `bash "$GITHUB_ACTION_PATH/scripts/check_review_needed.sh"`.
+1. 'Publish review comment' step: Added EFFECTIVE_REVIEW_SCOPE (${{ steps.precheck.outputs.effective_review_scope }}), BASE_SHA (${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}), and PREVIOUS_HEAD_SHA (${{ steps.precheck.outputs.previous_head_sha }}) to env:. Replaced inline ${{ }} assignments with ${EFFECTIVE_REVIEW_SCOPE:-full}, ${BASE_SHA}, and ${PREVIOUS_HEAD_SHA:-} in the run: block.
 
-2. 'Wait for CI checks to complete' step: Same fix for github.action_path.
+2. 'Publish review comment (non-blocking)' step: Added EFFECTIVE_REVIEW_SCOPE and BASE_SHA to env:. Replaced inline ${{ }} assignments with ${EFFECTIVE_REVIEW_SCOPE:-full} and ${BASE_SHA} in the run: block.
 
-3. 'Run AI review' step: Same fix for github.action_path.
-
-4. 'Publish review comment' step: Added EFFECTIVE_REVIEW_SCOPE, BASE_SHA, PREVIOUS_HEAD_SHA to env block; replaced ${{ steps.precheck.outputs.effective_review_scope || 'full' }}, ${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}, and ${{ steps.precheck.outputs.previous_head_sha || '' }} in shell body with ${EFFECTIVE_REVIEW_SCOPE:-full}, ${BASE_SHA}, and ${PREVIOUS_HEAD_SHA:-}.
-
-5. 'Publish review comment (non-blocking)' step: Added EFFECTIVE_REVIEW_SCOPE and BASE_SHA to env block; replaced same patterns.
-
-6. 'Publish review verdict' step: Added IS_FORK_PR_INPUT, EFFECTIVE_REVIEW_SCOPE, PREVIOUS_HEAD_SHA_INPUT, BASELINE_CLEAN_INPUT, and BASE_SHA to env block; replaced all ${{ steps.precheck.outputs.* }} and ${{ github.event.pull_request.base.sha }} expressions in shell body with plain env variable references (IS_FORK_PR_INPUT, EFFECTIVE_REVIEW_SCOPE:-full, PREVIOUS_HEAD_SHA_INPUT:-,  BASELINE_CLEAN_INPUT:-false, BASE_SHA).
+3. 'Publish review verdict (native PR review)' step: Added IS_FORK_PR_INPUT (${{ steps.precheck.outputs.is_fork_pr }}), EFFECTIVE_REVIEW_SCOPE (${{ steps.precheck.outputs.effective_review_scope }}), PREVIOUS_HEAD_SHA_INPUT (${{ steps.precheck.outputs.previous_head_sha }}), BASELINE_CLEAN_INPUT (${{ steps.precheck.outputs.baseline_clean }}), and BASE_SHA (${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}) to env:. Replaced all inline ${{ }} assignments with plain env var references in the run: block.
 
 ### Iteration 2
 
-**Fixes applied:** github-env-injection
+**Fixes applied:** script-injection, github-env-injection
 
 **Notes:**
 
-Fixed github-env-injection in scripts/run_review.sh: The ANALYSIS_ENGINE variable (constructed from user-controlled inputs AI_MODEL, AI_BASE_URL, AI_API_FORMAT) was being written directly to $GITHUB_OUTPUT without sanitization. Added a sanitization step using `printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r'` to strip newline characters before writing to $OUTPUT_FILE, preventing injection of arbitrary key=value pairs into GITHUB_OUTPUT.
+Fixed script-injection in action.yml by replacing `bash "${{ github.action_path }}/scripts/..."` with `bash "$GITHUB_ACTION_PATH/scripts/..."` in all three affected run: blocks (check_review_needed.sh, wait_for_ci.sh, run_review.sh). GITHUB_ACTION_PATH is a built-in GitHub Actions runner environment variable automatically available in all composite action steps, so no env: block changes were needed. Fixed github-env-injection in scripts/run_review.sh by sanitizing ANALYSIS_ENGINE before writing to $OUTPUT_FILE: added `safe_analysis_engine="$(printf '%s' "$ANALYSIS_ENGINE" | tr -d '\n\r')"` and changed the echo to use `$safe_analysis_engine` instead of `$ANALYSIS_ENGINE` directly.
 

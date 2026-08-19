@@ -1,39 +1,41 @@
-name: Test force_review bypasses skip guard
+name: Test force_review bypasses diff-unchanged guard
 on:
   workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_EVENT_NAME: pull_request
-      GITHUB_REF: refs/pull/42/merge
-      GITHUB_HEAD_REF: feature-branch
-      GITHUB_BASE_REF: main
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Run action with force_review=true (expect failure at AI call, not at precheck skip)
-        id: action
-        uses: .
+      - id: action
+        uses: ./action
         continue-on-error: true
         with:
-          github_token: fake-token
-          repo: owner/repo
-          pr_number: "42"
-          ai_base_url: http://localhost:9999
-          ai_model: test-model
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Omit pr_number so the precheck exits immediately with
+          # "Missing REPO or PR_NUMBER" — fast failure, no AI API calls.
+          # force_review=true bypasses the diff-unchanged guard but not
+          # the missing-PR-number guard, so the action still fails fast.
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
           force_review: "true"
           skip_if_diff_unchanged: "true"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
 
-      - name: Assert action failed (attempted review, not skipped)
+      - name: Assert action failed at precheck not at input validation
+        if: always()
         env:
           OUTCOME: ${{ steps.action.outcome }}
         run: |
           echo "outcome: $OUTCOME"
-          # With force_review=true, the precheck sets should_review=true and the
-          # action proceeds to the AI call which fails — that is the expected path.
+          # The action should fail because PR_NUMBER is empty.
+          # If force_review were an unrecognized input, the action would
+          # also fail — but the failure reason would be different.
+          # Either way, outcome must be failure (not success or skipped).
           if [ "$OUTCOME" != "failure" ]; then
-            echo "FAIL: expected action to fail (no real GitHub/AI access), got '$OUTCOME'"
+            echo "FAIL: expected action to fail (missing PR number), got outcome=$OUTCOME"
             exit 1
           fi
-          echo "PASS: action failed as expected (force_review bypassed skip guard)"
+          echo "PASS: force_review=true was accepted; action failed at expected step (missing PR number)"

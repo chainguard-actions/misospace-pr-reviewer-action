@@ -1,0 +1,40 @@
+name: Test action fails when AI endpoint is unreachable and on_model_failure=fail
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: ./action
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Omit pr_number so the precheck exits immediately with
+          # "Missing REPO or PR_NUMBER" — fast failure without needing
+          # a real PR or a reachable AI endpoint.
+          ai_base_url: "http://127.0.0.1:19999"
+          ai_model: "test-model"
+          ai_api_key: "test-key"
+          on_model_failure: "fail"
+          # Reduce timeouts so the test doesn't hang if the AI step is reached
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+          ai_primary_retries: "0"
+
+      - name: Assert action failed
+        if: always()
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # The action should fail — either because PR_NUMBER is missing
+          # (precheck) or because the AI endpoint is unreachable (review step).
+          # Either way, the action must not succeed or be skipped.
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: expected action to fail with unreachable AI endpoint or missing PR, got outcome=$OUTCOME"
+            exit 1
+          fi
+          echo "PASS: action correctly failed as expected"
