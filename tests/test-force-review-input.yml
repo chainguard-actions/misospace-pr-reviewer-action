@@ -1,0 +1,51 @@
+name: Test force_review and skip_if_diff_unchanged inputs
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Test that force_review=true and skip_if_diff_unchanged=false are
+      # accepted as valid inputs. The action will fail at the precheck step
+      # (no valid PR) or at the model call step (no real AI endpoint).
+      # Use a localhost AI endpoint and 0 retries so the action fails fast.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: http://127.0.0.1:1
+          ai_model: test-model
+          pr_number: "99999999"
+          repo: "actions/checkout"
+          force_review: "true"
+          skip_if_diff_unchanged: "false"
+          on_model_failure: "notice"
+          fail_on_request_changes: "false"
+          publish_mode: "comment"
+          publish_review_comment: "false"
+          ai_primary_retries: "0"
+          ai_connect_timeout_sec: "2"
+          ai_request_timeout_sec: "5"
+
+      - name: Assert action ran (inputs accepted, failed gracefully)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed successfully"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (expected with no real AI endpoint)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

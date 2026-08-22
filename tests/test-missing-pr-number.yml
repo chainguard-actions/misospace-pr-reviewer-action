@@ -1,0 +1,46 @@
+name: Test missing PR number fails gracefully
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # When pr_number is not provided and there is no pull_request event,
+      # the precheck script exits immediately with "Missing REPO or PR_NUMBER".
+      # The action should fail, not silently succeed.
+      # No AI API calls are made in this scenario (fails at precheck).
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: http://127.0.0.1:1
+          ai_model: test-model
+          # pr_number intentionally omitted — no pull_request event context
+          # repo intentionally omitted — will use sentinel GITHUB_REPOSITORY
+
+      - name: Assert action failed (missing PR number)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # Without a PR number and not on a pull_request event, the precheck
+          # script exits with an error — the action must fail, not silently pass.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (no PR number available)"
+          elif [ "$OUTCOME" = "success" ]; then
+            # If should_review=false, the action may have short-circuited gracefully
+            if [ "$SHOULD_REVIEW" = "false" ]; then
+              echo "PASS: action skipped review (no PR context)"
+            else
+              echo "FAIL: action succeeded unexpectedly with no PR number"
+              exit 1
+            fi
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
