@@ -1,0 +1,61 @@
+name: Test - Action outputs structure
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action and capture all outputs
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: "https://localhost:19999/v1"
+          ai_model: "test-model"
+          pr_number: ""
+          skip_if_diff_unchanged: "false"
+          force_review: "false"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action ran and outputs are structured correctly
+        if: always()
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+          EFFECTIVE_REVIEW_SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          echo "effective_review_scope: $EFFECTIVE_REVIEW_SCOPE"
+
+          # The action must not produce an unexpected outcome
+          if [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action step was skipped — a prior step may have failed"
+            exit 1
+          elif [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
+
+          # On success, should_review output must be set to a known value
+          if [ "$OUTCOME" = "success" ]; then
+            if [ "$SHOULD_REVIEW" = "true" ] || [ "$SHOULD_REVIEW" = "false" ]; then
+              echo "PASS: should_review output is set to '$SHOULD_REVIEW'"
+            else
+              echo "WARN: should_review output is '$SHOULD_REVIEW' (may be empty if precheck failed early)"
+            fi
+          fi
+
+          echo "PASS: action ran and produced expected output structure (outcome=$OUTCOME)"

@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the gitleaks CLI below can scan every commit, not
+          # just the PR merge ref of a shallow checkout.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # Pinned to 3.14 to match the local dev interpreter — a version skew
+          # between local and CI is how the duplicate-key regression test first
+          # shipped broken (passed on local 3.9, ModuleNotFoundError on CI 3.x).
+          python-version: '3.14'
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate action metadata YAML
+        run: ruby -e 'require "yaml"; YAML.load_file("action.yml")'
+
+      - name: Validate example workflow YAML
+        run: ruby -e 'require "yaml"; YAML.load_file("examples/workflow-self-hosted.yml"); YAML.load_file("examples/workflow-cloud.yml")'
+
+      # GitHub's Actions runner rejects a mapping with a duplicate key at load
+      # time ("'X' is already defined") — but ruby/python YAML loaders silently
+      # keep the last value, so the loads above pass on a manifest the runner
+      # would reject. This shipped the broken v1.2.10 (duplicate PLATFORM in
+      # three env: blocks, #255). yamllint's key-duplicates rule catches the
+      # whole class at any nesting depth, across the manifest and every workflow.
+      - name: Lint for duplicate YAML keys
+        run: |
+          yamllint -d "{rules: {key-duplicates: enable}}" \
+            action.yml \
+            .github/workflows/*.yaml \
+            examples/*.yml
+
+      - name: Lint GitHub Actions workflows
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+      # Secret scan: this action forwards operator PATs and AI_API_KEYs, so a
+      # hardcoded credential in a committed diff is exactly the regression class
+      # the redaction work (#471, #360) guards against. The official license-free
+      # gitleaks CLI (image pinned by digest) scans the full checkout history —
+      # the checkout above uses fetch-depth 0 — on every run, failing the build
+      # on any detection. .gitleaks.toml allowlists the intentionally fake
+      # credential fixtures in the redaction test suites.
+      - name: Scan for leaked secrets (gitleaks)
+        uses: docker://ghcr.io/gitleaks/gitleaks@sha256:090a2715530bd6592342e6a66c3f35eafcaaf2a3227a312482504f9c854997e3
+        with:
+          args: git --config /github/workspace/.gitleaks.toml --no-banner --redact /github/workspace
+
+      - name: Check shell scripts
+        run: |
+          set -euo pipefail
+          for f in scripts/*.sh tests/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Lint shell scripts with shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 shellcheck
+
+      - name: Check Python scripts
+        run: find scripts pr_reviewer tests -name '*.py' -print0 | xargs -0 python3 -m py_compile
+
+      - name: Verify smoke test helper is executable
+        run: test -x tests/smoke_test.sh
+
+      - name: Run smoke test
+        run: tests/smoke_test.sh
+
+      - name: Verify Forgejo E2E smoke harness parses
+        run: bash -n tests/forgejo_e2e_smoke.sh
+
+      # Coverage is scoped to pr_reviewer/ and scripts/ — the bash test suites
+      # below cover the shell side, which pytest-cov can't measure.
+      # Threshold: measured baseline was 76% (2026-07-03); gate at 72 to absorb
+      # small fluctuations. Ratchet toward the audit's 80% as coverage grows.
+      - name: Run Python tests (auto-discover all 215)
+        run: |
+          COV_FAIL_UNDER=72
+          pytest tests/ -v --tb=short \
+            --cov=pr_reviewer --cov=scripts \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under="$COV_FAIL_UNDER"
+
+      # Auto-discover every bash suite so a new (or previously unlisted) suite
+      # cannot silently stay out of CI. The smoke test runs separately above.
+      - name: Run bash test suites (auto-discover)
+        run: |
+          set -euo pipefail
+          failed=0
+          for t in tests/test_*.sh; do
+            echo "::group::$t"
+            if ! bash "$t"; then
+              echo "::error::$t failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"

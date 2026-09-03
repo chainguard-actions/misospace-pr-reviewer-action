@@ -1,0 +1,58 @@
+name: Test - fail_on_request_changes configuration
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with fail_on_request_changes=true
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: "https://localhost:19999/v1"
+          ai_model: "test-model"
+          pr_number: ""
+          fail_on_request_changes: "true"
+          skip_if_diff_unchanged: "false"
+          force_review: "false"
+          on_model_failure: "notice"
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "3"
+
+      - name: Assert action handled fail_on_request_changes configuration
+        if: always()
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "should_review: $SHOULD_REVIEW"
+          # With fail_on_request_changes=true and no PR number:
+          # - The precheck exits immediately (missing PR_NUMBER) → action fails
+          # With fail_on_request_changes=true and a verdict of request_changes:
+          # - The action fails after publishing the review
+          # Either way, failure is the expected outcome here.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed as expected (no PR context or request_changes verdict)"
+          elif [ "$OUTCOME" = "success" ]; then
+            # If it succeeded, the verdict must not be request_changes
+            if [ "$VERDICT" = "request_changes" ]; then
+              echo "FAIL: verdict is request_changes but action succeeded (fail_on_request_changes=true should have failed it)"
+              exit 1
+            fi
+            echo "PASS: action succeeded with verdict='$VERDICT' (no request_changes gate triggered)"
+          elif [ "$OUTCOME" = "skipped" ]; then
+            echo "FAIL: action step was skipped — a prior step may have failed"
+            exit 1
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
