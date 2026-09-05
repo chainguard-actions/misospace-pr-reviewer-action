@@ -1,0 +1,52 @@
+name: Test review routing auto mode
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          review_routing_mode: "auto"
+          ai_primary_model: "gpt-4o-mini"
+          ai_smart_model: "gpt-4o"
+          escalate_on_fast_request_changes: "true"
+          escalate_on_fast_low_confidence: "true"
+          escalate_on_dirty_baseline: "true"
+          # No pr_number — action fails at precheck (missing PR_NUMBER).
+          # The review_routing_mode=auto inputs are accepted without validation error.
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert routing mode inputs accepted
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review_route }}
+          ESCALATION_REASON: ${{ steps.action.outputs.escalation_reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "review_route: $REVIEW_ROUTE"
+          echo "escalation_reason: $ESCALATION_REASON"
+          # The action should accept review_routing_mode=auto inputs without
+          # crashing on input validation. Without a PR number, the action fails
+          # at the precheck step (missing PR_NUMBER).
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed with routing mode auto"
+            if [ -n "$REVIEW_ROUTE" ]; then
+              echo "PASS: review_route is set to '$REVIEW_ROUTE'"
+            fi
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (no PR number)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

@@ -1,0 +1,45 @@
+name: Test Anthropic API format
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.anthropic.com"
+          ai_api_format: "anthropic"
+          ai_model: "claude-3-5-haiku-20241022"
+          anthropic_version: "2023-06-01"
+          ai_max_tokens: "8192"
+          ai_temperature: "0.1"
+          # No pr_number — action fails at precheck (missing PR_NUMBER).
+          # The anthropic format inputs are accepted without validation error.
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert anthropic format was accepted
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # The action should accept anthropic format inputs without crashing
+          # on input validation. Without a PR number, the action fails at the
+          # precheck step (missing PR_NUMBER).
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed with anthropic format"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (no PR number)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

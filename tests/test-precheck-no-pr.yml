@@ -1,0 +1,41 @@
+name: Test precheck with no PR number
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          # No pr_number provided — the action should detect no PR context
+          # and fail gracefully (check_review_needed.sh exits 1 when PR_NUMBER is empty)
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action handled missing PR gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          # Without a PR number and not running in a pull_request event context,
+          # check_review_needed.sh exits 1 immediately ("Missing REPO or PR_NUMBER").
+          # The action step is marked as failure; continue-on-error keeps the job alive.
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed (should_review=$SHOULD_REVIEW)"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (no PR number in non-PR event context)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

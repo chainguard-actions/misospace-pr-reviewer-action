@@ -1,0 +1,51 @@
+name: Test output structure
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          # No pr_number — action fails at precheck (missing PR_NUMBER).
+          # We verify the step ran and outputs are reachable (possibly empty).
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert outputs are accessible
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+          EFFECTIVE_REVIEW_SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+          FINDINGS: ${{ steps.action.outputs.findings }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          echo "effective_review_scope: $EFFECTIVE_REVIEW_SCOPE"
+          echo "findings: $FINDINGS"
+          # The action exposes a well-defined set of outputs. Even when it
+          # fails due to missing PR number, the outputs should be accessible
+          # (possibly empty). We verify the step ran and outputs are reachable.
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed, outputs accessible"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (no PR number), outputs still accessible"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

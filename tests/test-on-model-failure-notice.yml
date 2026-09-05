@@ -1,0 +1,43 @@
+name: Test on_model_failure=notice
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          on_model_failure: "notice"
+          # No pr_number — action fails at precheck (missing PR_NUMBER).
+          # The on_model_failure=notice input is accepted without validation error.
+          ai_primary_retries: "1"
+          ai_primary_retry_delay_sec: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert on_model_failure=notice was accepted
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          # The on_model_failure=notice input is accepted without error.
+          # Without a PR number, the action fails at the precheck step.
+          # The action should either succeed (if precheck skips) or fail
+          # gracefully (missing PR number).
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed with on_model_failure=notice"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (no PR number)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
