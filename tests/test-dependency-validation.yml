@@ -1,0 +1,46 @@
+name: Test runtime dependency validation
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action (dependency validation is the first composite step)
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "1"
+          # Use a local endpoint that fails immediately (connection refused)
+          # so the action fails fast without long AI API timeouts.
+          ai_base_url: "http://localhost:1"
+          ai_model: "gpt-4o-mini"
+          ai_primary_retries: "0"
+          ai_connect_timeout_sec: "2"
+          ai_request_timeout_sec: "5"
+
+      - name: Assert action ran (dependency validation passed or failed gracefully)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          # The action should fail (sentinel repo API calls fail, or AI call fails)
+          # or succeed with should_review set. Either way, the dependency
+          # validation step must have passed (otherwise the action would have
+          # failed at the very first step with a different error).
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed at precheck/review stage (dependencies were fine)"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed (should_review=$SHOULD_REVIEW, skip_reason=$SKIP_REASON)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

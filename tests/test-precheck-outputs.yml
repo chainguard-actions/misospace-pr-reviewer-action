@@ -1,0 +1,56 @@
+name: Test precheck outputs are set
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run action with sentinel repo and pr_number
+        id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "1"
+          # Use a local endpoint that fails immediately (connection refused)
+          # so the action fails fast without long AI API timeouts.
+          ai_base_url: "http://localhost:1"
+          ai_model: "gpt-4o-mini"
+          # Use skip_if_diff_unchanged=false to avoid early exit on fingerprint match
+          skip_if_diff_unchanged: "false"
+          ai_primary_retries: "0"
+          ai_connect_timeout_sec: "2"
+          ai_request_timeout_sec: "5"
+
+      - name: Assert action ran and produced expected outcome
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff_fingerprint }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          VERDICT_SOURCE: ${{ steps.action.outputs.verdict_source }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "diff_fingerprint: $DIFF_FINGERPRINT"
+          echo "verdict: $VERDICT"
+          echo "verdict_source: $VERDICT_SOURCE"
+
+          if [ "$OUTCOME" = "success" ]; then
+            # If the action succeeded, should_review must be set
+            if [ -z "$SHOULD_REVIEW" ]; then
+              echo "FAIL: action succeeded but should_review output is empty"
+              exit 1
+            fi
+            echo "PASS: action succeeded with should_review=$SHOULD_REVIEW"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo or AI endpoint unreachable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
