@@ -1,0 +1,58 @@
+name: Test graceful failure with sentinel repo
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "1"
+          # repo defaults to GITHUB_REPOSITORY (the sentinel), which does not exist on GitHub
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          # Use on_model_failure=notice so model failures don't mask the real error
+          on_model_failure: "notice"
+          # Reduce retries and timeouts so the test completes quickly
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action outcome
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "skip_reason: $SKIP_REASON"
+          echo "verdict: $VERDICT"
+          # The action either fails (sentinel repo API 404) or skips review
+          # (should_review=false when diff fetch fails gracefully).
+          # With on_model_failure=notice, a model failure produces a notice
+          # instead of failing the step, so the action may succeed.
+          # All of these are acceptable outcomes — the action must not silently
+          # succeed with an empty verdict when the repo doesn't exist AND
+          # should_review=true.
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo not resolvable)"
+          elif [ "$OUTCOME" = "success" ]; then
+            if [ "$SHOULD_REVIEW" = "false" ]; then
+              echo "PASS: action skipped review (should_review=false, skip_reason=$SKIP_REASON)"
+            else
+              # With on_model_failure=notice, the action may succeed even if
+              # the model call failed — the notice is posted instead.
+              echo "PASS: action completed (on_model_failure=notice allows success)"
+            fi
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

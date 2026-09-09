@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# ── platform_api.sh ─────────────────────────────────────────────────────
+# Platform seam for every host-forge API interaction (issue #221).
+#
+# Sourced (not executed) by the action's scripts. Exposes platform_* shell
+# functions for operations against the repository under review. The github
+# backend reproduces the exact pre-seam `gh` invocations so output is
+# byte-identical to the un-seamed scripts — the existing test suites (which
+# stub `gh` via PATH) are the regression harness and must pass unmodified.
+#
+# Mode resolution (PLATFORM env, set by action.yml from the `platform` input):
+#   github  – default; all operations via the gh CLI.
+#   forgejo – operations via pr_reviewer/forgejo_backend.py (curl /api/v1).
+#             Requires FORGEJO_API_URL. Implemented per-operation across the
+#             1.4.x line; unimplemented operations fail loudly, never silently.
+#   auto    – resolved here: forgejo when FORGEJO_API_URL is set or when
+#             GITHUB_SERVER_URL names a non-github.com host (Forgejo Actions
+#             runners populate it with the instance URL), github otherwise.
+#
+# Two function classes:
+#   platform_*       – the repo under review; switches on PLATFORM.
+#   github_enrich_*  – linked-source enrichment for third-party repos (which
+#                      live on github.com regardless of the host platform).
+#                      Always gh; #227 decides degradation behavior on
+#                      non-github hosts.
+#
+# The #190 pitfall applies throughout: gh prints JSON error bodies to STDOUT
+# on HTTP errors. Callers' existing rc-check / stdout-discard semantics are
+# preserved by keeping each wrapper a thin exec of the original command —
+# wrappers must not capture-and-echo, which would launder an error body into
+# a success-shaped stdout.
+#
+# Known Forgejo divergences from the GitHub REST shape (callers must degrade,
+# never assume the field exists — golden fixtures in tests/fixtures/forgejo/
+# pin the real shapes):
+#   - compare: payload carries only commits/files/total_commits; it OMITS
+#     GitHub's status/ahead_by/behind_by/url/html_url. A `--jq '.url'` on the
+#     compare therefore yields empty on Forgejo (callers already fall back).
+#   - check-runs: no such API — platform_check_runs returns an empty struct;
+#     the CI signal comes from platform_commit_status instead.
+#   - graphql / collaborator_permission: GitHub-only; the forgejo path fails
+#     loudly (_forgejo_unimplemented), and call sites gate on this per #227.
+
+# Guard against double-sourcing (publish_helpers.sh and the caller may both
+# source this).
+if [[ -n "${_PLATFORM_API_SOURCED:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+_PLATFORM_API_SOURCED=1
+
+_PLATFORM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+platform_resolve() {
+  # Normalize PLATFORM, resolving `auto` from explicit Forgejo config or host.
+  local p="${PLATFORM:-github}"
+  p="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$p" == "auto" ]]; then
+    if [[ -n "${FORGEJO_API_URL:-}" ]]; then
+      p="forgejo"
+      printf '%s' "$p"
+      return 0
+    fi
+    local server="${GITHUB_SERVER_URL:-}"
+    if [[ -n "$server" && "$server" != "https://github.com" && "$server" != "https://github.com/" ]]; then
+      p="forgejo"
+    else
+      p="github"
+    fi
+  fi
+  case "$p" in
+    github|forgejo) printf '%s' "$p" ;;
+    *)
+      echo "platform_api: unsupported PLATFORM '$p' (expected github|forgejo|auto)" >&2
+      return 1
+      ;;
+  esac
+}
+
+_platform_is_forgejo() {
+  [[ "$(platform_resolve)" == "forgejo" ]]
+}
+
+_forgejo_py() {
+  # Invoke the python backend CLI. FORGEJO_API_URL is required in forgejo
+  # mode; failing loudly here beats every caller debugging empty output.
+  if [[ -z "${FORGEJO_API_URL:-}" ]]; then
+    echo "platform_api: PLATFORM=forgejo requires FORGEJO_API_URL" >&2
+    return 1
+  fi
+  PYTHONPATH="${_PLATFORM_SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m pr_reviewer.forgejo_backend "$@"
+}
+
+_forgejo_unimplemented() {
+  # Operations that land later in the 1.4.x line (#223–#226) fail loudly.
+  echo "platform_api: operation '$1' is not yet implemented for PLATFORM=forgejo" >&2
+  return 1
+}
+
+_forgejo_jq() {
+  # Run a forgejo_backend CLI subcommand, then apply an optional trailing
+  # `--jq <expr>` to the JSON it prints — mirroring `gh api --jq` so a single
+  # call site works on either platform. $1=subcommand; the rest are the
+  # subcommand's positional args, optionally followed by `--jq <expr>`.
+  # NB: a `--jq` projection only yields data for fields the forgejo payload
+  # actually carries (see the divergence notes in the header) — e.g. `.url`
+  # on a compare is empty because Forgejo's compare object omits it.
+  local sub="$1"; shift
+  local jqexpr="" args=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--jq" && $# -ge 2 ]]; then jqexpr="$2"; shift 2; continue; fi
+    args+=("$1"); shift
+  done
+  if [[ -n "$jqexpr" ]]; then
+    _forgejo_py "$sub" "${args[@]}" | jq -r "$jqexpr"
+  else
+    _forgejo_py "$sub" "${args[@]}"
+  fi
+}
+
+# ── Core PR I/O ─────────────────────────────────────────────────────────
+
+platform_authenticated_repo_permission() {
+  # $1=repo → read|write|admin on stdout (Forgejo), or "unknown" on GitHub:
+  # GitHub App/GITHUB_TOKEN permissions are unit-scoped and cannot be inferred
+  # from the coarse repo permission, so callers must not gate on it there.
+  if _platform_is_forgejo; then
+    _forgejo_py repo-permission "$1"
+  else
+    echo "unknown"
+  fi
+}
+
+platform_pr_get() {
+  # $1=repo $2=pr_number [extra gh api flags, e.g. --jq] → PR object
+  # (GitHub REST shape, or the --jq projection) on stdout
+  if _platform_is_forgejo; then
+    _forgejo_jq get-pr-metadata "$@"
+  else
+    local repo="$1" num="$2"
+    shift 2
+    gh api "repos/$repo/pulls/$num" "$@"
+  fi
+}
+
+platform_pr_head_sha() {
+  # $1=repo $2=pr_number → head sha on stdout
+  if _platform_is_forgejo; then
+    _forgejo_py get-pr-metadata "$1" "$2" | jq -r '.head.sha // empty'
+  else
+    gh api "repos/$1/pulls/$2" --jq '.head.sha'
+  fi
+}
+
+platform_pr_diff() {
+  # $1=repo $2=pr_number → unified diff on stdout
+  if _platform_is_forgejo; then
+    _forgejo_py get-pr-diff "$1" "$2"
+  else
+    gh pr diff "$2" --repo "$1"
+  fi
+}
+
+platform_pr_files() {
+  # $1=repo $2=pr_number → first page of changed files (GitHub REST shape)
+  if _platform_is_forgejo; then
+    _forgejo_py list-pr-files "$1" "$2"
+  else
+    gh api "repos/$1/pulls/$2/files?per_page=100"
+  fi
+}
+
+platform_issue_get() {
+  # $1=repo $2=issue_number → issue object on stdout
+  if _platform_is_forgejo; then
+    _forgejo_py fetch-issue "$1" "$2"
+  else
+    gh api "repos/$1/issues/$2"
+  fi
+}
+
+platform_issue_comments() {
+  # $1=repo $2=issue_number → first page of issue comments
+  if _platform_is_forgejo; then
+    _forgejo_py list-comments "$1" "$2"
+  else
+    gh api "repos/$1/issues/$2/comments?per_page=100"
+  fi
+}
+
+platform_compare() {
+  # $1=repo $2=base...head spec [extra gh api flags, e.g. --jq] → compare
+  # object (or the --jq projection) on stdout
+  if _platform_is_forgejo; then
+    _forgejo_jq compare "$@"
+  else
+    local repo="$1" spec="$2"
+    shift 2
+    gh api "repos/$repo/compare/$spec" "$@"
+  fi
+}
+
+# ── Sticky comment + reviews (publish surface) ─────────────────────────
+
+platform_comment_sticky() {
+  # $1=repo $2=pr_number $3=body_file — edit the managed comment or create it
+  if _platform_is_forgejo; then
+    _forgejo_py edit-last-comment "$1" "$2" "$(cat "$3")" >/dev/null
+  else
+    gh pr comment "$2" --repo "$1" --edit-last --create-if-none --body-file "$3"
+  fi
+}
+
+platform_pr_reviews() {
+  # $1=repo $2=pr_number [first-page|paginate] → reviews JSON
+  if _platform_is_forgejo; then
+    _forgejo_py list-pr-reviews "$1" "$2"
+  elif [[ "${3:-first-page}" == "paginate" ]]; then
+    gh api "repos/$1/pulls/$2/reviews" --paginate
+  else
+    gh api "repos/$1/pulls/$2/reviews?per_page=100"
+  fi
+}
+
+platform_review_create_json() {
+  # $1=repo $2=pr_number $3=request_json_file — POST a review (inline comments)
+  if _platform_is_forgejo; then
+    _forgejo_py create-review-json "$1" "$2" "$3"
+  else
+    gh api "repos/$1/pulls/$2/reviews" --method POST --input "$3"
+  fi
+}
+
+platform_review_native() {
+  # $1=repo $2=pr_number $3=APPROVE|REQUEST_CHANGES|COMMENT $4=body_file
+  case "$3" in
+    APPROVE|REQUEST_CHANGES|COMMENT) ;;
+    *) echo "Unsupported native review event: $3" >&2; return 2 ;;
+  esac
+  if _platform_is_forgejo; then
+    _forgejo_py create-native-review "$1" "$2" "$3" "$4"
+  else
+    case "$3" in
+      APPROVE)         gh pr review "$2" --repo "$1" --approve --body-file "$4" ;;
+      REQUEST_CHANGES) gh pr review "$2" --repo "$1" --request-changes --body-file "$4" ;;
+      COMMENT)         gh pr review "$2" --repo "$1" --comment --body-file "$4" ;;
+    esac
+  fi
+}
+
+platform_review_dismiss() {
+  # $1=repo $2=pr_number $3=review_id $4=message
+  if _platform_is_forgejo; then
+    _forgejo_py dismiss-review "$1" "$2" "$3" "$4"
+  else
+    gh api "repos/$1/pulls/$2/reviews/$3/dismissals" --method PUT -f message="$4" --jq '.id'
+  fi
+}
+
+platform_graphql() {
+  # GraphQL passthrough (comment minimisation). GitHub-only API surface; the
+  # forgejo path must degrade at the call site per #227, not crash here.
+  if _platform_is_forgejo; then
+    _forgejo_unimplemented "graphql"
+  else
+    gh api graphql "$@"
+  fi
+}
+
+platform_collaborator_permission() {
+  # $1=repo $2=login → permission string (admin|write|read|none) on stdout
+  if _platform_is_forgejo; then
+    _forgejo_unimplemented "collaborator_permission"   # comment-trigger wiring is GitHub-only today
+  else
+    gh api "repos/$1/collaborators/$2/permission" --jq '.permission'
+  fi
+}
+
+# ── CI status (wait_for_ci.sh) ──────────────────────────────────────────
+
+platform_check_runs() {
+  # $1=repo $2=sha → check-runs JSON
+  if _platform_is_forgejo; then
+    # Forgejo has no check-runs API — return empty structure so the
+    # wait_for_ci.sh jq summary produces zero external checks. The commit
+    # statuses path (platform_commit_status) carries the CI signal.
+    printf '{"check_runs":[],"total_count":0}'
+  else
+    gh api "repos/$1/commits/$2/check-runs?per_page=100"
+  fi
+}
+
+platform_commit_status() {
+  # $1=repo $2=sha → combined commit status JSON
+  if _platform_is_forgejo; then
+    _forgejo_py commit-status "$1" "$2"
+  else
+    gh api "repos/$1/commits/$2/status"
+  fi
+}
+
+platform_external_checks() {
+  # $1=repo $2=sha → normalized JSON array of EXTERNAL checks on stdout:
+  #   [{"name": <string>, "state": "pending"|"success"|"failure"}, ...]
+  #
+  # This is the single normalization seam for CI gating (issue #373). It folds
+  # the two raw API shapes (GitHub check-runs + the combined commit-status
+  # object) into one uniform list and applies self-exclusion ONCE here:
+  #   - our own workflow run's check runs, matched by GITHUB_RUN_ID in the
+  #     check-run detail/html URL (/runs/<run_id>/);
+  #   - our own commit-status context, matched by name (CI_STATUS_CONTEXT).
+  # Forgejo divergences are already handled upstream (platform_check_runs
+  # returns an empty struct; platform_commit_status normalizes status→state),
+  # so the jq below is platform-agnostic.
+  #
+  # State mapping (unchanged from the pre-seam wait_for_ci.sh jq):
+  #   check runs — not "completed" → pending; conclusion in
+  #     {failure,timed_out,cancelled,action_required} → failure; else success.
+  #   commit statuses — state in {failure,error} → failure; "success" →
+  #     success; anything else → pending.
+  #
+  # Emits nothing (empty stdout) when BOTH underlying APIs return empty, so the
+  # caller can distinguish a transient failure (retry) from "no external CI"
+  # (an empty JSON array). Falls back to the aggregate combined-status state
+  # when the endpoint reports total_count>0 but carries no per-status detail.
+  local repo="$1" sha="$2"
+  local runs combined
+  runs="$(platform_check_runs "$repo" "$sha" 2>/dev/null || echo "")"
+  combined="$(platform_commit_status "$repo" "$sha" 2>/dev/null || echo "")"
+  if [[ -z "$runs" && -z "$combined" ]]; then
+    return 0
+  fi
+  [[ -n "$runs" ]] || runs='{}'
+  [[ -n "$combined" ]] || combined='{}'
+
+  jq -cn \
+    --argjson runs "$runs" \
+    --argjson combined "$combined" \
+    --arg run "${GITHUB_RUN_ID:-}" \
+    --arg ctx "${CI_STATUS_CONTEXT:-pr-reviewer-action}" '
+    def cr_state:
+      if .status != "completed" then "pending"
+      else ((.conclusion // "") as $c
+            | if ($c == "failure" or $c == "timed_out"
+                   or $c == "cancelled" or $c == "action_required")
+              then "failure" else "success" end)
+      end;
+    def st_state:
+      if (.state == "failure" or .state == "error") then "failure"
+      elif (.state == "success") then "success"
+      else "pending" end;
+    ([$runs.check_runs[]?
+       | select(
+           $run == ""
+           or ((((.details_url // "") | test("/runs/" + $run + "(/|$)"))
+                or ((.html_url // "") | test("/runs/" + $run + "(/|$)"))) | not)
+         )
+       | {name: (.name // "(unnamed)"), state: cr_state}]) as $cr
+    | ([$combined.statuses[]?
+        | select(.context != $ctx)
+        | {name: (.context // "(status)"), state: st_state}]) as $st
+    | ($cr + $st) as $ext
+    | if ($ext | length) > 0 then $ext
+      # No per-check detail, but the combined endpoint reports a terminal
+      # aggregate over >0 statuses (degraded shape): synthesize one entry.
+      elif (($combined.total_count // 0) > 0
+            and ((($combined.state // "pending") == "success")
+                 or (($combined.state // "pending") == "failure")
+                 or (($combined.state // "pending") == "error")))
+      then [{name: "(combined)",
+             state: (if ((($combined.state) == "failure")
+                         or (($combined.state) == "error"))
+                     then "failure" else "success" end)}]
+      else [] end
+  ' 2>/dev/null || echo "[]"
+}
+
+# ── GitHub-targeted enrichment (linked third-party sources) ─────────────
+# These hit github.com-hosted upstream repos (release notes, compares, tags
+# for version hints) and are NOT host-platform operations: on a Forgejo
+# deployment the linked sources still live on github.com. #227 gates their
+# behavior when no GitHub credentials are available.
+
+github_enrich_api() {
+  gh api "$@"
+}
+
+# Linked-source enrichment against an arbitrary upstream forge host. Print the
+# JSON object on stdout, or `null` + nonzero exit when unavailable.
+
+forgejo_enrich_release() {
+  # $1=host $2=owner/repo $3=tag
+  PYTHONPATH="${_PLATFORM_SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m pr_reviewer.forgejo_backend enrich-release "$1" "$2" "$3"
+}
+
+forgejo_enrich_compare() {
+  # $1=host $2=owner/repo $3=base...head
+  PYTHONPATH="${_PLATFORM_SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m pr_reviewer.forgejo_backend enrich-compare "$1" "$2" "$3"
+}
+
+# ── Fork detection (single fail-closed derivation, #370) ────────────────
+# Echo "true" if the PR originates from a fork, else "false". Reads the saved
+# PR object (default: pr-object.json, written once by the precheck).
+#
+# This is the ONE place fork-ness is derived on the shell path. It mirrors
+# pr_reviewer.forgejo_backend.is_fork_pr: a missing/empty head.repo.full_name
+# is treated as a fork (a present head against a missing base is already
+# caught by head != base). Fork-ness gates the tool harness / evidence
+# providers / MCP against untrusted PR content while repo tokens are
+# available, so an unknown origin MUST fail closed. Degraded input all yields
+# "true": an empty `{}` object (the precheck writes `{}` when the PR fetch
+# fails), a missing base, or an unparseable / absent file (jq errors → the
+# `|| echo true` fallback).
+derive_is_fork_pr() {
+  local pr_object_file="${1:-pr-object.json}"
+  jq -r '
+    (.head.repo.full_name // "") as $head
+    | (.base.repo.full_name // "") as $base
+    | if $head == "" then true else ($head != $base) end
+  ' "$pr_object_file" 2>/dev/null || echo true
+}

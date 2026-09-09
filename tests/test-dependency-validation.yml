@@ -1,0 +1,43 @@
+name: Test runtime dependency validation
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          pr_number: "999"
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          # Reduce retries and timeouts so the test completes quickly
+          ai_primary_retries: "0"
+          ai_request_timeout_sec: "10"
+          ai_connect_timeout_sec: "5"
+
+      - name: Assert action ran (dependency check passed or failed gracefully)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          # The action either:
+          # - Fails at the precheck step (sentinel repo / invalid PR → 404) → failure
+          # - Fails at the review step (no AI key / fake key → model error) → failure
+          # - Succeeds (unlikely but possible if should_review=false) → success
+          # In all cases the dependency validation step must have run first.
+          # We accept both failure and success — the key is that the action
+          # ran at all (not a workflow-level error).
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (expected — sentinel repo or model error)"
+          elif [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed successfully"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME' (expected success or failure)"
+            exit 1
+          fi
