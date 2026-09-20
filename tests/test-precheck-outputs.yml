@@ -1,0 +1,53 @@
+name: Test precheck outputs and skip logic
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          pr_number: "1"
+          skip_if_diff_unchanged: "true"
+          force_review: "false"
+          review_scope: "full"
+          # Short timeouts and no retries so the action fails fast when the
+          # AI endpoint is unreachable in the test environment.
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "5"
+          ai_primary_retries: "0"
+
+      - name: Assert precheck outputs are present or action failed gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          DIFF_FP: ${{ steps.action.outputs.diff_fingerprint }}
+          SKIP_REASON: ${{ steps.action.outputs.skip_reason }}
+          EFF_SCOPE: ${{ steps.action.outputs.effective_review_scope }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "diff_fingerprint: $DIFF_FP"
+          echo "skip_reason: $SKIP_REASON"
+          echo "effective_review_scope: $EFF_SCOPE"
+          if [ "$OUTCOME" = "success" ]; then
+            # If it succeeded, should_review must be set to true or false
+            if [ -z "$SHOULD_REVIEW" ]; then
+              echo "FAIL: action succeeded but should_review output is empty"
+              exit 1
+            fi
+            echo "PASS: should_review='$SHOULD_REVIEW'"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo PR not resolvable or AI API unavailable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

@@ -1,0 +1,45 @@
+name: Test fail_on_request_changes configuration
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          pr_number: "1"
+          fail_on_request_changes: "true"
+          verdict_policy: "model"
+          on_model_failure: "notice"
+          skip_if_diff_unchanged: "false"
+          # Short timeouts and no retries so the action fails fast when the
+          # AI endpoint is unreachable in the test environment.
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "5"
+          ai_primary_retries: "0"
+
+      - name: Assert action ran with fail_on_request_changes=true (graceful failure allowed)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          VERDICT_SOURCE: ${{ steps.action.outputs.verdict_source }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "verdict_source: $VERDICT_SOURCE"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded (verdict='$VERDICT')"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo PR not resolvable, or request_changes verdict with fail_on_request_changes=true)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

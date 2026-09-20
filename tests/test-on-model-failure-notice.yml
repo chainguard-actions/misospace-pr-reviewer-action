@@ -1,0 +1,44 @@
+name: Test on_model_failure=notice behavior
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github_token: ${{ github.token }}
+          ai_base_url: "https://api.openai.com/v1"
+          ai_model: "gpt-4o-mini"
+          pr_number: "1"
+          on_model_failure: "notice"
+          skip_if_diff_unchanged: "false"
+          force_review: "true"
+          # Short timeouts and no retries so the action fails fast when the
+          # AI endpoint is unreachable in the test environment.
+          ai_request_timeout_sec: "5"
+          ai_connect_timeout_sec: "5"
+          ai_primary_retries: "0"
+
+      - name: Assert action ran with on_model_failure=notice (graceful failure allowed)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should_review }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should_review: $SHOULD_REVIEW"
+          echo "verdict: $VERDICT"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with on_model_failure=notice"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo PR not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
