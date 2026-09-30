@@ -1,0 +1,28 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Review PR with cloud model
+        uses: misospace/pr-reviewer-action@v3
+        with:
+          ai-base-url: https://api.openai.com/v1
+          ai-model: gpt-4.1-mini
+          ai-api-key: ${{ secrets.OPENAI_API_KEY }}
