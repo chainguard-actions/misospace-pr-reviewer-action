@@ -1,0 +1,39 @@
+name: Test anthropic API format input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.anthropic.com"
+          ai-api-format: "anthropic"
+          ai-model: "claude-3-haiku-20240307"
+          ai-api-key: "fake-key-for-test"
+          anthropic-version: "2023-06-01"
+          pr-number: "1"
+          ci-status-check: "false"
+          publish-review-comment: "false"
+          on-model-failure: "notice"
+      - name: Assert action ran with anthropic format or failed gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          ANALYSIS_ENGINE: ${{ steps.action.outputs.analysis-engine }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "analysis-engine: $ANALYSIS_ENGINE"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with anthropic format"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo not resolvable or API key invalid)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

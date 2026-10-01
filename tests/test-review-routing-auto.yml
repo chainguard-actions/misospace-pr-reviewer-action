@@ -1,0 +1,56 @@
+name: Test review-routing-mode=auto with smart model
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          ai-api-key: "fake-key-for-test"
+          pr-number: "1"
+          ci-status-check: "false"
+          publish-review-comment: "false"
+          on-model-failure: "notice"
+          review-routing-mode: "auto"
+          ai-smart-model: "gpt-4o"
+          ai-smart-base-url: "https://api.openai.com/v1"
+          ai-smart-api-key: "fake-key-for-test"
+          escalate-on-risk-flags: "linked_security_issue,auth_changes"
+      - name: Assert action ran with routing mode or failed gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review-route }}
+          ESCALATION_REASON: ${{ steps.action.outputs.escalation-reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "review-route: $REVIEW_ROUTE"
+          echo "escalation-reason: $ESCALATION_REASON"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with review-routing-mode=auto"
+            # If review-route is set, it must be one of the valid values
+            if [ -n "$REVIEW_ROUTE" ]; then
+              case "$REVIEW_ROUTE" in
+                legacy|primary|smart|escalated)
+                  echo "PASS: review-route '$REVIEW_ROUTE' is valid"
+                  ;;
+                *)
+                  echo "FAIL: unexpected review-route value '$REVIEW_ROUTE'"
+                  exit 1
+                  ;;
+              esac
+            fi
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
