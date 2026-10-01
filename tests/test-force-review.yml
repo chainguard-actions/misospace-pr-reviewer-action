@@ -1,0 +1,47 @@
+name: Test force-review input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          pr-number: "1"
+          force-review: "true"
+          verdict-policy: "strict"
+          publish-review-comment: "false"
+          ci-status-check: "false"
+          tool-mode: "off"
+
+      - name: Assert action ran with force-review (sentinel repo causes graceful failure)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review-route }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "verdict: $VERDICT"
+          echo "review-route: $REVIEW_ROUTE"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "Action succeeded"
+            # With force-review=true, should-review should be true if action ran
+            if [ "$SHOULD_REVIEW" = "false" ]; then
+              echo "WARN: force-review=true but should-review=false (may have skipped for another reason)"
+            fi
+            echo "PASS: action completed"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

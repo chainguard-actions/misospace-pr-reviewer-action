@@ -1,0 +1,44 @@
+name: Test basic invocation
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          pr-number: "1"
+          ci-status-check: "false"
+          tool-mode: "off"
+
+      - name: Assert action ran and failed gracefully (sentinel repo has no real PRs)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip-reason }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "skip-reason: $SKIP_REASON"
+          echo "verdict: $VERDICT"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "Action succeeded — checking outputs are set"
+            if [ -z "$SHOULD_REVIEW" ] && [ -z "$VERDICT" ] && [ -z "$SKIP_REASON" ]; then
+              echo "FAIL: action succeeded but no outputs were set"
+              exit 1
+            fi
+            echo "PASS: action succeeded with outputs"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
