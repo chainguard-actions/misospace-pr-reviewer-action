@@ -1,0 +1,1565 @@
+from __future__ import annotations
+
+import contextlib
+import errno
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
+from typing import Any
+
+SEMANTIC_CORPUS_VERSION = 1
+SEMANTIC_EVAL_VERSION = 1
+
+RECOGNISED_STAGES = frozenset({"specialist", "primary", "escalation", "any"})
+RECOGNISED_SIGNAL_STAGES = RECOGNISED_STAGES | {"unknown"}
+RECOGNISED_MODES = frozenset({"standard", "deep", "any"})
+RECOGNISED_ROUTES = frozenset({"primary", "escalation", "primary+escalation", "any"})
+RECOGNISED_DIFF_POLARITIES = frozenset({"deletion"})
+
+CAPABILITY_SEQUENCING = "control_flow_sequencing"
+CAPABILITY_OUTPUT_COMPLETENESS = "output_completeness"
+CAPABILITY_FULL_REVIEW_LOOP = "full_review_loop"
+CAPABILITY_RUNTIME_PROTOCOL = "runtime_protocol"
+CAPABILITY_STALE_REVIEW_STATE = "stale_review_state"
+CAPABILITY_DIFF_POLARITY = "diff_polarity"
+CAPABILITY_NEGATIVE_CONTROL = "negative_control"
+# Execution-boundary / lifecycle capabilities from the PR #654 failure classes
+# (#659): widening authority by moving work across a process boundary, losing
+# required ambient capability when narrowing that boundary, leaving forked
+# background work with no abnormal-exit owner, repairing only the tracked
+# wrapper PID while the payload/descendants survive, and silently degrading a
+# tree-aware repair when its new runtime capability (pgrep) is absent.
+CAPABILITY_EXECUTION_BOUNDARY_AUTHORITY = "execution_boundary_authority"
+CAPABILITY_AMBIENT_CAPABILITY_LOSS = "ambient_capability_loss"
+CAPABILITY_BACKGROUND_LIFECYCLE = "background_process_lifecycle"
+CAPABILITY_REMEDIATION_TOPOLOGY = "remediation_process_topology"
+CAPABILITY_UNDECLARED_CAPABILITY_DEPENDENCY = "undeclared_capability_dependency"
+CAPABILITY_CANONICAL_ARTIFACT = "canonical_artifact_propagation"
+CAPABILITY_PRECHECK_CREDENTIAL = "precheck_capability_wiring"
+CAPABILITY_BROKEN_ARROW = "broken_dataflow_arrow"
+CAPABILITY_CORPUS_EVIDENCE = "review_corpus_evidence_transport"
+CAPABILITY_TRUNCATION_COUNTEREXAMPLE = "truncation_counterexample"
+# #757 counterexample-driven falsification: the four PR #756-derived failure
+# classes where the reviewer verified that code/tests/parity agree with the
+# intended design but never challenged whether the implementation's actual
+# semantic/lexical boundary matches the claim. Generic across languages and
+# repositories — not path-classifier signatures:
+#   - boundary_scope_leak: the implementation claims to inspect an
+#     operand/value but actually scans a broader statement/container, so the
+#     trigger can be moved to an irrelevant syntactic position and still fire;
+#   - information_loss_ordering: normalization/neutralization removes the
+#     evidence a downstream rule needs before that rule can inspect it, and
+#     routing the same value through a simple alias hides it identically;
+#   - cooccurrence_false_flow: nearby untrusted-looking data is mistaken for
+#     data that actually reaches the changed operation;
+#   - incidental_positive_fixture: a positive test contains multiple
+#     trigger-shaped tokens and passes for the wrong reason — remove the
+#     incidental tokens while preserving the semantically relevant source and
+#     the claimed signal must still work, else the test proves vocabulary,
+#     not semantics.
+CAPABILITY_SCOPE_LEAK = "boundary_scope_leak"
+CAPABILITY_INFO_LOSS_ORDER = "information_loss_ordering"
+CAPABILITY_FALSE_FLOW = "cooccurrence_false_flow"
+CAPABILITY_INCIDENTAL_FIXTURE = "incidental_positive_fixture"
+# #750: an ungrounded not_applicable cannot wave away a real required-check
+# risk. A correct review names the concrete risk surface (or calls the N/A
+# waiver ungrounded); a review that emits the N/A token over a present risk
+# detects nothing.
+CAPABILITY_REQUIRED_CHECK_GROUNDING = "required_check_grounding"
+# #876: the reviewer must never report the sanitizer's own redaction marker
+# (inserted over a repository-source read/grep/blame result or a Related
+# Code Context snippet) as if it were literal committed source. The negative
+# control is code that legitimately assigns a secret-named property from an
+# identifier/member expression (`apiKey: config.apiKey,`), which the
+# source-safe redaction policy leaves untouched; a reviewer that still
+# invents a defect from `[REDACTED]`/`⟦redacted:credential⟧` text is
+# hallucinating over harness-inserted bytes, not reading the repository.
+CAPABILITY_SANITIZER_MARKER_MISATTRIBUTION = "sanitizer_marker_misattribution"
+# #661 merge-safety review dispositions: the per-run quality categories the
+# semantic report records so a miss is attributable to its failure mode — the
+# defect was never found, it was found but suppressed as pre-existing to the
+# targeted commit (a merge-safety miss, not a pass), it was found but the
+# recommended remediation is invalid or incomplete, or it was found with sound
+# remediation reasoning. A fifth category marks findings that assert a defect
+# the evidence cannot support (speculative/unsupported false positives).
+DISPOSITION_NOT_FOUND = "not_found"
+DISPOSITION_SUPPRESSED_PRE_EXISTING = "suppressed_pre_existing"
+DISPOSITION_INVALID_REMEDIATION = "invalid_remediation"
+DISPOSITION_CORRECT = "correct"
+DISPOSITION_SPECULATIVE_FALSE_POSITIVE = "speculative_false_positive"
+MERGE_SAFETY_DISPOSITIONS = frozenset(
+    {
+        DISPOSITION_NOT_FOUND,
+        DISPOSITION_SUPPRESSED_PRE_EXISTING,
+        DISPOSITION_INVALID_REMEDIATION,
+        DISPOSITION_CORRECT,
+        DISPOSITION_SPECULATIVE_FALSE_POSITIVE,
+    }
+)
+# Stable report ordering (counts render in this order).
+MERGE_SAFETY_DISPOSITIONS_ORDER = (
+    DISPOSITION_CORRECT,
+    DISPOSITION_NOT_FOUND,
+    DISPOSITION_SUPPRESSED_PRE_EXISTING,
+    DISPOSITION_INVALID_REMEDIATION,
+    DISPOSITION_SPECULATIVE_FALSE_POSITIVE,
+)
+# "pre-existing to this commit" is attribution metadata; it only becomes a
+# suppression when the same sentence also declines to flag it. Explicitly
+# re-asserting the blocker ("still blocks the resulting tree") overrides the
+# suppression reading — that is exactly the attribution-vs-severity rule #661
+# teaches, so the scorer must encode it too.
+ATTRIBUTION_TERMS = (
+    "pre-existing", "preexisting", "pre-existed", "predates this commit",
+    "pre-dates this commit", "predates the commit", "introduced by an earlier commit",
+    "introduced before this commit", "exists on main", "already on main",
+    "already existed before", "not new to this pr",
+)
+SUPPRESSION_TERMS = (
+    "not a merge blocker", "not a blocker", "non-blocking", "out of scope",
+    "not in scope", "outside the scope", "does not block", "no need to fix",
+    "not required to fix", "won't block", "will not block", "can be deferred",
+    "defer to a follow-up", "file a follow-up", "leave for a follow-up",
+    "follow-up issue", "not flagging", "not reporting it", "downgrad",
+    "suppress", "not introduced by this commit", "not introduced in this commit",
+    "not introduced here", "not caused by this change", "unrelated to this change",
+)
+BLOCKER_ASSERTION_TERMS = (
+    "still blocks", "still a blocker", "remains a blocker", "remains a merge blocker",
+    "must still be fixed", "still reachable", "still ships", "blocks the resulting tree",
+    "blocker for the resulting tree", "reaches the resulting tree",
+)
+# A finding that never satisfied the causal chain but asserts a defect anyway,
+# or hedges on one — the unsupported/speculative false-positive class.
+SPECULATIVE_CUES = (
+    "might ", "could ", "may ", "possibly", "likely", "potential", "hypothetical",
+    "future misuse", "speculative", "appears to", "seems to", "unverified",
+    "no evidence", "not verified", "unclear whether", "not sure whether",
+    "consider ", "may want", "worth considering",
+)
+DEFECT_ASSERTION_CUES = (
+    "bug", "breaks", "broken", "will fail", "must fix", "incorrect", "missing",
+    "fails to", "vulnerab", "leak", "unsafe",
+)
+# Remediation evaluation engages only when the run proposes a fix (or proposes
+# keeping a broken fallback), so a detection-only finding is not penalized.
+REMEDIATION_PROPOSAL_CUES = (
+    "recommend", "should ", "must ", "fix by", "fix:", "to fix", "instead",
+    "replace", "propose", "suggested", "remediation", "mitigat", "install ",
+    "add a ", "keep the", "no fix is needed", "not needed because", "refuse to",
+)
+# #757: generic counterexample-ATTEMPT cues — phrases that show the reviewer
+# tried to construct a falsifying input, independent of whether the attempt
+# hit this scenario's specific defect. Scenario-specific
+# `falsification_expectations.counterexample_any_of` needles decide
+# `counterexample_found`; these cues only decide `counterexample_attempted`,
+# so an A/B can measure attempt rate separately from success rate.
+COUNTEREXAMPLE_ATTEMPT_CUES = (
+    "counterexample", "counter-example", "near-miss", "near miss",
+    "just across the boundary", "just outside the boundary",
+    "boundary value", "adjacent input", "hostile input",
+    "if the trigger were moved", "moving the trigger", "renaming the trigger",
+    "moving or renaming", "mutation would", "mutating the",
+    "flip the classification", "flip the result", "flips the observed",
+    "flips the classification", "an input where", "an input that",
+)
+# #757: per-scenario falsification contract — the narrowest structured
+# distinction between verification-by-coherence and actual falsification.
+# `boundary_any_of` needles decide whether the reviewer named the changed
+# decision boundary; `counterexample_any_of` needles decide whether a
+# concrete falsifying input for THIS scenario was constructed. A review that
+# restates the intended behavior, cites green tests, or observes parity hits
+# the boundary needles but never the counterexample needles — exactly the
+# #756 failure the telemetry must stay able to see.
+FALSIFICATION_EXPECTATION_KEYS = frozenset({"boundary_any_of", "counterexample_any_of"})
+KNOWN_CAPABILITY_CLASSES = frozenset(
+    {
+        CAPABILITY_SEQUENCING,
+        CAPABILITY_OUTPUT_COMPLETENESS,
+        CAPABILITY_FULL_REVIEW_LOOP,
+        CAPABILITY_RUNTIME_PROTOCOL,
+        CAPABILITY_STALE_REVIEW_STATE,
+        CAPABILITY_DIFF_POLARITY,
+        CAPABILITY_NEGATIVE_CONTROL,
+        CAPABILITY_EXECUTION_BOUNDARY_AUTHORITY,
+        CAPABILITY_AMBIENT_CAPABILITY_LOSS,
+        CAPABILITY_BACKGROUND_LIFECYCLE,
+        CAPABILITY_REMEDIATION_TOPOLOGY,
+        CAPABILITY_UNDECLARED_CAPABILITY_DEPENDENCY,
+        CAPABILITY_CANONICAL_ARTIFACT,
+        CAPABILITY_PRECHECK_CREDENTIAL,
+        CAPABILITY_BROKEN_ARROW,
+        CAPABILITY_CORPUS_EVIDENCE,
+        CAPABILITY_TRUNCATION_COUNTEREXAMPLE,
+        CAPABILITY_SCOPE_LEAK,
+        CAPABILITY_INFO_LOSS_ORDER,
+        CAPABILITY_FALSE_FLOW,
+        CAPABILITY_INCIDENTAL_FIXTURE,
+        CAPABILITY_REQUIRED_CHECK_GROUNDING,
+        CAPABILITY_SANITIZER_MARKER_MISATTRIBUTION,
+    }
+)
+
+SIGNAL_KIND_FINDING = "finding"
+SIGNAL_KIND_MENTION = "mention"
+SIGNAL_KIND_TOOL = "tool"
+SIGNAL_KINDS = frozenset({SIGNAL_KIND_FINDING, SIGNAL_KIND_MENTION, SIGNAL_KIND_TOOL})
+_VOCABULARY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (CAPABILITY_SEQUENCING, (
+        "specialists launch before final", "specialists launched before final",
+        "final review starts before specialists", "final review begins before specialists",
+        "race condition between specialists and final", "specialists are not reaped before final",
+        "specialists are not joined before final", "specialist phase is not complete before final",
+        "specialists must reap", "specialists must terminate", "specialists must complete",
+        "reaped before final review", "waits for every role and is reaped before final review",
+    )),
+    (CAPABILITY_OUTPUT_COMPLETENESS, (
+        "artifact is missing on failure", "artifacts are missing on failure",
+        "output is missing on error", "normalized output is not written on failure",
+        "normalized artifact is absent on error", "failure path never writes",
+        "error path never writes", "catastrophic failure loses the artifact",
+        "missing on failure", "absent on error", "never written on failure",
+    )),
+    (CAPABILITY_FULL_REVIEW_LOOP, (
+        "needs_full_review is minted", "needs_full_review is emitted", "needs_full_review is recreated",
+        "needs_full_review is re-created", "needs_full_review causes a redundant full review",
+        "needs_full_review creates a redundant full review", "redundant full review",
+        "full review loops indefinitely", "full review repeats itself", "full review repeats past once",
+        "full-review loop is not cleared", "full review flag is not cleared",
+        "legacy full review flag is never cleared", "legacy full review flag is left uncleared",
+        "legacy flag is left uncleared", "legacy flag repeats past once", "full review runs twice",
+    )),
+    (CAPABILITY_RUNTIME_PROTOCOL, (
+        "prompt still references deleted runtime protocol", "prompt references deleted runtime protocol",
+        "stale default prompt remains", "default prompt still names the removed protocol",
+        "runtime protocol is gone but prompt", "prompt and runtime disagree",
+        "runtime no longer supports the protocol but prompt", "unsupported runtime protocol is used",
+        "stale default prompt",
+    )),
+    (CAPABILITY_STALE_REVIEW_STATE, (
+        "stale previous review state remains", "carried findings remain", "carried findings survive",
+        "stale review metadata remains", "old review state survives", "dead prior-review state remains",
+        "previous review is stale but still used", "docs still describe stale previous review",
+        "documentation still describes removed review state", "removed state is still referenced",
+        "deleted state is still used", "state no longer exists but code still reads it",
+        "stale review state",
+    )),
+    (CAPABILITY_DIFF_POLARITY, (
+        "deleted declaration still exists", "deleted declarations still exist",
+        "removed declaration is still present", "deleted code is still present",
+        "treats deleted as present", "deleted-only declaration remains", "deleted symbol remains",
+        "deletion is treated as an addition", "deleted side of the diff is treated as added",
+        "removed side of the diff is treated as present",
+    )),
+    # The #659 vocabulary is deliberately causal: a generic warning
+    # ("check security boundaries", "consider cleanup") matches none of these,
+    # so only a finding that names the boundary/lifecycle mechanism counts.
+    # Terms are ordered so the more specific capability wins when a phrase
+    # could plausibly belong to two classes (the pgrep/fallback dependency is
+    # checked before the tracked-PID topology it degrades to).
+    (CAPABILITY_EXECUTION_BOUNDARY_AUTHORITY, (
+        "inherits reviewer secrets", "inherits reviewer-only secrets",
+        "inherit reviewer secrets", "inherit reviewer-only secrets",
+        "inherits the review environment", "inherits the privileged review environment",
+        "inherit the review environment", "inherit the privileged review environment",
+        "inherits model credentials", "inherits model and tool secrets",
+        "inherit model credentials", "inherit model and tool secrets",
+        "inherits the review process environment", "inherits the review step secrets",
+        "inherit the review process environment", "inherit the review step secrets",
+        "child of the fully privileged review process", "child of the privileged review process",
+        "no longer isolated by the standalone step", "moved into the review process and can inherit",
+        "authority widened across the execution boundary", "authority is widened across the execution boundary",
+        "widened across the execution boundary", "execution boundary widens authority",
+        "gained the review process's inherited authority", "lost its least-privilege boundary",
+    )),
+    (CAPABILITY_AMBIENT_CAPABILITY_LOSS, (
+        "dropped the proxy configuration", "drops the proxy configuration", "drop the proxy configuration",
+        "dropped proxy and custom-ca configuration", "lost required ambient configuration",
+        "lost the ambient transport configuration", "removed required transport variables",
+        "removes required transport variables", "remove required transport variables",
+        "env -i strips the proxy", "env -i removes the proxy", "env -i stripped proxy",
+        "broke proxy/custom-ca compatibility", "breaks proxy/custom-ca compatibility",
+        "custom ca configuration was lost", "custom-ca configuration is lost",
+        "lost the gh cli config", "lost required benign transport variables",
+    )),
+    (CAPABILITY_BACKGROUND_LIFECYCLE, (
+        "no abnormal-exit cleanup", "no exit/term cleanup", "no exit or term cleanup",
+        "orphaned ci child", "leaves an orphaned ci child", "leave an orphaned ci child",
+        "orphan the ci child", "orphaned credential-bearing child",
+        "credential-bearing child survives parent exit", "child survives parent exit",
+        "only joined on the normal path", "joined only on the normal path",
+        "no abnormal-exit owner", "background child has no owner",
+        "parent exit between fork and join", "parent dies between fork and join",
+        "drops runner_tracking_id", "removed runner_tracking_id", "removes runner_tracking_id",
+        "runner_tracking_id is not forwarded", "weakened runner orphan-process cleanup",
+        "weakens github runner orphan cleanup", "weakens runner orphan-process cleanup",
+        "evades runner orphan tracking",
+    )),
+    (CAPABILITY_UNDECLARED_CAPABILITY_DEPENDENCY, (
+        "pgrep is not a declared runtime dependency", "undeclared dependency on pgrep",
+        "remediation depends on pgrep", "cleanup depends on pgrep", "cleanup depends on `pgrep`",
+        "pgrep is unavailable", "when pgrep is unavailable", "missing pgrep", "pgrep is missing",
+        "pgrep is not part of the validated runtime contract", "pgrep is not part of the runtime contract",
+        "pgrep is required but unavailable",
+        "falls back to wrapper-only", "silently falls back to wrapper-only",
+        "silently falls back to the vulnerable wrapper-only",
+        "degrades to wrapper-only", "pgrep not part of the runtime contract",
+        "pgrep is not in the runtime contract",
+    )),
+    (CAPABILITY_REMEDIATION_TOPOLOGY, (
+        "kills only the tracked pid", "kill only the tracked pid", "killing only the tracked pid",
+        "killing only the tracked wrapper pid", "kills only the tracked wrapper",
+        "tracked wrapper pid is not the workload",
+        "payload and descendants survive", "payload/descendants survive",
+        "descendants survive the kill", "only the background wrapper is killed",
+        "wrapper pid alone does not own the workload", "test collapses the wrapper and payload",
+        "exec sleep collapses the process topology", "collapses the wrapper and payload",
+        "simplifies away the process topology", "process-topology risk",
+    )),
+    (CAPABILITY_CANONICAL_ARTIFACT, (
+        "canonical linked-issues.json contains bare refs", "classifier reads bare refs instead of fetched labels",
+        "fetched labels never reach the classifier", "linked labels are missing from the canonical artifact",
+    )),
+    (CAPABILITY_PRECHECK_CREDENTIAL, (
+        "precheck lacks the linear api key", "linear key is absent from the precheck environment",
+        "precheck signature ignores linear priority", "linear lookup is unreachable from the precheck step",
+    )),
+    (CAPABILITY_BROKEN_ARROW, (
+        "consumer reads a different artifact", "consumer reads a different environment variable",
+        "helper output never reaches the production consumer", "producer and consumer use different paths",
+    )),
+    (CAPABILITY_CORPUS_EVIDENCE, (
+        "verified exact-head evidence is omitted from the review corpus",
+        "corpus truncation promotes verified evidence into a blocker",
+        "exact-head ci evidence never reaches the reviewer",
+    )),
+    (CAPABILITY_TRUNCATION_COUNTEREXAMPLE, (
+        "truncate_clean writes an oversized marker beyond max_corpus",
+        "oversized marker exceeds the corpus budget",
+    )),
+    # #757 falsification vocabularies. Deliberately causal/mechanism-level
+    # (a generic "be more adversarial" sentence matches none of these), so
+    # only a finding that names the boundary mechanism counts. The scenario
+    # carries the concrete falsification separately via
+    # falsification_expectations.counterexample_any_of — this vocabulary only
+    # decides whether the changed decision boundary was named at all.
+    (CAPABILITY_SCOPE_LEAK, (
+        "scans a broader statement", "scans the whole statement",
+        "scans the whole line", "statement-wide", "line-wide",
+        "scans the container instead of the value",
+        "checks the container rather than the value",
+        "operand rather than the statement", "inspects the operand",
+        "instead of the consumed value", "instead of the assigned value",
+        "wrong object", "wrong scope", "scope of the check",
+        "irrelevant syntactic position", "irrelevant position",
+    )),
+    (CAPABILITY_INFO_LOSS_ORDER, (
+        "normalized away before", "erases evidence before",
+        "erases the evidence before", "removes evidence before",
+        "destroys the evidence before", "lost before the check",
+        "lost before the downstream", "neutralization erases",
+        "normalization erases", "normalization removes the evidence",
+        "alias hides", "aliased value is erased", "through a simple alias",
+        "through an alias", "runs after normalization",
+        "runs before normalization", "inspected after normalization",
+        "inspected after the value is lost", "downstream rule cannot inspect",
+        "ordering erases evidence", "ordering loses the evidence",
+    )),
+    (CAPABILITY_FALSE_FLOW, (
+        "co-occurrence mistaken for flow", "co-occurrence, not flow",
+        "nearby but unrelated", "nearby data does not flow",
+        "never reaches the changed operation", "never reaches the sink",
+        "does not flow into", "no dataflow into", "without any dataflow",
+        "adjacent line satisfies", "adjacent statement satisfies",
+        "presence is not flow", "proximity is not flow",
+        "unrelated adjacent", "unrelated neighbor",
+    )),
+    (CAPABILITY_INCIDENTAL_FIXTURE, (
+        "incidental trigger", "trigger vocabulary", "trigger-shaped",
+        "incidental token", "incidental identifier", "incidental keyword",
+        "for the wrong reason", "passes for the wrong reason",
+        "tests repeat the implementation's", "fixtures repeat the implementation's",
+        "prove vocabulary", "proves vocabulary", "not the semantics",
+        "mutation would flip", "moving the trigger", "renaming the trigger",
+        "moving or renaming the trigger", "strip the incidental",
+        "removing the incidental",
+    )),
+    # #750: causal terms only — a generic "be careful with paths" matches
+    # none of these, so only a finding that names the concrete risk surface
+    # (or the ungrounded-waiver mechanism) counts as grounding the check.
+    (CAPABILITY_REQUIRED_CHECK_GROUNDING, (
+        "attacker-controlled path", "user-controlled path", "user-supplied path",
+        "untrusted path", "attacker controlled path", "attacker-controlled input reaches",
+        "path traversal", "directory traversal", "traversal outside",
+        "path is not sanitized", "path is not validated", "unsanitized path",
+        "not_applicable is not grounded", "ungrounded not_applicable", "ungrounded n/a",
+        "n/a is not grounded", "cannot be waived as not applicable",
+        "waives the path check", "waived as not applicable",
+    )),
+    # #876: the reviewer mistook the harness's own redaction marker for
+    # committed source and reported it as a defect — invalid syntax, a
+    # missing/replaced identifier, or a security issue caused by the marker
+    # itself. Deliberately keyed on naming the MARKER as source, not on the
+    # word "redacted" alone (a review may legitimately discuss redaction as
+    # a feature without this failure).
+    (CAPABILITY_SANITIZER_MARKER_MISATTRIBUTION, (
+        "[redacted] is not valid", "[redacted] appears in the source",
+        "[redacted] is not a valid identifier", "[redacted] breaks the syntax",
+        "redacted token in the committed source", "redacted marker in the source code",
+        "redacted placeholder is reported as", "sanitizer marker is treated as source",
+        "sanitizer marker as if it were source", "the token [redacted] replaces",
+        "property was replaced by [redacted]", "value was replaced by [redacted]",
+        "identifier is replaced with [redacted]", "apikey was replaced by [redacted]",
+        "⟦redacted:credential⟧ appears in the source",
+        "⟦redacted:credential⟧ is not valid",
+        "⟦redacted:credential⟧ breaks the syntax",
+        "treats the redaction marker as literal source",
+        "mistakes the redaction marker for committed code",
+    )),
+)
+
+def _truthy(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _safe_relative_path(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = Path(value)
+    windows_path = PureWindowsPath(value)
+    return not (
+        path.is_absolute()
+        or windows_path.is_absolute()
+        or ".." in path.parts
+        or ".." in windows_path.parts
+    )
+
+
+def _sentence_for_match(value: str, position: int) -> tuple[str, int]:
+    start = max(value.rfind(mark, 0, position) for mark in ".!?\n") + 1
+    end_candidates = [value.find(mark, position) for mark in ".!?\n"]
+    ends = [end for end in end_candidates if end >= 0]
+    end = min(ends) if ends else len(value)
+    return value[start:end], start
+
+
+def _is_negated_match(value: str, match: re.Match[str], term: str) -> bool:
+    start, end = match.span()
+    sentence, sentence_start = _sentence_for_match(value, start)
+    relative_start = start - sentence_start
+    relative_end = end - sentence_start
+    prefix = sentence[:relative_start]
+    suffix = sentence[relative_end:]
+    before = prefix[-48:]
+    after = suffix[:48]
+    if re.search(
+        r"(?:^|\b)(?:no|not|never|doesn['’]?t|isn['’]?t|is not|are not|do not|must not|should not|cannot|can['’]?t)\s+[^,;:]{0,20}$",
+        before,
+    ):
+        return True
+    # Safe-narrowing prose ("the allowlist prevents the child from inheriting
+    # secrets", "the child runs without reviewer credentials") must not be
+    # scored as the vulnerability it reassures against (#659 negative
+    # controls). Keep these as bounded clause-local connectors so they cannot
+    # suppress a finding elsewhere in the sentence.
+    if re.search(
+        r"(?:^|\b)(?:prevents?|excludes?|avoids?|blocks?|without|strips?|removes?|eliminates?)\s+[^,;:]{0,20}$",
+        before,
+    ):
+        return True
+    if re.match(
+        r"^\s*(?:absent|removed|resolved|fixed|cleared|no longer|does not remain|is not present|are not present|was removed|has been removed|has been fixed|is gone|is resolved|is fixed|is cleared|remains absent)\b",
+        after,
+    ):
+        return True
+    return bool(re.search(
+        r"\b(?:is|are|was|were)\s+not\s*,\s*despite\b[^.!?]{0,80}\b(?:a|an|the)?\s*$",
+        before,
+    ))
+
+
+def _normalize_for_matching(text: str) -> str:
+    # Instrument-correctness fix (NOT new detection power): strip inline-code
+    # backticks and normalise the unicode right single quote so a finding that
+    # markdown-emphasizes a phrase already in the vocabulary (e.g. "`pgrep` is
+    # missing") hits the same word-boundary/substring match as plain ASCII.
+    # It accepts no paraphrase: the exact curated phrase must still be present.
+    return (text or "").casefold().replace("`", "").replace("\u2019", "'")
+
+
+def classify_signal(text: str) -> str | None:
+    value = _normalize_for_matching(text)
+    for capability, vocabulary in _VOCABULARY:
+        for term in vocabulary:
+            match = re.search(rf"(?<!\w){re.escape(term)}(?!\w)", value)
+            if match is None or _is_negated_match(value, match, term):
+                continue
+            sentence, sentence_start = _sentence_for_match(value, match.start())
+            prefix = sentence[:match.start() - sentence_start]
+            if capability == CAPABILITY_DIFF_POLARITY and re.search(
+                r"\b(?:assert|claim|treat|say|report|suggest)\b", prefix,
+            ):
+                continue
+            return capability
+    return None
+
+
+def _sentences(text: str) -> list[str]:
+    return [part for part in re.split(r"(?:[.!?]\s+|\n+)", text) if part.strip()]
+
+
+def _is_suppressed_pre_existing(text: str) -> bool:
+    """True when a finding is waved off as pre-existing to the commit.
+
+    Sentence-local: attribution language plus an explicit decline to flag it in
+    the same sentence. Re-asserting the merge blocker in that sentence
+    ("pre-existing, but still blocks the resulting tree") reads as attribution
+    metadata and is NOT suppression — the #661 rule the reviewer is taught.
+    """
+    value = text.casefold()
+    for sentence in _sentences(value):
+        if not any(term in sentence for term in ATTRIBUTION_TERMS):
+            continue
+        if not any(term in sentence for term in SUPPRESSION_TERMS):
+            continue
+        if any(term in sentence for term in BLOCKER_ASSERTION_TERMS):
+            continue
+        return True
+    return False
+
+
+def _is_speculative_finding(text: str) -> bool:
+    value = text.casefold()
+    if any(cue in value for cue in SPECULATIVE_CUES):
+        return True
+    return any(cue in value for cue in DEFECT_ASSERTION_CUES)
+
+
+def _remediation_verdict(scenario: SemanticScenario, combined_text: str) -> bool:
+    """Validate the run's recommended remediation against the scenario contract.
+
+    `combined_text` is the casefolded join of the run's finding and review
+    texts. Forbidden remediation (the wrapper-only repair, the silent-fallback
+    repair) always fails. A run that proposes a fix must cover every required
+    remediation element; a detection-only run is not penalized.
+    """
+    expectations = scenario.remediation_expectations
+    required = [str(item).casefold() for item in expectations.get("required", [])]
+    forbidden = [str(item).casefold() for item in expectations.get("forbidden", [])]
+    if not required and not forbidden:
+        return True
+    if any(item in combined_text for item in forbidden):
+        return False
+    if not any(cue in combined_text for cue in REMEDIATION_PROPOSAL_CUES):
+        return True
+    return all(item in combined_text for item in required)
+
+
+@dataclass
+class ReviewSignal:
+    kind: str
+    stage: str
+    text: str
+    capability: str | None = None
+    anchors: list[str] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.capability is None and self.kind in {SIGNAL_KIND_FINDING, SIGNAL_KIND_TOOL}:
+            self.capability = classify_signal(self.text)
+
+
+@dataclass
+class SemanticScenario:
+    number: int
+    repo_full_name: str
+    url: str
+    title: str
+    provenance: dict[str, Any]
+    klass: str
+    review_mode: str = "any"
+    route: str = "any"
+    stage_attribution: str = "any"
+    expected_capabilities: list[str] = field(default_factory=list)
+    expected_evidence_anchors: list[dict[str, Any]] = field(default_factory=list)
+    forbidden_capabilities: list[str] = field(default_factory=list)
+    negative_control: bool = False
+    description: str = ""
+    known_findings: list[dict[str, Any]] = field(default_factory=list)
+    expected_metrics: dict[str, Any] = field(default_factory=dict)
+    diff_polarity: str | None = None
+    # #661: per-scenario remediation contract — substrings a recommended fix
+    # must cover ("required") and remediation shapes that must be rejected
+    # ("forbidden", e.g. the wrapper-only repair or the silent fallback).
+    remediation_expectations: dict[str, Any] = field(default_factory=dict)
+    # #757: per-scenario falsification contract (see
+    # FALSIFICATION_EXPECTATION_KEYS). When present on a vulnerable scenario,
+    # a run satisfies the scenario only if it constructed a concrete
+    # counterexample against the changed decision boundary — boundary
+    # comprehension alone (restating the design, citing green tests) is
+    # telemetry, never a pass.
+    falsification_expectations: dict[str, Any] = field(default_factory=dict)
+    fixture: dict[str, Any] | None = None
+    offline_runs: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, entry: dict[str, Any]) -> SemanticScenario:
+        if not isinstance(entry, dict):
+            raise SemanticCorpusError("semantic scenario entries must be objects")
+        klass = entry.get("class")
+        if not _truthy(klass):
+            raise ValueError(f"semantic scenario #{entry.get('number')} is missing required 'class'")
+        return cls(
+            number=entry.get("number"),
+            repo_full_name=entry.get("repo_full_name"),
+            url=entry.get("url"),
+            title=entry.get("title", ""),
+            provenance=entry.get("provenance", {}),
+            klass=klass,
+            review_mode=entry.get("review_mode", "any"),
+            route=entry.get("route", "any"),
+            stage_attribution=entry.get("stage_attribution", "any"),
+            expected_capabilities=entry.get("expected_capabilities", []),
+            expected_evidence_anchors=entry.get("expected_evidence_anchors", []),
+            forbidden_capabilities=entry.get("forbidden_capabilities", []),
+            negative_control=entry.get("negative_control", False),
+            description=entry.get("description", ""),
+            known_findings=entry.get("known_findings", []),
+            expected_metrics=entry.get("expected_metrics", {}),
+            diff_polarity=entry.get("diff_polarity"),
+            remediation_expectations=entry.get("remediation_expectations") or {},
+            falsification_expectations=entry.get("falsification_expectations") or {},
+            fixture=entry.get("fixture"),
+            offline_runs=entry.get("offline_runs", []),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "number": self.number,
+            "repo_full_name": self.repo_full_name,
+            "url": self.url,
+            "title": self.title,
+            "provenance": self.provenance,
+            "class": self.klass,
+            "review_mode": self.review_mode,
+            "route": self.route,
+            "stage_attribution": self.stage_attribution,
+            "expected_capabilities": self.expected_capabilities,
+            "expected_evidence_anchors": self.expected_evidence_anchors,
+            "forbidden_capabilities": self.forbidden_capabilities,
+            "negative_control": self.negative_control,
+            "description": self.description,
+            "known_findings": self.known_findings,
+            "expected_metrics": self.expected_metrics,
+            "diff_polarity": self.diff_polarity,
+            "remediation_expectations": self.remediation_expectations,
+            "falsification_expectations": self.falsification_expectations,
+            "fixture": self.fixture,
+            "offline_runs": self.offline_runs,
+        }
+
+
+@dataclass
+class SemanticCorpus:
+    scenarios: list[SemanticScenario] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    version: int = SEMANTIC_CORPUS_VERSION
+    fixture_root: Path | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_file(cls, path: Path) -> SemanticCorpus:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise TypeError(f"{path}: top-level value must be an object")
+        raw = data.get("semantic_corpus") or data.get("benchmark_corpus") or []
+        if not isinstance(raw, list):
+            raise TypeError(f"{path}: semantic_corpus must be a list")
+        return cls(
+            scenarios=[SemanticScenario.from_dict(item) for item in raw],
+            metadata=dict(data.get("metadata", {})),
+            version=int(data.get("version", SEMANTIC_CORPUS_VERSION)),
+            fixture_root=path.parent,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "semantic_corpus": [scenario.to_dict() for scenario in self.scenarios],
+            "metadata": self.metadata,
+        }
+
+
+class SemanticCorpusError(ValueError):
+    pass
+
+
+# Git can spawn background auto-gc / maintenance after a commit; that races the
+# fixture teardown and makes rmtree fail with ENOTEMPTY on .git/objects/pack
+# (#920). Disable it for every git subprocess the fixture spawns, and retry
+# teardown as a belt-and-braces guard.
+_GIT_BACKGROUND_OFF: dict[str, str] = {
+    "gc.auto": "0",
+    "gc.autoDetach": "false",
+    "gc.autoPackLimit": "0",
+    "maintenance.auto": "false",
+}
+_FIXTURE_RMTREE_ATTEMPTS = 5
+_FIXTURE_RMTREE_DELAY_SECONDS = 0.05
+
+
+def _fixture_git_env() -> dict[str, str]:
+    """Subprocess environment for fixture git calls.
+
+    `GIT_CONFIG_*` entries behave like `git -c`, so every spawned git command
+    inherits them without mutating the caller's environment. Inherited
+    `GIT_CONFIG*` entries are dropped first: the fixture is deliberately
+    hermetic (like the `GIT_CONFIG_GLOBAL`/`NOSYSTEM` isolation below), and a
+    leaked `GIT_CONFIG_COUNT` that disagrees with its `KEY_*`/`VALUE_*` pairs
+    aborts every git call, while a leaked `GIT_CONFIG=<file>` redirects
+    `git config` writes out of `.git/config`, so the fixture's identity never
+    lands where `git commit` reads it."""
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "GIT_CONFIG" and not name.startswith("GIT_CONFIG_")
+    }
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    for index, (key, value) in enumerate(_GIT_BACKGROUND_OFF.items()):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    env["GIT_CONFIG_COUNT"] = str(len(_GIT_BACKGROUND_OFF))
+    return env
+
+
+def _remove_fixture_tree(directory: str) -> None:
+    """Remove the fixture tree, retrying only a transient ENOTEMPTY (#920).
+
+    Any other `OSError` (permissions, read-only mount, …) is not a race and is
+    surfaced immediately rather than after a pointless sleep."""
+    for attempt in range(_FIXTURE_RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(directory)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY or attempt == _FIXTURE_RMTREE_ATTEMPTS - 1:
+                raise
+            time.sleep(_FIXTURE_RMTREE_DELAY_SECONDS)
+
+
+@contextlib.contextmanager
+def _fixture_directory() -> Iterator[str]:
+    directory = tempfile.mkdtemp(prefix="semantic-fixture-")
+    try:
+        yield directory
+    finally:
+        _remove_fixture_tree(directory)
+
+
+def validate_semantic_fixture_integrity(fixture: dict[str, Any]) -> None:
+    files = fixture.get("files")
+    diff = fixture.get("diff")
+    if not isinstance(files, list):
+        raise SemanticCorpusError("semantic fixture files must be a list")
+    if not isinstance(diff, str):
+        raise SemanticCorpusError("semantic fixture diff must be a string")
+
+    expected: dict[str, bytes] = {}
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise SemanticCorpusError("semantic fixture files must contain objects")
+        path = entry.get("path")
+        content = entry.get("content")
+        if not isinstance(path, str) or not path or not _safe_relative_path(path):
+            raise SemanticCorpusError(f"semantic fixture file path is unsafe: {path!r}")
+        if path in expected:
+            raise SemanticCorpusError(f"semantic fixture contains duplicate file: {path}")
+        if not isinstance(content, str):
+            raise SemanticCorpusError(f"semantic fixture content must be text: {path}")
+        expected[path] = content.encode("utf-8")
+
+    with _fixture_directory() as directory:
+        repo = Path(directory)
+        env = _fixture_git_env()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "eval@test"], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "semantic-eval"], check=True, capture_output=True, env=env)
+        for relative_name, content in expected.items():
+            destination = repo / relative_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-q", "-m", "fixture-head"], check=True, capture_output=True, env=env)
+
+        result = subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check", "--reverse"],
+            input=diff.encode("utf-8"), capture_output=True, env=env,
+        )
+        if result.returncode != 0:
+            raise SemanticCorpusError(
+                "semantic fixture reverse patch does not apply: "
+                + result.stderr.decode("utf-8", errors="replace").strip()
+            )
+        subprocess.run(
+            ["git", "-C", str(repo), "apply", "--reverse"],
+            input=diff.encode("utf-8"), check=True, capture_output=True, env=env,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "apply", "--check"],
+            input=diff.encode("utf-8"), check=True, capture_output=True, env=env,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "apply"],
+            input=diff.encode("utf-8"), check=True, capture_output=True, env=env,
+        )
+        actual_paths = {
+            path.decode("utf-8")
+            for path in subprocess.run(
+                ["git", "-C", str(repo), "ls-files", "-z"], check=True, capture_output=True, env=env,
+            ).stdout.split(b"\0")
+            if path
+        }
+        if actual_paths != set(expected):
+            raise SemanticCorpusError(
+                "semantic fixture patch changed the tracked file set: "
+                f"expected {sorted(expected)}, got {sorted(actual_paths)}"
+            )
+        for relative_name, content in expected.items():
+            if (repo / relative_name).read_bytes() != content:
+                raise SemanticCorpusError(
+                    f"semantic fixture patch new side does not match files: {relative_name}"
+                )
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SemanticCorpusError(message)
+
+
+def validate_semantic_corpus(corpus: SemanticCorpus) -> None:
+    _require(corpus.version == SEMANTIC_CORPUS_VERSION, f"semantic corpus version must be {SEMANTIC_CORPUS_VERSION}, got {corpus.version}")
+    _require(bool(corpus.scenarios), "semantic corpus must declare at least one scenario")
+    seen: set[int] = set()
+    for scenario in corpus.scenarios:
+        prefix = f"semantic scenario #{scenario.number}"
+        _require(isinstance(scenario.number, int) and not isinstance(scenario.number, bool), f"{prefix}: number must be an integer")
+        _require(scenario.number not in seen, f"{prefix}: duplicate scenario number")
+        seen.add(scenario.number)
+        _require(isinstance(scenario.provenance, dict), f"{prefix}: provenance must be an object")
+        _require(isinstance(scenario.expected_capabilities, list), f"{prefix}: expected_capabilities must be a list")
+        _require(isinstance(scenario.forbidden_capabilities, list), f"{prefix}: forbidden_capabilities must be a list")
+        _require(isinstance(scenario.expected_evidence_anchors, list), f"{prefix}: expected_evidence_anchors must be a list")
+        _require(isinstance(scenario.klass, str), f"{prefix}: class must be a string")
+        _require(scenario.klass in KNOWN_CAPABILITY_CLASSES, f"{prefix}: unknown class {scenario.klass!r}")
+        _require(isinstance(scenario.review_mode, str) and scenario.review_mode in RECOGNISED_MODES, f"{prefix}: review_mode {scenario.review_mode!r} not recognised")
+        _require(isinstance(scenario.route, str) and scenario.route in RECOGNISED_ROUTES, f"{prefix}: route {scenario.route!r} not recognised")
+        _require(isinstance(scenario.stage_attribution, str) and scenario.stage_attribution in RECOGNISED_STAGES, f"{prefix}: stage_attribution {scenario.stage_attribution!r} not recognised")
+        if scenario.diff_polarity is not None:
+            _require(scenario.diff_polarity in RECOGNISED_DIFF_POLARITIES, f"{prefix}: diff_polarity {scenario.diff_polarity!r} not recognised")
+        if scenario.fixture is not None:
+            _require(isinstance(scenario.fixture, dict), f"{prefix}: fixture must be an object")
+            fixture_path = scenario.fixture.get("path")
+            fixture_hash = scenario.fixture.get("sha256")
+            _require(_truthy(fixture_path), f"{prefix}: fixture.path is required")
+            _require(_safe_relative_path(fixture_path), f"{prefix}: fixture.path must be a safe relative path")
+            _require(isinstance(fixture_hash, str) and re.fullmatch(r"[0-9a-f]{64}", fixture_hash) is not None, f"{prefix}: fixture.sha256 must be 64 lowercase hexadecimal characters")
+            if corpus.fixture_root is not None:
+                fixture_file = (corpus.fixture_root / fixture_path).resolve()
+                _require(corpus.fixture_root.resolve() in fixture_file.parents, f"{prefix}: fixture path escapes corpus root")
+                if fixture_file.exists():
+                    try:
+                        fixture_data = json.loads(fixture_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as exc:
+                        raise SemanticCorpusError(f"{prefix}: fixture cannot be loaded") from exc
+                    try:
+                        validate_semantic_fixture_integrity(fixture_data)
+                    except (TypeError, AttributeError, SemanticCorpusError) as exc:
+                        raise SemanticCorpusError(f"{prefix}: fixture integrity failed: {exc}") from exc
+        _require(_truthy(scenario.repo_full_name), f"{prefix}: repo_full_name is required")
+        _require(_truthy(scenario.url), f"{prefix}: url is required")
+        _require(_truthy(scenario.provenance.get("pr_url")), f"{prefix}: provenance.pr_url is required")
+        _require(scenario.provenance.get("issue") is not None, f"{prefix}: provenance.issue is required")
+        _require(isinstance(scenario.negative_control, bool), f"{prefix}: negative_control must be a boolean")
+        for capability in scenario.expected_capabilities + scenario.forbidden_capabilities:
+            _require(isinstance(capability, str), f"{prefix}: capabilities must be strings")
+            _require(capability in KNOWN_CAPABILITY_CLASSES, f"{prefix}: unknown capability {capability!r}")
+        _require(scenario.klass in scenario.expected_capabilities or scenario.negative_control, f"{prefix}: class must be expected or negative_control")
+        if not scenario.negative_control:
+            _require(
+                scenario.expected_evidence_anchors
+                and all(anchor.get("kind") in {SIGNAL_KIND_FINDING, SIGNAL_KIND_TOOL} for anchor in scenario.expected_evidence_anchors),
+                f"{prefix}: positive scenarios need only finding or tool evidence anchors",
+            )
+        if scenario.negative_control:
+            _require(not scenario.expected_capabilities, f"{prefix}: negative controls cannot expect capabilities")
+            _require(bool(scenario.forbidden_capabilities), f"{prefix}: negative controls need forbidden_capabilities")
+        _require(isinstance(scenario.expected_metrics, dict), f"{prefix}: expected_metrics must be an object")
+        for key, value in scenario.expected_metrics.items():
+            _require(key in {"max_tool_calls", "max_duplicates", "max_latency_sec"}, f"{prefix}: expected_metrics key {key!r} is not recognised")
+            if key in {"max_tool_calls", "max_duplicates"}:
+                _require(isinstance(value, int) and not isinstance(value, bool) and value >= 0, f"{prefix}: expected_metrics.{key} must be a non-negative integer")
+            else:
+                _require(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0, f"{prefix}: expected_metrics.{key} must be a finite non-negative number")
+        _require(isinstance(scenario.remediation_expectations, dict), f"{prefix}: remediation_expectations must be an object")
+        for key in scenario.remediation_expectations:
+            _require(key in {"required", "forbidden"}, f"{prefix}: remediation_expectations key {key!r} is not recognised")
+        for key in ("required", "forbidden"):
+            items = scenario.remediation_expectations.get(key, [])
+            _require(isinstance(items, list), f"{prefix}: remediation_expectations.{key} must be a list")
+            for item in items:
+                _require(isinstance(item, str) and item.strip(), f"{prefix}: remediation_expectations.{key} entries must be non-empty strings")
+        # #757 falsification contract: both needle lists are required so the
+        # boundary-comprehension vs counterexample distinction is always
+        # decidable, and negative controls cannot declare one (their success
+        # state is the absence of a false attribution, not a falsification).
+        _require(isinstance(scenario.falsification_expectations, dict), f"{prefix}: falsification_expectations must be an object")
+        if scenario.falsification_expectations:
+            _require(
+                not scenario.negative_control,
+                f"{prefix}: falsification_expectations cannot be declared on a negative control",
+            )
+            for key in scenario.falsification_expectations:
+                _require(key in FALSIFICATION_EXPECTATION_KEYS, f"{prefix}: falsification_expectations key {key!r} is not recognised")
+            for key in ("boundary_any_of", "counterexample_any_of"):
+                items = scenario.falsification_expectations.get(key, [])
+                _require(isinstance(items, list) and bool(items), f"{prefix}: falsification_expectations.{key} must be a non-empty list")
+                for item in items:
+                    _require(isinstance(item, str) and item.strip(), f"{prefix}: falsification_expectations.{key} entries must be non-empty strings")
+        _require(isinstance(scenario.offline_runs, list), f"{prefix}: offline_runs must be a list")
+        for fixture in scenario.offline_runs:
+            _require(isinstance(fixture, dict), f"{prefix}: offline_runs entries must be objects")
+            if "mode" in fixture:
+                _require(fixture["mode"] in RECOGNISED_MODES - {"any"}, f"{prefix}: offline run mode is not recognised")
+            if "route" in fixture:
+                _require(fixture["route"] in RECOGNISED_ROUTES, f"{prefix}: offline run route is not recognised")
+            if "expected_disposition" in fixture:
+                _require(
+                    fixture["expected_disposition"] in MERGE_SAFETY_DISPOSITIONS,
+                    f"{prefix}: offline run expected_disposition {fixture['expected_disposition']!r} is not recognised",
+                )
+            findings = fixture.get("findings", [])
+            _require(isinstance(findings, list), f"{prefix}: offline run findings must be a list")
+            for finding in findings:
+                _require(isinstance(finding, dict), f"{prefix}: offline run findings must be objects")
+            if any(not finding.get("stage") for finding in findings):
+                _require("route" in fixture, f"{prefix}: offline runs with stage-less findings must declare route")
+        anchor_ids: set[str] = set()
+        for anchor in scenario.expected_evidence_anchors:
+            _require(isinstance(anchor, dict), f"{prefix}: evidence anchors must be objects")
+            if "id" in anchor:
+                _require(_truthy(anchor["id"]), f"{prefix}: evidence anchor id must be non-empty")
+                _require(anchor["id"] not in anchor_ids, f"{prefix}: duplicate evidence anchor id {anchor['id']!r}")
+                anchor_ids.add(anchor["id"])
+            kind = anchor.get("kind")
+            _require(kind in SIGNAL_KINDS, f"{prefix}: evidence anchor kind {kind!r} not recognised")
+            if kind == SIGNAL_KIND_TOOL:
+                _require(_truthy(anchor.get("tool")), f"{prefix}: 'tool' anchors must declare 'tool'")
+            _require(
+                isinstance(anchor.get("any_of"), list) and anchor["any_of"],
+                f"{prefix}: '{kind}' anchors must declare a non-empty 'any_of' list",
+            )
+
+
+@dataclass
+class SemanticResult:
+    scenario_number: int
+    capability_hits: dict[str, list[str]] = field(default_factory=dict)
+    anchor_results: list[dict[str, Any]] = field(default_factory=list)
+    stages_hit: list[str] = field(default_factory=list)
+    forbidden_violations: list[str] = field(default_factory=list)
+    passed: bool = False
+    description: str = ""
+    signals_seen: int = 0
+    tool_call_count: int = 0
+    duplicate_count: int = 0
+    latency_sec: float = 0.0
+    escalated: bool = False
+    route: str | None = None
+    mode: str | None = None
+    applicability_violations: list[str] = field(default_factory=list)
+    metric_violations: list[str] = field(default_factory=list)
+    # #661 merge-safety disposition telemetry (see MERGE_SAFETY_DISPOSITIONS).
+    disposition: str | None = None
+    disposition_expected: str | None = None
+    disposition_violations: list[str] = field(default_factory=list)
+    suppressed_pre_existing: bool = False
+    remediation_ok: bool | None = None
+    # #661 review-blocker fix: a run that declares `expected_disposition` is a
+    # scorer-CALIBRATION fixture (an answer-key output), never an observed
+    # reviewer output. It exercises whether the scorer lands the output in its
+    # declared category (`disposition_calibration_pass`) and is excluded from
+    # the reviewer-quality `passed` / pass_rate accounting entirely — a
+    # deliberately bad reference must not inflate the headline success rate,
+    # and a deliberately correct reference must still satisfy the full
+    # capability/evidence-anchor contract through `passed`.
+    calibration_run: bool = False
+    disposition_calibration_pass: bool | None = None
+    # #757 counterexample-driven falsification telemetry. The first three are
+    # None when the scenario declares no falsification_expectations (the
+    # contract is not part of that scenario); booleans otherwise.
+    # `finding_correct` is computed on every vulnerable scenario
+    # (expected_capabilities non-empty): the defect was detected and
+    # dispositioned correct (not suppressed, remediation sound).
+    boundary_understood: bool | None = None
+    counterexample_attempted: bool | None = None
+    counterexample_found: bool | None = None
+    finding_correct: bool | None = None
+    falsification_violations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_number": self.scenario_number,
+            "passed": self.passed,
+            "description": self.description,
+            "capability_hits": self.capability_hits,
+            "anchor_results": self.anchor_results,
+            "stages_hit": self.stages_hit,
+            "forbidden_violations": self.forbidden_violations,
+            "signals_seen": self.signals_seen,
+            "tool_call_count": self.tool_call_count,
+            "duplicate_count": self.duplicate_count,
+            "latency_sec": self.latency_sec,
+            "escalated": self.escalated,
+            "route": self.route,
+            "mode": self.mode,
+            "applicability_violations": self.applicability_violations,
+            "metric_violations": self.metric_violations,
+            "disposition": self.disposition,
+            "disposition_expected": self.disposition_expected,
+            "disposition_violations": self.disposition_violations,
+            "suppressed_pre_existing": self.suppressed_pre_existing,
+            "remediation_ok": self.remediation_ok,
+            "calibration_run": self.calibration_run,
+            "disposition_calibration_pass": self.disposition_calibration_pass,
+            "boundary_understood": self.boundary_understood,
+            "counterexample_attempted": self.counterexample_attempted,
+            "counterexample_found": self.counterexample_found,
+            "finding_correct": self.finding_correct,
+            "falsification_violations": self.falsification_violations,
+        }
+
+
+def _matches_expected(value: str | None, expected: str) -> bool:
+    return expected == "any" or value == expected
+
+
+def _run_value(run: Any, key: str, default: Any = None) -> Any:
+    if isinstance(run, dict):
+        return run.get(key, default)
+    return getattr(run, key, default)
+
+
+def _run_metadata(run: Any) -> dict[str, Any]:
+    metadata = _run_value(run, "meta", {}) or {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _run_route(run: Any) -> str | None:
+    route = _run_value(run, "route") or _run_metadata(run).get("route")
+    return str(route) if route else None
+
+
+def _run_mode(run: Any) -> str | None:
+    mode = _run_value(run, "mode") or _run_metadata(run).get("mode")
+    if not mode:
+        return None
+    value = str(mode)
+    return "deep" if value.endswith("+deep") or value == "deep" else "standard"
+
+
+def _run_stage(run: Any) -> str:
+    stage = _run_value(run, "stage") or _run_metadata(run).get("stage")
+    return str(stage) if stage in RECOGNISED_SIGNAL_STAGES else "unknown"
+
+
+def _run_finding_stage(run: Any, finding: Any = None) -> str:
+    if isinstance(finding, dict):
+        explicit_stage = finding.get("stage")
+        if explicit_stage in RECOGNISED_SIGNAL_STAGES:
+            return str(explicit_stage)
+    stage = _run_stage(run)
+    return stage if stage in {"primary", "escalation"} else "unknown"
+
+
+def _signal_stage(value: Any, fallback: str) -> str:
+    return str(value) if value in RECOGNISED_SIGNAL_STAGES else fallback
+
+
+def _route_matches(actual: str | None, expected: str) -> bool:
+    if expected == "any":
+        return True
+    if actual == "any":
+        return True
+    if expected == actual:
+        return True
+    primary_routes = {"primary", "fast", "smart", "legacy"}
+    escalation_routes = {"escalation", "escalated"}
+    if expected == "primary":
+        return actual in primary_routes
+    if expected == "escalation":
+        return actual in escalation_routes
+    return expected == "primary+escalation" and actual in primary_routes | escalation_routes
+
+
+def _collect_signals_from_run(run: Any) -> list[ReviewSignal]:
+    stage = _run_stage(run)
+    signals: list[ReviewSignal] = []
+    review = _run_value(run, "review_markdown", "") or ""
+    if review:
+        signals.append(ReviewSignal(SIGNAL_KIND_MENTION, stage, str(review)))
+    for finding in _run_value(run, "primary_findings", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        text = finding.get("description") or finding.get("message") or ""
+        signals.append(ReviewSignal(SIGNAL_KIND_FINDING, "primary", str(text), meta=finding))
+    for finding in _run_value(run, "findings", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        signal_stage = _run_finding_stage(run, finding)
+        text = finding.get("description") or finding.get("message") or ""
+        signals.append(ReviewSignal(SIGNAL_KIND_FINDING, signal_stage, str(text), meta=finding))
+    for artifact in _run_value(run, "artifacts", []) or []:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_stage = _signal_stage(artifact.get("stage"), "unknown")
+        text = artifact.get("text") or artifact.get("content") or artifact.get("message") or ""
+        if text:
+            signals.append(ReviewSignal(SIGNAL_KIND_MENTION, artifact_stage, str(text), meta=artifact))
+    leads = _run_value(run, "specialist_leads", None)
+    if not isinstance(leads, list) or not leads:
+        leads = []
+        specialists = _run_value(run, "specialists", {})
+        if isinstance(specialists, dict):
+            leads_by_role = specialists.get("leads_by_role")
+            if isinstance(leads_by_role, dict):
+                leads = [
+                    lead
+                    for role_leads in leads_by_role.values()
+                    for lead in role_leads if isinstance(role_leads, list)
+                ]
+    for lead in leads:
+        if not isinstance(lead, dict):
+            continue
+        text = lead.get("message") or lead.get("description") or ""
+        if text:
+            signals.append(ReviewSignal(SIGNAL_KIND_FINDING, "specialist", str(text), meta=lead))
+    for call in _run_value(run, "tool_calls", []) or []:
+        if not isinstance(call, dict):
+            continue
+        call_stage = _signal_stage(call.get("stage"), stage)
+        args = call.get("args") or {}
+        text = " ".join(str(value) for value in args.values() if isinstance(value, str))
+        signals.append(ReviewSignal(SIGNAL_KIND_TOOL, call_stage, text, meta={"tool": call.get("tool", ""), "status": call.get("status")}))
+    return signals
+
+
+def _anchor_matches(signal: ReviewSignal, anchor: dict[str, Any]) -> bool:
+    if signal.stage == "unknown" or signal.kind != anchor.get("kind"):
+        return False
+    if anchor.get("kind") == SIGNAL_KIND_TOOL and anchor.get("tool") != signal.meta.get("tool"):
+        return False
+    haystack = signal.text.casefold()
+    return any(str(needle).casefold() in haystack for needle in anchor.get("any_of", []))
+
+
+def evaluate_semantic_capability(
+    scenario: SemanticScenario,
+    signals: Iterable[ReviewSignal],
+    run_metadata: dict[str, Any] | None = None,
+) -> SemanticResult:
+    values = list(signals)
+    metadata = run_metadata or {}
+    signal_tool_calls = sum(signal.kind == SIGNAL_KIND_TOOL for signal in values)
+    declared_tool_calls = metadata.get("tool_call_count", metadata.get("tool_calls"))
+    if isinstance(declared_tool_calls, (list, tuple)):
+        declared_tool_calls = len(declared_tool_calls)
+    try:
+        tool_call_count = int(declared_tool_calls) if declared_tool_calls is not None else signal_tool_calls
+    except (TypeError, ValueError):
+        tool_call_count = signal_tool_calls
+    result = SemanticResult(
+        scenario_number=scenario.number,
+        description=scenario.description,
+        signals_seen=len(values),
+        tool_call_count=tool_call_count,
+        duplicate_count=int(metadata.get("duplicate_count", 0)),
+        latency_sec=float(metadata.get("latency_sec", 0.0) or 0.0),
+        escalated=bool(metadata.get("escalated", False)),
+        route=_run_route(metadata),
+        mode=_run_mode(metadata),
+    )
+
+    if not _matches_expected(result.mode, scenario.review_mode):
+        result.applicability_violations.append(f"review_mode={result.mode!r}, expected={scenario.review_mode!r}")
+    if not _route_matches(result.route, scenario.route):
+        result.applicability_violations.append(f"route={result.route!r}, expected={scenario.route!r}")
+    if scenario.expected_metrics.get("max_tool_calls") is not None and result.tool_call_count > scenario.expected_metrics["max_tool_calls"]:
+        result.metric_violations.append("max_tool_calls")
+    if scenario.expected_metrics.get("max_duplicates") is not None and result.duplicate_count > scenario.expected_metrics["max_duplicates"]:
+        result.metric_violations.append("max_duplicates")
+    if scenario.expected_metrics.get("max_latency_sec") is not None and result.latency_sec > scenario.expected_metrics["max_latency_sec"]:
+        result.metric_violations.append("max_latency_sec")
+    for signal in values:
+        if signal.kind not in {SIGNAL_KIND_FINDING, SIGNAL_KIND_TOOL}:
+            continue
+        if signal.capability:
+            result.capability_hits.setdefault(signal.capability, [])
+            if signal.stage not in result.capability_hits[signal.capability]:
+                result.capability_hits[signal.capability].append(signal.stage)
+    result.forbidden_violations = [capability for capability in scenario.forbidden_capabilities if capability in result.capability_hits]
+    anchor_stages: set[str] = set()
+    for index, anchor in enumerate(scenario.expected_evidence_anchors):
+        matching = [signal for signal in values if _anchor_matches(signal, anchor)]
+        anchor_stages.update(signal.stage for signal in matching)
+        result.anchor_results.append({"id": anchor.get("id") or f"anchor-{index}", "kind": anchor.get("kind"), "satisfied": bool(matching), "stages": sorted({signal.stage for signal in matching})})
+    hit_stages = set(anchor_stages)
+    for stages in result.capability_hits.values():
+        hit_stages.update(stages)
+    result.stages_hit = [stage for stage in ("specialist", "primary", "escalation", "any") if stage in hit_stages]
+    capabilities_ok = all(capability in result.capability_hits for capability in scenario.expected_capabilities)
+    anchors_ok = all(item["satisfied"] for item in result.anchor_results)
+    stage_ok = scenario.stage_attribution == "any" or scenario.stage_attribution in result.stages_hit
+    if scenario.stage_attribution != "any" and scenario.stage_attribution not in result.stages_hit:
+        result.applicability_violations.append(f"stage_attribution={result.stages_hit!r}, expected={scenario.stage_attribution!r}")
+    result.passed = capabilities_ok and anchors_ok and stage_ok and not result.forbidden_violations and not result.applicability_violations and not result.metric_violations
+    # #661 merge-safety disposition: classify WHY this run found (or missed)
+    # the defect, and keep two independent verdicts separate.
+    #
+    # Review quality (`passed`, above): whether this output actually satisfies
+    # the scenario. Tightened so the merge-safety miss categories are never a
+    # pass on a vulnerable scenario — a found-but-suppressed or badly repaired
+    # detection does not satisfy the scenario even though the causal chain
+    # fired. Negative controls keep the legacy formula: for them "no defect
+    # found" IS the success state.
+    #
+    # Disposition calibration (`disposition_calibration_pass`): whether the
+    # scorer classified a REFERENCE (answer-key) output into its declared
+    # `expected_disposition`. Calibration runs are marked as such, gated on
+    # this metric, and excluded from reviewer-quality accounting downstream
+    # (`aggregate_semantic_runs`), so intentionally bad answer-key outputs can
+    # never inflate the reported pass_rate.
+    finding_texts = [signal.text for signal in values if signal.kind in {SIGNAL_KIND_FINDING, SIGNAL_KIND_MENTION}]
+    combined_text = "\n".join(finding_texts).casefold()
+    detected = bool(scenario.expected_capabilities) and all(
+        capability in result.capability_hits for capability in scenario.expected_capabilities
+    )
+    result.suppressed_pre_existing = detected and _is_suppressed_pre_existing(combined_text)
+    result.remediation_ok = _remediation_verdict(scenario, combined_text) if detected else None
+    expected_disposition = metadata.get("expected_disposition")
+    if expected_disposition is not None:
+        result.calibration_run = True
+        result.disposition_expected = str(expected_disposition)
+    if not detected:
+        result.disposition = (
+            DISPOSITION_SPECULATIVE_FALSE_POSITIVE
+            if any(_is_speculative_finding(text.casefold()) for text in finding_texts)
+            else DISPOSITION_NOT_FOUND
+        )
+    elif result.suppressed_pre_existing:
+        result.disposition = DISPOSITION_SUPPRESSED_PRE_EXISTING
+    elif result.remediation_ok is False:
+        result.disposition = DISPOSITION_INVALID_REMEDIATION
+    else:
+        result.disposition = DISPOSITION_CORRECT
+    if scenario.expected_capabilities and result.disposition != DISPOSITION_CORRECT:
+        # A vulnerable scenario is only satisfied by a clean detection with
+        # sound remediation reasoning; every other disposition is a miss.
+        result.passed = False
+    # #757 counterexample-driven falsification: when the scenario declares a
+    # falsification contract, passing requires an actual constructed
+    # counterexample against the changed boundary. A review that restates the
+    # intended design, cites green tests, or observes parity understands the
+    # boundary (boundary_understood) but never falsifies it — exactly the
+    # verification-by-coherence failure #756 exhibited, so it must never be a
+    # pass. `counterexample_attempted` stays telemetry so an A/B can measure
+    # attempt rate separately from success.
+    if scenario.falsification_expectations:
+        # Same normalization as classify_signal (backtick/apostrophe fold), so
+        # a counterexample written inside markdown code spans matches the same
+        # needle as plain text.
+        falsification_text = _normalize_for_matching(combined_text)
+        boundary_needles = [_normalize_for_matching(str(item)) for item in scenario.falsification_expectations.get("boundary_any_of", [])]
+        counterexample_needles = [_normalize_for_matching(str(item)) for item in scenario.falsification_expectations.get("counterexample_any_of", [])]
+        result.boundary_understood = any(needle in falsification_text for needle in boundary_needles)
+        result.counterexample_found = any(needle in falsification_text for needle in counterexample_needles)
+        result.counterexample_attempted = result.counterexample_found or any(
+            cue in falsification_text for cue in COUNTEREXAMPLE_ATTEMPT_CUES
+        )
+        if scenario.expected_capabilities and not result.counterexample_found:
+            result.falsification_violations.append("counterexample_not_found")
+            result.passed = False
+    if scenario.expected_capabilities:
+        result.finding_correct = detected and result.disposition == DISPOSITION_CORRECT
+    if result.calibration_run:
+        if result.disposition != result.disposition_expected:
+            result.disposition_violations.append(
+                f"disposition={result.disposition!r}, expected={result.disposition_expected!r}"
+            )
+        result.disposition_calibration_pass = not result.disposition_violations
+    return result
+
+
+def _fixture_signals(fixture: dict[str, Any]) -> list[ReviewSignal]:
+    class FixtureRun:
+        pass
+
+    run = FixtureRun()
+    run.stage = fixture.get("stage", "primary")
+    run.route = fixture.get("route")
+    run.review_markdown = fixture.get("review_markdown", "")
+    run.findings = fixture.get("findings", [])
+    run.tool_calls = fixture.get("tool_calls", [])
+    return _collect_signals_from_run(run)
+
+
+def evaluate_offline_scenario(scenario: SemanticScenario) -> list[SemanticResult]:
+    results: list[SemanticResult] = []
+    for fixture in scenario.offline_runs:
+        if not isinstance(fixture, dict):
+            continue
+        signals = _fixture_signals(fixture)
+        metadata = dict(fixture.get("metadata", {}))
+        for key in ("mode", "route", "escalated", "duplicate_count", "latency_sec", "tool_calls", "tool_call_count", "expected_disposition"):
+            if key in fixture:
+                metadata[key] = fixture[key]
+        result = evaluate_semantic_capability(scenario, signals, metadata)
+        results.append(result)
+    return results
+
+
+def evaluate_semantic_corpus(corpus: SemanticCorpus) -> dict[str, Any]:
+    validate_semantic_corpus(corpus)
+    scenario_reports: list[dict[str, Any]] = []
+    for scenario in corpus.scenarios:
+        per_run = evaluate_offline_scenario(scenario)
+        aggregate = aggregate_semantic_runs(scenario, per_run)
+        aggregate["provenance"] = scenario.provenance
+        aggregate["class"] = scenario.klass
+        aggregate["negative_control"] = scenario.negative_control
+        aggregate["diff_polarity"] = scenario.diff_polarity
+        aggregate["review_mode"] = scenario.review_mode
+        aggregate["route_expected"] = scenario.route
+        aggregate["stage_attribution_expected"] = scenario.stage_attribution
+
+        reviewer_runs = [result for result in per_run if not result.calibration_run]
+        aggregate["attribution_rates"] = {
+            stage: round(sum(stage in result.stages_hit for result in reviewer_runs) / len(reviewer_runs), 4) if reviewer_runs else 0.0
+            for stage in ("specialist", "primary", "escalation")
+        }
+        scenario_reports.append(aggregate)
+    scored = [item for item in scenario_reports if item["runs"]]
+    negative_controls = [item for item in scenario_reports if item["negative_control"]]
+    calibration_scenarios = [item for item in scored if item["disposition_calibration_rate"] is not None]
+    # #661: aggregate merge-safety dispositions across the scored (vulnerable)
+    # scenarios so suppression-as-pre-existing and invalid-remediation misses
+    # are visible in the report headline, not buried per scenario. The
+    # headline counts describe ACTUAL evaluated reviewer outputs; the answer
+    # key calibration fixtures are reported separately so deliberately bad
+    # synthetic examples can never read as observed reviewer performance.
+    disposition_totals = {
+        disposition: sum(item["merge_safety_disposition_counts"].get(disposition, 0) for item in scored)
+        for disposition in MERGE_SAFETY_DISPOSITIONS_ORDER
+    }
+    calibration_disposition_totals = {
+        disposition: sum(item["merge_safety_calibration_disposition_counts"].get(disposition, 0) for item in scored)
+        for disposition in MERGE_SAFETY_DISPOSITIONS_ORDER
+    }
+    calibration_runs_total = sum(item["calibration_runs"] for item in scored)
+    calibration_passes_total = sum(item["disposition_calibration_passes"] for item in scored)
+    summary = {
+        "scenarios": len(scenario_reports),
+        "scored_scenarios": len(scored),
+        "pass_rate": round(sum(item["pass_rate"] for item in scored) / len(scored), 4) if scored else 0.0,
+        "false_positive_rate": round(sum(item["false_positive_rate"] for item in negative_controls) / len(negative_controls), 4) if negative_controls else 0.0,
+        "average_tool_calls": round(sum(item["average_tool_calls"] for item in scored) / len(scored), 4) if scored else 0.0,
+        "average_duplicate_count": round(sum(item["average_duplicate_count"] for item in scored) / len(scored), 4) if scored else 0.0,
+        "average_latency_sec": round(sum(item["average_latency_sec"] for item in scored) / len(scored), 4) if scored else 0.0,
+        "escalation_frequency": round(sum(item["escalation_frequency"] for item in scored) / len(scored), 4) if scored else 0.0,
+        # Observed reviewer-output dispositions (calibration fixtures excluded).
+        "merge_safety_disposition_counts": disposition_totals,
+        "merge_safety_suppressed_pre_existing_runs": disposition_totals[DISPOSITION_SUPPRESSED_PRE_EXISTING],
+        "merge_safety_invalid_remediation_runs": disposition_totals[DISPOSITION_INVALID_REMEDIATION],
+        # Scorer calibration: how often the scorer landed each answer-key
+        # fixture in its declared category. Gated separately from pass_rate.
+        "calibration_fixture_runs": calibration_runs_total,
+        "disposition_calibration_passes": calibration_passes_total,
+        "disposition_calibration_rate": round(calibration_passes_total / calibration_runs_total, 4) if calibration_runs_total else None,
+        "merge_safety_calibration_disposition_counts": calibration_disposition_totals,
+        # #757 counterexample-driven falsification telemetry.
+        "falsification": _falsification_summary(scored, negative_controls),
+    }
+    return {
+        "evaluator_version": SEMANTIC_EVAL_VERSION,
+        "corpus_version": corpus.version,
+        "metadata": corpus.metadata,
+        "scenarios": scenario_reports,
+        "summary": summary,
+        # Reviewer-quality gate (pass_rate, negative controls) and the
+        # disposition-calibration gate (every answer-key fixture must be
+        # classified into its declared category) are both mandatory: a
+        # misclassified calibration fixture fails CI, and so does any
+        # non-calibration run that misses its scenario.
+        "passed": bool(scored)
+        and all(item["pass_rate"] == 1.0 for item in scored)
+        and all(item["false_positive_rate"] == 0.0 for item in negative_controls)
+        and all(item["disposition_calibration_rate"] == 1.0 for item in calibration_scenarios),
+        "scenarios_evaluated": len(scenario_reports),
+        "per_scenario_summary": {str(item["scenario_number"]): item for item in scenario_reports},
+        "negative_control_summary": {
+            "scenarios": len(negative_controls),
+            "false_positive_rate": round(sum(item["false_positive_rate"] for item in negative_controls) / len(negative_controls), 4) if negative_controls else 0.0,
+        },
+    }
+
+
+def _falsification_summary(scored: list[dict[str, Any]], negative_controls: list[dict[str, Any]]) -> dict[str, Any]:
+    """#757: aggregate counterexample-falsification telemetry across scenarios.
+
+    Rates average the per-scenario falsification blocks (scenarios without a
+    falsification contract contribute nothing, never a zero).
+    `clean_control_preserved_rate` is the fraction of negative-control
+    scenarios (with runs) whose reviewer runs produced zero false
+    capability attributions — the "clean control preserved" signal. It is
+    None when the corpus declares no negative controls.
+    """
+    blocks = [item["falsification"] for item in scored if item.get("falsification")]
+    summary: dict[str, Any] = {
+        "scenarios": len(blocks),
+        "boundary_understood_rate": round(sum(block["boundary_understood_rate"] for block in blocks) / len(blocks), 4) if blocks else None,
+        "counterexample_attempted_rate": round(sum(block["counterexample_attempted_rate"] for block in blocks) / len(blocks), 4) if blocks else None,
+        "counterexample_found_rate": round(sum(block["counterexample_found_rate"] for block in blocks) / len(blocks), 4) if blocks else None,
+        "finding_correct_rate": round(sum(block["finding_correct_rate"] for block in blocks) / len(blocks), 4) if blocks else None,
+    }
+    controls_with_runs = [item for item in negative_controls if item["runs"]]
+    # Reads the per-scenario `false_positive_rate`, which for a negative
+    # control IS the reviewer-run forbidden-capability rate. Valid because
+    # validate_semantic_corpus rejects falsification_expectations on negative
+    # controls, so no other signal can enter this rate; revisit if that
+    # schema constraint is ever relaxed.
+    summary["clean_control_preserved_rate"] = (
+        round(sum(1 for item in controls_with_runs if item["false_positive_rate"] == 0.0) / len(controls_with_runs), 4)
+        if controls_with_runs
+        else None
+    )
+    return summary
+
+
+def aggregate_semantic_runs(scenario: SemanticScenario, per_run_results: list[SemanticResult]) -> dict[str, Any]:
+    # #661: calibration (answer-key) fixtures are accounted separately from
+    # actual evaluated reviewer outputs. `runs` keeps counting every evaluated
+    # run so "scenario has no runs" stays detectable, but pass_rate, evidence
+    # rates, and cost averages describe REVIEWER outputs only; the calibration
+    # fixtures carry their own recognition rate and disposition counts.
+    runs = len(per_run_results)
+    reviewer_results = [result for result in per_run_results if not result.calibration_run]
+    calibration_results = [result for result in per_run_results if result.calibration_run]
+    reviewer_runs = len(reviewer_results)
+    passes = sum(result.passed for result in reviewer_results)
+    calibration_passes = sum(1 for result in calibration_results if result.disposition_calibration_pass)
+    stage_union = sorted({stage for result in reviewer_results for stage in result.stages_hit})
+    capability_rates = {
+        capability: round(sum(capability in result.capability_hits for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+        for capability in scenario.expected_capabilities
+    }
+    anchor_rates: dict[str, float] = {}
+    for index, anchor in enumerate(scenario.expected_evidence_anchors):
+        anchor_id = anchor.get("id") or f"anchor-{index}"
+        anchor_rates[anchor_id] = round(sum(any(item["id"] == anchor_id and item["satisfied"] for item in result.anchor_results) for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    forbidden_rate = round(sum(bool(result.forbidden_violations) for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    tool_calls = round(sum(result.tool_call_count for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    duplicates = round(sum(result.duplicate_count for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    latency = round(sum(result.latency_sec for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    escalation_frequency = round(sum(result.escalated or "escalation" in result.stages_hit for result in reviewer_results) / reviewer_runs, 4) if reviewer_runs else 0.0
+    disposition_counts = {
+        disposition: sum(1 for result in reviewer_results if result.disposition == disposition)
+        for disposition in MERGE_SAFETY_DISPOSITIONS_ORDER
+    }
+    calibration_disposition_counts = {
+        disposition: sum(1 for result in calibration_results if result.disposition == disposition)
+        for disposition in MERGE_SAFETY_DISPOSITIONS_ORDER
+    }
+    # #757 falsification telemetry: rates over reviewer runs only. A scenario
+    # without a falsification contract reports None so A/B comparisons never
+    # average absent obligations in as zeros.
+    falsification: dict[str, Any] | None = None
+    if scenario.falsification_expectations:
+        if reviewer_runs:
+            falsification = {
+                "boundary_understood_rate": round(sum(result.boundary_understood is True for result in reviewer_results) / reviewer_runs, 4),
+                "counterexample_attempted_rate": round(sum(result.counterexample_attempted is True for result in reviewer_results) / reviewer_runs, 4),
+                "counterexample_found_rate": round(sum(result.counterexample_found is True for result in reviewer_results) / reviewer_runs, 4),
+                "finding_correct_rate": round(sum(result.finding_correct is True for result in reviewer_results) / reviewer_runs, 4),
+            }
+        else:
+            falsification = {
+                "boundary_understood_rate": 0.0,
+                "counterexample_attempted_rate": 0.0,
+                "counterexample_found_rate": 0.0,
+                "finding_correct_rate": 0.0,
+            }
+    return {
+        "scenario_number": scenario.number,
+        "runs": runs,
+        "reviewer_runs": reviewer_runs,
+        "calibration_runs": len(calibration_results),
+        "passes": passes,
+        "pass_rate": round(passes / reviewer_runs, 4) if reviewer_runs else 0.0,
+        "disposition_calibration_passes": calibration_passes,
+        "disposition_calibration_rate": round(calibration_passes / len(calibration_results), 4) if calibration_results else None,
+        "stages_hit": stage_union,
+        "capability_pass_rate": capability_rates,
+        "anchor_pass_rate": anchor_rates,
+        "forbidden_violation_rate": forbidden_rate,
+        "false_positive_rate": forbidden_rate if scenario.negative_control else 0.0,
+        "duplicate_rate": duplicates,
+        "average_duplicate_count": duplicates,
+        "average_tool_calls": tool_calls,
+        "average_latency_sec": latency,
+        "escalation_frequency": escalation_frequency,
+        "routes": sorted({result.route for result in reviewer_results if result.route}),
+        "modes": sorted({result.mode for result in reviewer_results if result.mode}),
+        # Dispositions of actual evaluated reviewer outputs — observed
+        # reviewer performance, never the synthetic answer-key examples.
+        "merge_safety_disposition_counts": disposition_counts,
+        # Dispositions the scorer assigned to the calibration fixtures, with
+        # how often they matched the declared answer key.
+        "merge_safety_calibration_disposition_counts": calibration_disposition_counts,
+        # #757 counterexample-driven falsification telemetry (None when the
+        # scenario declares no falsification contract).
+        "falsification": falsification,
+    }
+
+
+__all__ = [
+    "CAPABILITY_DIFF_POLARITY", "CAPABILITY_FULL_REVIEW_LOOP", "CAPABILITY_NEGATIVE_CONTROL",
+    "CAPABILITY_OUTPUT_COMPLETENESS", "CAPABILITY_RUNTIME_PROTOCOL", "CAPABILITY_SEQUENCING",
+    "CAPABILITY_STALE_REVIEW_STATE", "KNOWN_CAPABILITY_CLASSES",
+    "CAPABILITY_EXECUTION_BOUNDARY_AUTHORITY", "CAPABILITY_AMBIENT_CAPABILITY_LOSS",
+    "CAPABILITY_BACKGROUND_LIFECYCLE", "CAPABILITY_REMEDIATION_TOPOLOGY",
+    "CAPABILITY_UNDECLARED_CAPABILITY_DEPENDENCY",
+    "CAPABILITY_CANONICAL_ARTIFACT", "CAPABILITY_PRECHECK_CREDENTIAL",
+    "CAPABILITY_BROKEN_ARROW", "CAPABILITY_CORPUS_EVIDENCE", "CAPABILITY_TRUNCATION_COUNTEREXAMPLE",
+    "CAPABILITY_REQUIRED_CHECK_GROUNDING", "CAPABILITY_SANITIZER_MARKER_MISATTRIBUTION",
+    "DISPOSITION_CORRECT", "DISPOSITION_INVALID_REMEDIATION", "DISPOSITION_NOT_FOUND",
+    "DISPOSITION_SPECULATIVE_FALSE_POSITIVE", "DISPOSITION_SUPPRESSED_PRE_EXISTING",
+    "MERGE_SAFETY_DISPOSITIONS", "MERGE_SAFETY_DISPOSITIONS_ORDER",
+    "_falsification_summary",
+    "RECOGNISED_DIFF_POLARITIES", "RECOGNISED_MODES", "RECOGNISED_ROUTES", "RECOGNISED_SIGNAL_STAGES", "RECOGNISED_STAGES", "SEMANTIC_CORPUS_VERSION",
+    "SEMANTIC_EVAL_VERSION", "SIGNAL_KIND_FINDING", "SIGNAL_KIND_MENTION", "SIGNAL_KIND_TOOL",
+     "ReviewSignal", "SemanticCorpus", "SemanticCorpusError", "SemanticResult", "SemanticScenario",
+     "_collect_signals_from_run", "aggregate_semantic_runs", "classify_signal", "evaluate_semantic_capability",
+       "evaluate_semantic_corpus", "validate_semantic_corpus", "validate_semantic_fixture_integrity",
+
+
+
+]

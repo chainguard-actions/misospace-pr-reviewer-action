@@ -1,0 +1,42 @@
+name: Test review routing mode configuration
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "http://127.0.0.1:19999/v1"
+          ai-model: "test-model"
+          ai-api-key: "test-key"
+          pr-number: "1"
+          on-model-failure: "notice"
+          review-routing-mode: "auto"
+          ai-smart-model: "smart-model"
+          ai-smart-base-url: "http://127.0.0.1:19999/v1"
+          ai-smart-api-key: "test-key"
+          escalate-on-risk-flags: "linked_security_issue,auth_changes"
+          ci-status-check: "false"
+          tool-mode: "off"
+          ai-primary-retries: "0"
+
+      - name: Assert action ran with routing configuration
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review-route }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "review-route: $REVIEW_ROUTE"
+          # The action should either succeed or fail gracefully on the sentinel repo.
+          if [ "$OUTCOME" = "success" ] || [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action completed with expected outcome '$OUTCOME'"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

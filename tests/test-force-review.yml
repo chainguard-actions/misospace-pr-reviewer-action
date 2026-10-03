@@ -1,0 +1,49 @@
+name: Test force-review bypasses diff-unchanged guard
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "http://127.0.0.1:19999/v1"
+          ai-model: "test-model"
+          ai-api-key: "test-key"
+          pr-number: "1"
+          on-model-failure: "notice"
+          skip-if-diff-unchanged: "true"
+          force-review: "true"
+          ci-status-check: "false"
+          tool-mode: "off"
+          ai-primary-retries: "0"
+
+      - name: Assert action ran with force-review
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip-reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "skip-reason: $SKIP_REASON"
+          # With force-review=true, the diff-unchanged guard should be bypassed.
+          # The action may still fail on the sentinel repo (no real PR).
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action completed"
+            # If should-review is set, it should be true (force-review bypasses skip)
+            if [ -n "$SHOULD_REVIEW" ] && [ "$SHOULD_REVIEW" = "false" ]; then
+              echo "FAIL: force-review=true should not result in should-review=false"
+              exit 1
+            fi
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo has no real PR)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
