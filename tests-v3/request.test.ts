@@ -1,0 +1,156 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { buildModelRequest, OPENAI_VERDICT_JSON_SCHEMA } from "../src/model/request.js";
+import type { ModelRequestConfig } from "../src/model/types.js";
+
+// Frozen copy of the v2 `rf_json` bash literal (scripts/model_call.sh's
+// json_schema arm) as of the #706 wave-0 re-point. The shell file is deleted
+// in teardown wave 1; this snapshot keeps the byte-for-byte pin without
+// reading v2 at test time.
+const V2_RF_JSON_SCHEMA_LITERAL =
+  '{"type":"json_schema","json_schema":{"name":"pr_review","strict":true,"schema":{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"review_markdown":{"type":"string"},"smart_review_requested":{"type":"boolean"},"smart_review_reason":{"type":["string","null"]},"findings":{"type":["array","null"],"items":{"type":"object","properties":{"severity":{"type":"string","enum":["blocker","major","minor","info"]},"category":{"type":["string","null"]},"file":{"type":["string","null"]},"line":{"type":["integer","null"]},"message":{"type":"string"},"preliminary_finding":{"type":["integer","null"]}},"required":["severity","category","file","line","message","preliminary_finding"],"additionalProperties":false}},"requirement_coverage":{"type":["array","null"],"items":{"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"type":"string","enum":["satisfied","violated","unknown"]},"evidence":{"type":["array","null"],"items":{"type":"object","properties":{"kind":{"type":"string","enum":["file","test","tool","ci","diff"]},"ref":{"type":["string","null"]},"detail":{"type":["string","null"]}},"required":["kind","ref","detail"],"additionalProperties":false}}},"required":["requirement_id","status","evidence"],"additionalProperties":false}},"required_check_dispositions":{"type":["array","null"],"items":{"type":"object","properties":{"check":{"type":"string"},"status":{"type":"string","enum":["satisfied","not_applicable","unresolved"]},"rationale":{"type":["string","null"]}},"required":["check","status","rationale"],"additionalProperties":false}}},"required":["verdict","review_markdown","smart_review_requested","smart_review_reason","findings","requirement_coverage","required_check_dispositions"],"additionalProperties":false}}}';
+
+function config(overrides: Partial<ModelRequestConfig> = {}): ModelRequestConfig {
+  return {
+    apiFormat: "openai",
+    model: "test-model",
+    system: "SYSTEM",
+    user: "USER",
+    corpus: "CORPUS",
+    stream: false,
+    shape: "default",
+    maxTokens: 8192,
+    temperature: 0.1,
+    responseFormat: "off",
+    tokensParam: "max_tokens",
+    ...overrides,
+  };
+}
+
+test("openai default request shape", () => {
+  const payload = buildModelRequest(config());
+  assert.equal(payload.endpointPath, "/chat/completions");
+  assert.deepEqual(payload.body, {
+    model: "test-model",
+    stream: false,
+    messages: [
+      { role: "system", content: "SYSTEM" },
+      { role: "user", content: "USER\n\nCORPUS" },
+    ],
+    max_tokens: 8192,
+    temperature: 0.1,
+  });
+});
+
+test("openai trailing_task shape puts the corpus first", () => {
+  const payload = buildModelRequest(config({ shape: "trailing_task" }));
+  const messages = payload.body as unknown as { messages: { content: string }[] };
+  assert.equal(messages.messages[1]!.content, "CORPUS\n\nUSER");
+});
+
+test("empty temperature omits the field; set temperature is sent", () => {
+  const omitted = buildModelRequest(config({ temperature: "" }));
+  assert.equal("temperature" in (omitted.body as object), false);
+  const explicit = buildModelRequest(config({ temperature: 0 }));
+  assert.equal((explicit.body as unknown as { temperature: number }).temperature, 0);
+});
+
+test("max_completion_tokens replaces max_tokens wholesale", () => {
+  const payload = buildModelRequest(config({ tokensParam: "max_completion_tokens" }));
+  const body = payload.body as unknown as Record<string, unknown>;
+  assert.equal(body.max_completion_tokens, 8192);
+  assert.equal("max_tokens" in body, false);
+});
+
+test("response_format modes", () => {
+  assert.equal("response_format" in (buildModelRequest(config()).body as object), false);
+  assert.deepEqual(
+    (buildModelRequest(config({ responseFormat: "json_object" })).body as { response_format: unknown }).response_format,
+    { type: "json_object" },
+  );
+  const schemaPayload = buildModelRequest(config({ responseFormat: "json_schema" }));
+  assert.deepEqual(
+    (schemaPayload.body as { response_format: unknown }).response_format,
+    OPENAI_VERDICT_JSON_SCHEMA,
+  );
+});
+
+test("stream_options only attaches while streaming", () => {
+  assert.equal("stream_options" in (buildModelRequest(config({ stream: false })).body as object), false);
+  assert.deepEqual(
+    (buildModelRequest(config({ stream: true })).body as { stream_options: unknown }).stream_options,
+    { include_usage: true },
+  );
+});
+
+test("anthropic request shape: max_tokens always, no response_format, no token-param switching", () => {
+  const payload = buildModelRequest(config({
+    apiFormat: "anthropic",
+    tokensParam: "max_completion_tokens",
+    responseFormat: "json_schema",
+    stream: true,
+  }));
+  assert.equal(payload.endpointPath, "/messages");
+  assert.deepEqual(payload.body, {
+    model: "test-model",
+    max_tokens: 8192,
+    stream: true,
+    system: "SYSTEM",
+    messages: [{ role: "user", content: "USER\n\nCORPUS" }],
+    temperature: 0.1,
+  });
+  const body = payload.body as unknown as Record<string, unknown>;
+  assert.equal("response_format" in body, false);
+  assert.equal("stream_options" in body, false);
+});
+
+test("anthropic omits temperature when empty and supports trailing_task", () => {
+  const payload = buildModelRequest(config({
+    apiFormat: "anthropic",
+    temperature: "",
+    shape: "trailing_task",
+  }));
+  const body = payload.body as unknown as Record<string, unknown>;
+  assert.equal("temperature" in body, false);
+  assert.equal((body.messages as { content: string }[])[0]!.content, "CORPUS\n\nUSER");
+});
+
+test("request construction is provider-neutral: no branching on model names", () => {
+  // The same config with different model names produces identical structure.
+  const a = buildModelRequest(config({ model: "gpt-9-mini" }));
+  const b = buildModelRequest(config({ model: "qwen3-local@proxy" }));
+  assert.deepEqual(
+    { ...(a.body as object), model: undefined },
+    { ...(b.body as object), model: undefined },
+  );
+});
+
+test("the strict verdict schema matches the frozen v2 bash literal byte for byte", () => {
+  assert.deepEqual(OPENAI_VERDICT_JSON_SCHEMA, JSON.parse(V2_RF_JSON_SCHEMA_LITERAL));
+});
+
+test("the strict verdict schema requires every property (OpenAI strict mode)", () => {
+  const schema = (OPENAI_VERDICT_JSON_SCHEMA.json_schema as unknown as Record<string, unknown>).schema as unknown as Record<string, unknown>;
+  assert.deepEqual(
+    schema.required,
+    ["verdict", "review_markdown", "smart_review_requested", "smart_review_reason", "findings", "requirement_coverage", "required_check_dispositions"],
+  );
+  const properties = schema.properties as unknown as Record<string, { type: unknown }>;
+  assert.deepEqual(properties.smart_review_requested!.type, "boolean");
+  assert.deepEqual(properties.smart_review_reason!.type, ["string", "null"]);
+  const findings = properties.findings! as unknown as { type: string[] };
+  assert.deepEqual(findings.type, ["array", "null"]);
+  // #750: one disposition per deterministic must_check item; identity is
+  // the echoed check text; not_applicable carries a grounded rationale.
+  const dispositions = properties.required_check_dispositions! as unknown as {
+    type: string[];
+    items: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+  };
+  assert.deepEqual(dispositions.type, ["array", "null"]);
+  assert.deepEqual(dispositions.items.required, ["check", "status", "rationale"]);
+  assert.equal(dispositions.items.additionalProperties, false);
+  assert.deepEqual(
+    (dispositions.items.properties.status as { enum: string[] }).enum,
+    ["satisfied", "not_applicable", "unresolved"],
+  );
+});

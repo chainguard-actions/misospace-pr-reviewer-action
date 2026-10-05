@@ -1,0 +1,570 @@
+# Generated from contracts/action-v3.yml by scripts/generate-action-yml.mjs.
+# Edit the contract, then regenerate.
+name: Miso PR Review
+description: AI pull request reviews with any OpenAI- or Anthropic-compatible model, cloud or self-hosted, grounded in the code.
+author: misospace
+branding:
+  icon: git-pull-request
+  color: orange
+inputs:
+  github-token:
+    description: GitHub token for PR and API access. Defaults to the workflow's own token.
+    required: false
+    default: "${{ github.token }}"
+  repo:
+    description: Repository in owner/name format. Defaults to the current workflow repository.
+    required: false
+    default: ""
+  pr-number:
+    description: Pull request number. Defaults to the current pull_request event number.
+    required: false
+    default: ""
+  ai-base-url:
+    description: Base URL of the primary AI API
+    required: true
+  ai-api-format:
+    description: API request/response format for the primary AI endpoint (openai or anthropic)
+    required: false
+    default: "openai"
+  ai-model:
+    description: Model name for the primary analysis pass
+    required: true
+  ai-api-key:
+    description: Optional API key for the primary AI endpoint
+    required: false
+    default: ""
+  ai-max-tokens:
+    description: Maximum completion tokens for the primary and fallback final review calls. Default 16384. Reasoning models that emit a thinking channel need this headroom — too low a cap is consumed by reasoning, leaving empty content with finish_reason=length, so the verdict JSON fails to parse and the review needlessly escalates or fails.
+    required: false
+    default: "16384"
+  ai-temperature:
+    description: Sampling temperature for the review model. Default "0.1". Set to an empty string to omit the field entirely (some newer cloud models reject any non-default temperature).
+    required: false
+    default: "0.1"
+  ai-response-format:
+    description: "Structured-output mode for OpenAI-compatible endpoints (including LiteLLM): off (default), json_object, or json_schema (enforces a verdict/review_markdown schema). Ignored for the anthropic format. Improves output reliability with smaller local models. Applies to both the primary and fallback review calls."
+    required: false
+    default: "off"
+  ai-tokens-param:
+    description: "Token-limit field name for OpenAI-compatible requests: max_tokens (default) or max_completion_tokens (required by newer OpenAI reasoning models). Ignored for anthropic."
+    required: false
+    default: "max_tokens"
+  anthropic-version:
+    description: Anthropic API version header used when ai_api_format or ai_fallback_api_format is anthropic
+    required: false
+    default: "2023-06-01"
+  ai-fallback-base-url:
+    description: Optional base URL of a fallback AI API; defaults to ai_base_url when blank
+    required: false
+    default: ""
+  ai-fallback-api-format:
+    description: Fallback API request/response format; defaults to ai_api_format when blank
+    required: false
+    default: ""
+  ai-fallback-model:
+    description: Optional model name for the fallback analysis pass
+    required: false
+    default: ""
+  ai-fallback-api-key:
+    description: Optional API key for the fallback endpoint; defaults to ai_api_key when blank
+    required: false
+    default: ""
+  ai-primary-retries:
+    description: Number of retries for the primary model
+    required: false
+    default: "8"
+  ai-primary-retry-delay-sec:
+    description: Delay between primary retries in seconds
+    required: false
+    default: "15"
+  on-model-failure:
+    description: Behavior when both primary and fallback models fail to return a usable review. 'notice' (default) posts a visible request_changes notice explaining the review could not run (never auto-approves), so a provider outage does not fail the check. 'fail' fails the action step instead.
+    required: false
+    default: "notice"
+  fail-on-request-changes:
+    description: "If true, fail the action step when the final verdict is request_changes, so the review can act as a CI merge gate without a GitHub App. The gate runs after publishing, so the review comment and inline findings still land on the PR. It reads the same final verdict the `verdict` output reports (post-verdict_policy, post-evidence-blocker and tool-failure enforcement), not the raw model verdict. on_model_failure=notice still passes: a model outage produces no verdict and must not wedge merges. Default false — existing consumers see no behaviour change."
+    required: false
+    default: "false"
+  verdict-policy:
+    description: "How the final verdict is decided. 'strict' (the v3 default, #811) derives the published verdict deterministically from the normalized still-open findings and required-check coverage: request_changes only when at least one still-open finding is blocker or major; otherwise approve. The metadata marker's review_result distinguishes clean (no open findings, coverage complete), findings (minor/info-only findings) and partial (coverage gap), and the findings plus the coverage gap render at the top of the published review. The model's verdict is an input, not the final answer: when the policy overrides it, the review says so in one line. 'model' keeps the v2 passthrough for consumers that gate merges on the model's own verdict — set it to opt out of the strict mapping. 'findings_severity_gated' keeps its v2 behavior: request_changes from the model is preserved and approve escalates to request_changes when any blocker-severity finding exists, with the opt-in non-blocking category capping. Enforcement settings (evidence blockers, tool failure) still apply afterwards and can force request_changes under every policy."
+    required: false
+    default: "strict"
+  non-blocking-finding-categories:
+    description: Comma-separated finding categories (from tests, docs, style, question, performance, bug, other; security is never allowed) that cannot request changes on their own under verdict_policy=findings_severity_gated. Their blocker/major findings are capped at minor, and a model request_changes backed only by them is relaxed to approve. Ignored on PRs with a security risk flag and under verdict_policy=model. Empty (the default) disables it.
+    required: false
+    default: ""
+  inline-findings:
+    description: If true (default), structured findings that anchor to a line in the PR diff are attached as native line-anchored review comments when publishing with publish-mode=review_comment or review_verdict. Findings that cannot be anchored stay in the review body only. Ignored for publish-mode=comment.
+    required: false
+    default: "true"
+  inline-findings-max:
+    description: Maximum inline review comments attached per review when inline_findings=true.
+    required: false
+    default: "20"
+  validate-required-checks:
+    description: "Whether to validate the final review against the classifier's must_check items. 'auto' (default) validates whenever must_check is non-empty; 'true' and 'false' force it on or off. Since #750, validation is structured-first: when the verdict carries required_check_dispositions, each deterministic check must be dispositioned satisfied, grounded not_applicable, or unresolved; the legacy keyword match applies only when the model emitted no structured dispositions at all."
+    required: false
+    default: "auto"
+  required-check-validation-mode:
+    description: What to do when required checks are unresolved or undispositioned. 'warn' (default) appends an 'Unaddressed required checks' section to the published review. 'fail' also forces a request_changes verdict. 'metadata_only' records the result (required_checks output and metadata marker) without changing the published review. Incompleteness never triggers smart escalation by itself (#721).
+    required: false
+    default: "warn"
+  review-routing-mode:
+    description: Route PR reviews between the primary and smart models based on the deterministic classification. 'off' (default) preserves existing primary/fallback behavior. 'auto' sends PRs whose pr_kind or risk_flags match escalate_on_risk_flags to the smart model (when one is configured) and keeps everything else on the primary model.
+    required: false
+    default: "off"
+  ai-primary-model:
+    description: Model for the primary review route when review_routing_mode=auto. Defaults to ai_model.
+    required: false
+    default: ""
+  ai-primary-base-url:
+    description: Base URL for the primary route model. Defaults to ai_base_url.
+    required: false
+    default: ""
+  ai-primary-api-format:
+    description: API format for the primary route model (openai or anthropic). Defaults to ai_api_format.
+    required: false
+    default: ""
+  ai-primary-api-key:
+    description: API key for the primary route model. Defaults to ai_api_key.
+    required: false
+    default: ""
+  ai-smart-model:
+    description: Opt-in smarter model for high-risk reviews (review_routing_mode=auto). With no smart model set, auto-routing stays on the primary model and never escalates. After a successful primary review, a smart re-review runs only when the primary reviewer explicitly requests it via the structured smart_review_requested verdict field (#721); heuristic signals (request_changes, low confidence, blockers, incomplete coverage) are telemetry only. The fallback model is NEVER an escalation target — it only catches an availability failure of the first-pass model (primary, or smart on a direct smart route).
+    required: false
+    default: ""
+  ai-smart-base-url:
+    description: Base URL for the smart model. Defaults to ai_base_url.
+    required: false
+    default: ""
+  ai-smart-api-format:
+    description: API format for the smart model (openai or anthropic). Defaults to ai_api_format.
+    required: false
+    default: ""
+  ai-smart-api-key:
+    description: API key for the smart model. Defaults to ai_api_key.
+    required: false
+    default: ""
+  escalate-on-risk-flags:
+    description: Comma-separated pr_kind / risk_flag names that route directly to the smart model when review_routing_mode=auto. Matched against route_signals — linked-issue flags and file-based signals backed by an actual changed filename — so a benign PR whose diff merely mentions a pattern (e.g. os.path) does not route.
+    required: false
+    default: "linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes"
+  ai-stream:
+    description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
+    required: false
+    default: "true"
+  ai-fallback-stream:
+    description: If set, overrides ai_stream for the fallback model; defaults to ai_stream value when blank
+    required: false
+    default: ""
+  allowed-source-hosts:
+    description: Comma-separated list of hosts allowed for linked source fetching
+    required: false
+    default: "github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io"
+  related-code-context:
+    description: Include deterministic related-code context discovered from changed-file anchors
+    required: false
+    default: "true"
+  related-code-max-bytes:
+    description: Maximum bytes of related-code context included in the review corpus (values below 64 are clamped to 64)
+    required: false
+    default: "16000"
+  harness-obligations:
+    description: "Add harness-authored verification obligations (derived from related-code context) to the requirement ledger. Off by default: measured with no recall gain."
+    required: false
+    default: "false"
+  equivalent-paths:
+    description: Detect bounded groups of changed functions/methods that are alternate implementations of the same result (dispatcher branches, adapter siblings, or same-privileged-operation call sites) and give the correctness specialist a compact 'Equivalent Paths to Compare' hint listing each member's file:line, so it checks sibling paths for the same invariants the others enforce. Off by default until measured.
+    required: false
+    default: "false"
+  equivalent-paths-max-bytes:
+    description: Maximum bytes of the equivalent-paths section included in context
+    required: false
+    default: "6000"
+  requirement-trace:
+    description: "Require a per-requirement trace (production enforcement + regression test locations, deterministically verified against the checkout) for every acceptance/normative requirement in the ledger before crediting it; an unverifiable or missing trace marks review coverage incomplete, and an unmet requirement without a finding gets a deterministic one. Off by default: not yet measured on the real-PR corpus."
+    required: false
+    default: "false"
+  linear-api-key:
+    description: Optional Linear personal API key used to fetch issue/spec context from PR-title identifiers
+    required: false
+    default: ""
+  linear-issue-prefixes:
+    description: Comma-separated Linear team keys recognized in PR titles (for example DST,LAB); empty disables the Linear adapter
+    required: false
+    default: ""
+  linear-issue-timeout-sec:
+    description: Timeout in seconds for each Linear GraphQL issue lookup
+    required: false
+    default: "20"
+  linear-enable-for-forks:
+    description: If true, allow private Linear issue context to be fetched and included for cross-repository PRs
+    required: false
+    default: "false"
+  system-prompt:
+    description: Optional system prompt override. When both this and system_prompt_file are set, the file content is read first and the inline value is appended (separated by two newlines), combining static repo conventions with per-PR steering.
+    required: false
+    default: ""
+  system-prompt-file:
+    description: Optional file path in the reviewed repository to use as the system prompt, read from the PR's base ref (like the standards file) so a PR cannot rewrite the prompt that reviews it. When both this and system_prompt are set, the file content is read first and the inline system_prompt is appended (separated by two newlines).
+    required: false
+    default: ""
+  system-prompt-mode:
+    description: How a supplied system_prompt / system_prompt_file combines with the bundled default. 'replace' (default) uses the supplied prompt verbatim. 'append' keeps the conditionally-assembled bundled default and appends the supplied prompt as a repo-specific addendum — so consumers add conventions without copying (and re-syncing) the whole default.
+    required: false
+    default: "replace"
+  review-verbosity:
+    description: "Output-length dial for the bundled default prompt. 'normal' (default) leaves the prompt unchanged. 'concise' adds a brevity fragment: a ~300-word target, prose limited to blocker/major issues with minor/info left to the findings array, no diff restatement, and Standards Compliance omitted unless a convention is violated. must_check coverage and the Unknowns section are explicitly exempt, so brevity cannot hide a gap. Applies only to the bundled default — a replace-mode system_prompt override is used verbatim."
+    required: false
+    default: "normal"
+  standards-file:
+    description: Repository standards file path for conventions and policy context
+    required: false
+    default: ""
+  standards-file-candidates:
+    description: Candidate files to auto-discover when standards_file is not set. First found is used.
+    required: false
+    default: "AGENTS.md,agents.md,CLAUDE.md,claude.md,.github/ai-review-rules.md,.github/ai-review-rules.txt"
+  publish-review-comment:
+    description: If true, publish or update a PR comment with the generated review
+    required: false
+    default: "false"
+  publish-mode:
+    description: "Publish mode for the review. 'review_comment' (default) submits a non-blocking native PR review, so findings can anchor to diff lines. 'comment' publishes a sticky PR comment instead. 'review_verdict' submits approve/request_changes. review_comment and review_verdict need permissions: pull-requests: write."
+    required: false
+    default: "review_comment"
+  allow-approve:
+    description: "If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a native approval. Defaults to false — approval is blocked unless explicitly enabled. WARNING: native approvals can affect branch protection rules and automerge pipelines."
+    required: false
+    default: "false"
+  allow-repo-policy-overrides:
+    description: "If true, a repository config file may set policy inputs (marked repo-policy in the v3 contract: verdict policy, blocking categories, required-check and evidence enforcement, fail-on-request-changes, system prompt mode) that the workflow left unset. Defaults to false, so a repository cannot loosen a gate its operator enforces. v3 only."
+    required: false
+    default: "false"
+  approve-forks:
+    description: If true and publish_mode=review_verdict with allow_approve=true, native approvals are also allowed for cross-repository (fork) PRs. Defaults to false — fork PRs are blocked from approval even when allow_approve is set.
+    required: false
+    default: "false"
+  cleanup-previous-native-reviews:
+    description: "Mark previous managed native PR reviews as outdated/superseded before publishing a new native review. Accepted values: `auto` (default, enables cleanup for review_comment and review_verdict modes), `true`, or `false`. Cleanup only targets reviews created by this action and carrying the managed marker. Dismissal of old approval/request-changes reviews is attempted when permissions allow but is secondary to visual cleanup."
+    required: false
+    default: "auto"
+  upstream-link-mode:
+    description: "How upstream GitHub PR/issue/commit/compare URLs in the published review are handled. `inert` (default) rewrites them to plain text so GitHub never auto-links them. `togithub` rewrites them to https://togithub.com/... so they stay clickable without triggering notifications or cross-repository auto-linking. Shorthand references (owner/repo#123, bare #123) are inert in both modes."
+    required: false
+    default: "inert"
+  context-limit-mode:
+    description: Context budget mode - normal (140k/70k/220k), low (80k/40k/120k), minimal (40k/20k/60k)
+    required: false
+    default: "normal"
+  model-context-tokens:
+    description: The model's real context window in tokens (e.g. 8192, 32768). When set, corpus/diff/file byte budgets are derived from it (reserving ai_max_tokens for output) instead of context_limit_mode — recommended for local models whose windows are smaller than the named modes assume. Empty uses context_limit_mode.
+    required: false
+    default: ""
+  primary-model-context-tokens:
+    description: Primary tier context window in tokens; empty inherits model_context_tokens/context_limit_mode
+    required: false
+    default: ""
+  smart-model-context-tokens:
+    description: Smart tier context window in tokens; empty inherits model_context_tokens/context_limit_mode
+    required: false
+    default: ""
+  fallback-model-context-tokens:
+    description: Fallback model context window in tokens; empty inherits model_context_tokens. The fallback reuses the primary review corpus, so when this is set the shared corpus is sized to the smaller of the primary and fallback windows (#922).
+    required: false
+    default: ""
+  primary-request-shape:
+    description: Primary request layout (default or trailing_task)
+    required: false
+    default: "default"
+  smart-request-shape:
+    description: Smart request layout (default or trailing_task)
+    required: false
+    default: "default"
+  repo-map-context:
+    description: Include a bounded deterministic map of Git-tracked repository structure in the review corpus and native-loop planning context
+    required: false
+    default: "true"
+  repo-map-max-bytes:
+    description: Maximum UTF-8 bytes for the repository-map Markdown artifact and planning slot
+    required: false
+    default: "12000"
+  pr-thread-context:
+    description: Include bounded recent PR conversation comments (thread context) in the review corpus, with the action's own managed comments filtered out
+    required: false
+    default: "true"
+  pr-thread-max-bytes:
+    description: Maximum UTF-8 bytes of PR-thread context in the review corpus (whole comments are dropped to fit; values above 200000 are rejected)
+    required: false
+    default: "8000"
+  review-threads-context:
+    description: Include unresolved inline review threads (the action's earlier findings and the replies to them) in the review corpus; the reviewer must disposition each listed thread
+    required: false
+    default: "true"
+  review-threads-max-bytes:
+    description: Maximum UTF-8 bytes of review-thread context in the review corpus (whole threads are dropped to fit; values above 200000 are rejected)
+    required: false
+    default: "8000"
+  deep-review:
+    description: "Specialist leads (correctness/security/tests) over the review corpus: auto (default) = deterministic classifier-driven selection, possibly zero; true = all three roles; false = off. Advisory only."
+    required: false
+    default: "auto"
+  deep-review-timeout-sec:
+    description: Maximum wall-clock seconds for the whole deep-review specialist phase; stragglers past the deadline are recorded as role errors (advisory only). Default 600.
+    required: false
+    default: "600"
+  deep-review-max-tokens:
+    description: Maximum completion tokens for each deep-review specialist role; independent of ai_max_tokens. Default 4096.
+    required: false
+    default: "4096"
+  deep-review-corpus-max-bytes:
+    description: Hard UTF-8 byte cap on the compact deep-review specialist corpus; independent of the final review corpus. Default 48000.
+    required: false
+    default: "48000"
+  claim-falsification:
+    description: "Opt-in claim falsification pre-pass (#785): a deterministic scan of the PR body and its diff's added comments/docstrings for the PR's own quantified claims and invariants (every/only/never/identical/parity, authority boundaries, compatibility promises), each anchored to the concrete code it describes; falls back to one bounded model call on the primary route only when that scan finds nothing. The review corpus gets a Claims to Falsify section asking the reviewer to check every listed item and report counterexamples as findings. Fail-soft; never changes the verdict policy."
+    required: false
+    default: "false"
+  enrichment-budget-sec:
+    description: Maximum seconds to spend on enrichment (linked source fetching, release metadata, ghcr.io lookups). Exceeding the budget stops further enrichment. Default 60.
+    required: false
+    default: "60"
+  image-digest-budget-sec:
+    description: Maximum seconds to spend on image digest provenance lookups (registry tokens, manifests, revision compares). 0 disables the budget. Default 60.
+    required: false
+    default: "60"
+  evidence-providers-file:
+    description: Optional JSON file in the reviewed repository that defines evidence providers to run before review
+    required: false
+    default: ""
+  sarif-files:
+    description: Comma- or newline-delimited workspace-relative SARIF 2.1.0 files to include as evidence
+    required: false
+    default: ""
+  sarif-max-findings:
+    description: Global maximum number of findings combined across all supplied SARIF files
+    required: false
+    default: "200"
+  evidence-provider-timeout-sec:
+    description: Default timeout in seconds for each evidence provider command
+    required: false
+    default: "30"
+  evidence-provider-max-output-bytes:
+    description: Maximum stdout or stderr bytes captured per evidence provider command
+    required: false
+    default: "20000"
+  evidence-provider-parallelism:
+    description: Maximum evidence provider commands run concurrently. Set 1 to force serial execution when providers contend on shared files. Default 4.
+    required: false
+    default: "4"
+  evidence-blocker-enforcement:
+    description: If true, force request_changes when any evidence provider reports blocker severity
+    required: false
+    default: "false"
+  evidence-enable-for-forks:
+    description: If true, allow evidence providers to run on cross-repository pull requests
+    required: false
+    default: "false"
+  tool-mode:
+    description: "Optional tool harness mode: \"off\" (no evidence tools) or \"native_loop\". With native_loop the model uses its native tool-calling API — it holds the tool schemas and decides each next read-only call from the previous result, enabling multi-hop evidence chains. A model that never emits a tool call degrades to a corpus-only review (the verdict is still produced). Loop turns stream by default (controlled by ai_stream) so long turns don't time out behind a short-idle proxy; a stream that can't be reassembled is retried non-streamed for that turn. Budgets: tool_max_requests, tool_max_rounds, and tool_loop_wall_clock_sec. (The legacy plan_execute_once / plan_execute_loop planner modes were removed in 2.0; a stale value is treated as \"off\".)"
+    required: false
+    default: "native_loop"
+  tool-loop-wall-clock-sec:
+    description: Wall-clock ceiling in seconds for the whole tool_mode=native_loop exchange (all model round-trips plus tool execution). Ignored for other modes.
+    required: false
+    default: "600"
+  tool-loop-summarize:
+    description: When "true", tool_mode=native_loop folds the oldest tool results into a model-generated evidence digest once the conversation outgrows its context budget, instead of blunt-truncating them — preserving salient facts (versions, paths, URLs, findings) in fewer tokens at the cost of one extra model call per compaction. Off by default (truncation). Ignored for other modes.
+    required: false
+    default: "false"
+  tool-loop-summarize-max-tokens:
+    description: Maximum completion tokens for each result-summarization call when tool_loop_summarize is enabled. Keep it small — the digest should be terse.
+    required: false
+    default: "512"
+  tool-max-requests:
+    description: Maximum number of tool requests the harness executes when tool_mode is enabled. Empty (the default) resolves a tier-aware budget from the review route (#701) — ~24 for the primary route, ~32 for the smart route, up to 40 for the escalated (deep) path — scaled for the PR size (#810) from changed files, changed lines and specialist leads, floored at the tier default (small PRs keep the tier budget) and capped at the hard ceiling of 50; wall-clock and round budgets still bind. An explicit value overrides every tier and the scaling and is bounded to 1..50.
+    required: false
+    default: ""
+  primary-tool-max-requests:
+    description: Request budget for the primary route only, bounded to 1..50. Outranks tool_max_requests on that route and leaves the smart/escalated tiers untouched. Empty (the default) keeps the tier default.
+    required: false
+    default: ""
+  smart-tool-max-requests:
+    description: Request budget for the smart and escalated routes only, bounded to 1..50. Outranks tool_max_requests on those routes and leaves the primary tier untouched. Empty (the default) keeps the tier defaults.
+    required: false
+    default: ""
+  tool-max-rounds:
+    description: "Round budget for tool_mode=native_loop, where a round is a single model turn. Empty (the default) resolves to 4, and the effective round cap also scales with the resolved tool-max-requests budget (#895) — one round per tool call, so a model that reads one file per turn can spend the whole size-scaled or tiered call budget; it is bounded at 32 rounds, and the wall clock is the real bound. Set this explicitly to opt back out of that scaling: the loop then allows up to twice the configured value (capped at 12), exactly as before #895, to leave room for one-call-per-turn chains and repair turns. Ignored when tool_mode=off."
+    required: false
+    default: ""
+  tool-turn-timeout-sec:
+    description: "Timeout in seconds for each model turn of the tool-mode=native_loop exchange. Default 180: a ceiling, not a cost — fast endpoints finish well within it, while local models with slow prompt eval need the headroom. native_loop streams turns by default (ai-stream) to avoid short-idle-proxy timeouts."
+    required: false
+    default: "180"
+  tool-corpus-max-bytes:
+    description: "Maximum corpus bytes passed into the native_loop conversation's first turn. Empty (the default) resolves to 50000. When primary-model-context-tokens / smart-model-context-tokens / model-context-tokens declares a window, it derives from it instead: normally about 15% of the window (up to 600000 bytes), and lower for small windows, since it never exceeds ~60% of the loop's conversation budget after the per-turn completion is reserved (#922). An explicit value is an operator override and is used as-is, even beyond that envelope; the operator is then responsible for fitting the model's window."
+    required: false
+    default: ""
+  tool-max-tokens-per-turn:
+    description: Maximum completion tokens for each model turn of the tool-mode=native_loop exchange. Default 16384, so reasoning models are not cut off before they emit the tool call.
+    required: false
+    default: "16384"
+  tool-max-response-bytes:
+    description: "Maximum bytes captured from each tool execution result. Empty (the default) resolves to 12000. With a declared context window it derives from it instead: normally about 2% of the window (up to 64000 bytes), and lower for small windows, since it never exceeds ~8% of the loop's conversation budget (#922). An explicit value is an operator override and is used as-is, even beyond that envelope; the operator is then responsible for fitting the model's window."
+    required: false
+    default: ""
+  tool-allowed-gh-api-repos:
+    description: Comma-separated owner/repo list allowed for gh_api tool requests; use * to allow any repo still permitted by the path allowlist (empty means current repo only)
+    required: false
+    default: ""
+  tool-request-timeout-sec:
+    description: Timeout in seconds for each tool request execution
+    required: false
+    default: "20"
+  search-url:
+    description: Search-engine endpoint (e.g. a SearXNG instance's /search URL) that enables the read-only web_search tool in the native tool loop. When set, the model can search for a page (release notes, a support/compatibility matrix) and then web_fetch the best result — useful when it doesn't know the exact URL. Empty (default) leaves web_search un-advertised. The model supplies only the query; the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness.
+    required: false
+    default: ""
+  tool-max-search-results:
+    description: Maximum results returned per web_search call
+    required: false
+    default: "5"
+  tool-failure-enforcement:
+    description: If true, force request_changes when tool harness planning fails
+    required: false
+    default: "false"
+  tool-min-successful-requests:
+    description: Minimum number of successful tool requests required when tool failure enforcement is enabled
+    required: false
+    default: "0"
+  tool-enable-for-forks:
+    description: If true, allow the tool harness to run on cross-repository pull requests
+    required: false
+    default: "false"
+  tool-mcp-servers:
+    description: Optional allowlist of read-only MCP servers for tool_mode=native_loop, as a newline/comma list of name=url (e.g. konflate=https://konflate.example/mcp). Their read-verb tools (list/get/read/…) are advertised as mcp__<name>__<tool> (double underscores); write-verb tools are refused. Empty = off (default). Fork-gated like the rest of the harness (tool_enable_for_forks). Only host-bearing http(s) URLs are accepted (HTTPS recommended); other schemes are dropped.
+    required: false
+    default: ""
+  tool-mcp-token:
+    description: Optional bearer token sent to every configured MCP server (tool_mcp_servers)
+    required: false
+    default: ""
+  tool-mcp-name-prefixes:
+    description: 'Comma-separated list of tool name prefixes to strip before the read-only verb check (e.g. toolhive workload prefixes from `prefixFormat: "{workload}_"`). Empty preserves the default-deny boundary.'
+    required: false
+    default: ""
+  ai-request-timeout-sec:
+    description: Timeout in seconds for the primary model API request (curl --max-time)
+    required: false
+    default: "300"
+  ai-connect-timeout-sec:
+    description: Timeout in seconds for the primary model API connection (curl --connect-timeout)
+    required: false
+    default: "30"
+  ai-fallback-request-timeout-sec:
+    description: Timeout in seconds for the fallback model API request (curl --max-time). Defaults to ai_request_timeout_sec when blank.
+    required: false
+    default: ""
+  ai-fallback-connect-timeout-sec:
+    description: Timeout in seconds for the fallback model API connection (curl --connect-timeout). Defaults to ai_connect_timeout_sec when blank.
+    required: false
+    default: ""
+  platform:
+    description: "Target hosting platform for API capability gating and backend selection. 'auto' (default) detects from TANGLED_REPO_DID (the Tangled repository owner DID), GITHUB_SERVER_URL, and FORGEJO_API_URL: a set TANGLED_REPO_DID resolves to 'tangled' (checked before the GitHub/Forgejo signals); otherwise non-github.com hosts or FORGEJO_API_URL set resolves to 'forgejo'; otherwise 'github'. Set 'forgejo', 'github', or 'tangled' explicitly to override auto-detection; explicit 'tangled' requires a non-empty TANGLED_REPO_DID and fails with a descriptive error when it is missing. Tangled is resolution-only for now: Tangled backend operations are not implemented yet and fail loudly until the follow-up work lands. On Forgejo, features requiring GitHub GraphQL (review minimization) degrade gracefully with a log line; the REST backend handles core PR operations. Linked-source enrichment always targets github.com regardless of this setting."
+    required: false
+    default: "auto"
+  forgejo-api-url:
+    description: Base URL for the Forgejo instance API backend (for example, https://forgejo.example.com). Optional on Forgejo Actions runners when GITHUB_SERVER_URL is set; set it when running from GitHub Actions or any runner that does not export the Forgejo server URL.
+    required: false
+    default: ""
+  forgejo-token:
+    description: Optional Forgejo API token. Defaults to github_token when blank. Use this when the token used for GitHub-compatible operations is not also valid for the Forgejo REST API.
+    required: false
+    default: ""
+  forgejo-auth-method:
+    description: "Forgejo authentication method. 'token' (default) uses a static personal access token via the forgejo_token input. 'authorized_integration' uses Forgejo's authorized integrations flow: the action exchanges the forgejo_authorized_integration_audience for a short-lived JWT via the runner's OIDC token endpoint and authenticates API calls with 'Authorization: Bearer {jwt}'. Requires forgejo_authorized_integration_audience and that the workflow sets 'enable-openid-connect: true'."
+    required: false
+    default: "token"
+  forgejo-authorized-integration-audience:
+    description: Audience identifier for the Forgejo Authorized Integration (the 'aud' JWT claim). Not secret — safe to commit to public code. Required when forgejo_auth_method is 'authorized_integration'. Ignored when forgejo_auth_method is 'token'.
+    required: false
+    default: ""
+  forgejo-skip-permission-preflight:
+    description: 'If true, allow the review to proceed when the Forgejo preflight reports an unrecognized ("unknown") permission — i.e. the server returned 200 but no recognizable permissions field. Distinct from granting write access: this only suppresses the unknown-payload error and logs a warning. Do not enable unless you have verified separately that the token can in fact publish reviews, otherwise the model output will be lost.'
+    required: false
+    default: "false"
+  skip-if-diff-unchanged:
+    description: If true, skip the LLM review when the effective PR diff matches the last managed review comment fingerprint
+    required: false
+    default: "true"
+  force-review:
+    description: If true, bypass the diff-unchanged guard and run a full PR review, even when the fingerprint matches the last managed review. Set automatically when the rereview_label is added; callers can also pass it from a workflow_dispatch or repository_dispatch. Default false.
+    required: false
+    default: "false"
+  rereview-label:
+    description: Label that, when added to a PR, forces a fresh review even if nothing changed — the easy re-review trigger (only users with write/triage can label, so it is self-authorizing). On a `labeled` event the action reviews iff the added label matches this, then removes the label so re-adding re-triggers; any other label add is ignored. To enable, add `labeled` to the workflow's pull_request types. Default "ai-review".
+    required: false
+    default: "ai-review"
+  rereview-command:
+    description: 'Comment command that forces a fresh full review from a `created` `issue_comment` event on a pull request — the comment re-review trigger. The comment body must be exactly this command (leading/trailing whitespace ignored; v1 takes no arguments — a comment with trailing text never triggers), and the commenter must have triage-or-higher repository permission, verified through the forge API and failing closed on lookup errors: a matching command from an unauthorized or unverifiable commenter skips the run even when `force-review` is set. An empty string disables comment-triggered re-reviews. To enable, consumers add `issue_comment: [created]` to their workflow; fork PRs only get a reply pointing at the `ai-review-fork` label workflow. Default "/ai-review".'
+    required: false
+    default: "/ai-review"
+  comment-marker:
+    description: HTML marker for the managed PR comment
+    required: false
+    default: "<!-- ai-pr-reviewer -->"
+  ci-status-check:
+    description: "If true (default), wait for CI checks to reach a terminal state before starting the AI review, then fold the per-check outcomes into the review corpus as evidence. Polls the Checks API for the PR head SHA; degrades when the token cannot read checks (grant checks: read). Set false for an immediate review."
+    required: false
+    default: "true"
+  ci-timeout-sec:
+    description: Maximum seconds to wait for CI checks to complete when ci_status_check=true. Default 300.
+    required: false
+    default: "300"
+  ci-interval-sec:
+    description: Seconds between CI status polls when ci_status_check=true. Default 15.
+    required: false
+    default: "15"
+  ci-skip-on-timeout:
+    description: If true, proceed with review after timeout instead of failing. If false, abort the action on timeout. Default true.
+    required: false
+    default: "true"
+outputs:
+  verdict:
+    description: AI verdict, approve or request_changes
+  verdict-source:
+    description: Where the final verdict came from ('model' or 'findings' per verdict_policy, 'enforcement' when a fail-closed enforcement layer forced it, or 'carry_forward' when an unchanged-diff skip retains the prior verdict)
+  required-checks:
+    description: Required-check validation status ('complete', 'incomplete', or 'none' when validation did not run)
+  review-result:
+    description: "The metadata marker's review_result state ('clean', 'findings', 'partial', or 'issues'), from the same still-open findings and coverage the marker records. #873/#954: 'partial' means the review has an execution or requirement-traceability gap — 'verdict: approve' with 'review-result: partial' is not an approval; gate merges on both, never on verdict alone. Use incomplete-reason to distinguish the gap. Has no v2 equivalent."
+  incomplete-reason:
+    description: "Why the review's coverage is incomplete, distinguishing review-execution gaps from requirement-traceability gaps: 'execution' (tool-loop or required-check coverage did not finish), 'requirement_trace' (the review completed, but an in-scope requirement lacks verifiable enforcement/test evidence), 'both', or 'none' when complete. #954. Has no v2 equivalent."
+  review-route:
+    description: Model route used for this review ('legacy', 'primary', 'smart', or 'escalated')
+  escalation-reason:
+    description: primary_requested when review_route is 'escalated' (the primary reviewer's structured smart_review_requested field triggered the smart re-review); empty otherwise
+  findings:
+    description: Normalized structured findings as a JSON array (empty array when the model produced none)
+  review-markdown:
+    description: Human-readable markdown review body
+  analysis-engine:
+    description: Model and endpoint that produced the final result
+  should-review:
+    description: Whether the action determined a new LLM review is needed
+  skip-reason:
+    description: Reason the LLM review was skipped
+  diff-fingerprint:
+    description: Stable fingerprint of the current pull request patch
+  ci-status-skipped:
+    description: Whether CI status check was skipped (true) or completed (false)
+  ci-status-final:
+    description: Final CI state (success/failure) when ci_status_check completed
+  cache-hit-ratio:
+    description: Prompt-cache hit ratio for this review (0.0-1.0, from the tool harness in native_loop mode; empty when unavailable)
+  tool-calls:
+    description: JSON array of read-only tools executed by the native tool harness, with tool names and statuses
+runs:
+  pre: chainguard-phonehome.js
+  using: node24
+  main: dist/index.js

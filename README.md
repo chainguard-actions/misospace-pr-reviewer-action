@@ -1,41 +1,184 @@
-# misospace/pr-reviewer-action
+<div align="center">
 
-Review pull requests with OpenAI- or Anthropic-compatible models and post an optional sticky comment.
+# 🤖 pr-reviewer-action
 
-Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/misospace/pr-reviewer-action](https://github.com/misospace/pr-reviewer-action).
+**AI pull request reviews with any OpenAI- or Anthropic-compatible model — cloud or self-hosted.**
 
-## Versions
+*Point it at your llama.cpp box or your Anthropic key. Either way, every PR gets a real review.*
 
-| Version | Tag | Upstream commit |
-|---------|-----|-----------------|
-| v1.2.9 | [`v1.2.9`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.2.9) | [`4126a27`](https://github.com/misospace/pr-reviewer-action/commit/4126a2701a5e9adcf7c48ac6eb678e2e3a2bb2a0) |
-| v1.3.0 | [`v1.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.3.0) | [`3479bf5`](https://github.com/misospace/pr-reviewer-action/commit/3479bf51ab9133414ae07af783bff985d3929884) |
-| v1.3.1 | [`v1.3.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.3.1) | [`7189223`](https://github.com/misospace/pr-reviewer-action/commit/7189223d79151d0508bdb1c60b6e60097e998ce5) |
-| v2.0.0 | [`v2.0.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.0) | [`7e25f7d`](https://github.com/misospace/pr-reviewer-action/commit/7e25f7d0d8651e936f3158477b0a364f27ed7383) |
-| v2.0.2 | [`v2.0.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.2) | [`529f5e8`](https://github.com/misospace/pr-reviewer-action/commit/529f5e897d0f0f6b203ccb74102ecc586bee538a) |
-| v2.0.3 | [`v2.0.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.3) | [`b06e61d`](https://github.com/misospace/pr-reviewer-action/commit/b06e61dde363d369173d82c7126f7b71e5c40c63) |
-| v2.1.0 | [`v2.1.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.0) | [`6ccb182`](https://github.com/misospace/pr-reviewer-action/commit/6ccb1823b99a0da09e9946dccd7437648d7771e1) |
-| v2.1.1 | [`v2.1.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.1) | [`41d9ffa`](https://github.com/misospace/pr-reviewer-action/commit/41d9ffadf39c7f317ef3cb6885d9f48447dcad23) |
-| v2.1.10 | [`v2.1.10`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.10) | [`6f4fb72`](https://github.com/misospace/pr-reviewer-action/commit/6f4fb724b222f6d9a83096d6b41cd636ef3a044e) |
-| v2.1.11 | [`v2.1.11`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.11) | [`d38d634`](https://github.com/misospace/pr-reviewer-action/commit/d38d63486d81156724191a438719bdd0431952c4) |
-| v2.1.2 | [`v2.1.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.2) | [`a177c34`](https://github.com/misospace/pr-reviewer-action/commit/a177c3478b52a6f8402ebbe9a0ba59c61cf028ed) |
-| v2.1.3 | [`v2.1.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.3) | [`16da477`](https://github.com/misospace/pr-reviewer-action/commit/16da47790168e70ca1f5f94821375f5b6e44a2c2) |
-| v2.1.5 | [`v2.1.5`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.5) | [`071a139`](https://github.com/misospace/pr-reviewer-action/commit/071a13976b80df2d5ea0e45285bcafcdae2c8a9e) |
-| v2.1.7 | [`v2.1.7`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.7) | [`258ac49`](https://github.com/misospace/pr-reviewer-action/commit/258ac494ff48261cba9a62dce384b35ed73404ba) |
-| v2.1.8 | [`v2.1.8`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.8) | [`a14a8bb`](https://github.com/misospace/pr-reviewer-action/commit/a14a8bb4e15ac6765eba782b2b21c7bcb351ffee) |
-| v2.1.9 | [`v2.1.9`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.9) | [`1cb6bed`](https://github.com/misospace/pr-reviewer-action/commit/1cb6bed7a29f0d528ff5ba56bcf57092bf096af1) |
-| v2.2.0 | [`v2.2.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.2.0) | [`99e7764`](https://github.com/misospace/pr-reviewer-action/commit/99e7764a4906f94d99c249231d2016c3cda8997e) |
-| v2.2.1 | [`v2.2.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.2.1) | [`54dfb1a`](https://github.com/misospace/pr-reviewer-action/commit/54dfb1aac20e1e410ad8f71dc3681b888500a1ec) |
-| v2.3.0 | [`v2.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.0) | [`f089f7c`](https://github.com/misospace/pr-reviewer-action/commit/f089f7c41375bef3b0e41c277d65e4d104b5641b) |
-| v2.3.1 | [`v2.3.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.1) | [`398d92d`](https://github.com/misospace/pr-reviewer-action/commit/398d92dea2644f8b9ea139f135e4fb4c6d60d6b0) |
-| v2.3.2 | [`v2.3.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.2) | [`b21c335`](https://github.com/misospace/pr-reviewer-action/commit/b21c335693194d7ae9b7ac77bc4e04a66e3c8e61) |
-| v2.3.3 | [`v2.3.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.3) | [`f1605b9`](https://github.com/misospace/pr-reviewer-action/commit/f1605b97871cc821302a8b4827f9058a4d6cd7cb) |
-| v2.4.0 | [`v2.4.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.4.0) | [`acb9476`](https://github.com/misospace/pr-reviewer-action/commit/acb9476d7358801d854f9c57366bbfbef401acd5) |
-| v2.5.0 | [`v2.5.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.5.0) | [`a962cdf`](https://github.com/misospace/pr-reviewer-action/commit/a962cdfc21c378a3b8cf2d8b194c787408e60e6b) |
-| v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.0.0) | [`2c1db88`](https://github.com/misospace/pr-reviewer-action/commit/2c1db8864069b1c747728ce935f469849d32c4c0) |
-| v3.0.1 | [`v3.0.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.0.1) | [`22c7da6`](https://github.com/misospace/pr-reviewer-action/commit/22c7da6cbc914d2bc235ca2e928d32b6408fcfff) |
-| v3.1.0 | [`v3.1.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.1.0) | [`aa12ad9`](https://github.com/misospace/pr-reviewer-action/commit/aa12ad9909b1ee8a5a7fe00dceeb1a8c97ab27dd) |
-| v3.2.0 | [`v3.2.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.2.0) | [`c86f3e9`](https://github.com/misospace/pr-reviewer-action/commit/c86f3e94191c9078e92714b10f39deb8d3466268) |
+[![CI](https://github.com/misospace/pr-reviewer-action/actions/workflows/ci.yaml/badge.svg)](https://github.com/misospace/pr-reviewer-action/actions/workflows/ci.yaml)
+[![Latest release](https://img.shields.io/github/v/release/misospace/pr-reviewer-action)](https://github.com/misospace/pr-reviewer-action/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**[Quick start](#-quick-start)** · **[Documentation](docs/README.md)** · **[Inputs](docs/inputs.md)** · **[Troubleshooting](docs/troubleshooting.md)** · **[Migrating from v2](docs/v3-migration.md)**
+
+</div>
+
+---
+
+The action reviews each pull request with the model you point it at. It collects the diff, linked issues, CI results, repository standards and evidence; lets the model read the checkout through a bounded, read-only tool loop; and publishes structured findings with a verdict derived from them, as a native review or a sticky comment.
+
+## ✨ Highlights
+
+- 🏠 **Local-model-first**: ollama, llama.cpp, vLLM, LiteLLM, or any OpenAI/Anthropic-compatible endpoint, with an optional fallback model.
+- 🔎 **Gathers its own evidence**: a native tool loop reads files, greps, follows git history and calls GitHub APIs or MCP servers before the verdict, with a budget that scales with the PR.
+- 🧭 **Deterministic classification**: rule-based risk flags and required checks keep smaller models focused; specialist passes run only when the change warrants them.
+- ⚖️ **Verdicts you can audit**: request changes only for open blocker/major findings, and a review that couldn't read everything says so and never approves.
+- 💸 **Token-saving**: an unchanged diff skips the model entirely and carries the prior verdict forward.
+- 🛡️ **Safe by default**: standards and prompts read from the base branch, read-only tools, secret redaction, approvals off, fork PRs isolated.
+
+## 🚀 Quick start
+
+```yaml
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: misospace/pr-reviewer-action@v3
+        with:
+          ai-base-url: ${{ vars.AI_BASE_URL }}
+          ai-api-key: ${{ secrets.AI_API_KEY }}
+          ai-model: ${{ vars.AI_MODEL }}
+```
+
+That is the whole setup: an OpenAI-compatible endpoint (set `ai-api-format: anthropic` for an Anthropic-compatible one), its key, and a model. The defaults are the recommended configuration: the native tool loop gathers evidence from the checkout, specialist leads run when the change warrants them, CI results are folded in as evidence, and findings post as a non-blocking review anchored to the diff. `github-token` defaults to the job token.
+
+**Requirements:** it is a JavaScript action (`runs.using: node24`), so GitHub-hosted runners need nothing installed; the runner provides Node. The repository under review must be checked out (`fetch-depth: 0` gives the history context). `checks: read` lets the review wait for CI; without it the CI evidence is skipped. On Forgejo, use runner 9 or newer with a job image that has Node 22+ and `git`.
+
+## ⚙️ How it works
+
+```mermaid
+flowchart LR
+    A[Precheck<br/>diff fingerprint] -->|unchanged| Z[Skip review 💤]
+    A -->|changed| B[CI wait + specialist passes<br/><i>in parallel</i>]
+    B --> C[Collect context<br/>diff · issues · standards · evidence]
+    C --> D[Tool loop<br/>read-only evidence gathering]
+    D --> E[Review<br/>primary / smart / fallback model]
+    E --> F[Enforce<br/>strict verdict · coverage]
+    F --> G[Publish<br/>native review / comment]
+```
+
+## 🖥️ Platform support
+
+The action works on **GitHub** and **Forgejo** (1.4.x), with **Tangled** resolvable as a platform. Set `platform: auto` (default) to detect automatically from `TANGLED_REPO_DID` (the Tangled repository owner DID, checked first), `GITHUB_SERVER_URL`, and `FORGEJO_API_URL`, or set explicitly to `forgejo` / `github` / `tangled` (explicit `tangled` requires `TANGLED_REPO_DID`). Tangled is resolution-only for now: its backend operations are not implemented yet and fail loudly until follow-up work lands.
+
+| Feature | GitHub | Forgejo |
+|---|---|---|
+| PR diff, files, metadata | ✅ Full | ✅ Full (REST backend) |
+| Managed sticky comment | ✅ Full | ✅ Full |
+| Native review comments (`review_comment`) | ✅ Full | ⚠️ Degraded — REST-based; no inline line anchors |
+| Native review verdicts (`review_verdict`) | ✅ Full | ⚠️ Degraded — approve/request_changes via REST |
+| Cleanup: dismiss stale reviews | ✅ Full | ✅ Full (REST) |
+| Cleanup: minimizeComment (hide outdated) | ✅ Full | ❌ Skipped (no GraphQL) |
+| CI status check polling | ✅ Full | ✅ Commit-status polling (Forgejo REST) |
+| Evidence providers | ✅ Full | ✅ Full |
+| Tool harness | ✅ Full | ✅ Full |
+| Fast/smart model routing | ✅ Full | ✅ Full |
+
+> **Note:** On Forgejo, features requiring GitHub's GraphQL API (review minimization) are skipped with a clear log line. The core review pipeline and all REST-based features work fully.
+
+## 📚 Documentation
+
+| Topic | Page |
+|---|---|
+| Every input and output, with defaults | [Inputs and outputs](docs/inputs.md) |
+| What the reviewer sees and how to steer it (standards, prompts, evidence, CI) | [Context and evidence](docs/context-and-evidence.md) |
+| The native tool loop, budgets and partial coverage | [Tool loop](docs/tool-loop.md) |
+| Specialist passes and `deep-review: auto` | [Deep review](docs/deep-review.md) |
+| Verdict policies, publish modes, re-reviews | [Verdicts and publishing](docs/verdicts-and-publishing.md) |
+| Endpoints, fallback and fast/smart routing | [Models and routing](docs/models-and-routing.md) |
+| Review marker fields and the step summary | [Telemetry](docs/telemetry.md) |
+| Default-off experimental features | [Opt-in features](docs/opt-in-features.md) |
+| Local model issues and common misconfigurations | [Troubleshooting](docs/troubleshooting.md) |
+| Repository-owned config file | [Repository config](docs/repository-config.md) |
+| Reviewing pull requests from forks | [Fork reviews](docs/fork-review.md) |
+| Upgrading from v2 | [v2 → v3 migration](docs/v3-migration.md) |
+
+Copyable workflows: [`examples/workflow-self-hosted.yml`](examples/workflow-self-hosted.yml) and [`examples/workflow-cloud.yml`](examples/workflow-cloud.yml).
+
+## 📌 Version pinning and releases
+
+The action is versioned with Git tags. `@v3` is a floating major tag; for reproducible runs, pin a release tag or its commit SHA (Renovate keeps either current):
+
+```yaml
+- uses: misospace/pr-reviewer-action@v3.1.0
+# or
+- uses: misospace/pr-reviewer-action@aa12ad9909b1ee8a5a7fe00dceeb1a8c97ab27dd # v3.1.0
+```
+
+Release tags point at a build commit that contains `dist/`; `main` does not carry the bundle. Releases are cut by merging the standing `release: X.Y.Z` pull request that release-please maintains.
+
+### 🗓️ Versioning policy
+
+- **Patch** (`Z`): bug fixes, docs, performance work and internal refactors.
+- **Minor** (`Y`): new inputs, outputs, tools or modes, and deliberate changes to the reviewer's operating point (such as the v3.1.0 tool budget). Release notes call out anything that changes review behavior.
+- **Major** (`X`): anything that can require editing your workflow, such as removing or renaming inputs/outputs or dropping platform support.
+- **Deprecations** keep working, with a log warning, for the rest of the current major.
+- **`source-vX.Y.Z` tags** mark each release's source commit on `main` for release tooling. They have no `dist/`, so never pin to them.
+- **Pre-releases** (`vX.Y.Z-rc.N`) never move the floating major tag.
+
+Subscribe to [GitHub Releases](https://github.com/misospace/pr-reviewer-action/releases) to follow changes.
+
+### 🚚 v3 breaking changes
+
+If you used `review_scope: auto|incremental|full` in v2, remove the input in v3. There is no replacement: every changed review uses the full current PR. Keep `skip-if-diff-unchanged` for the zero-token unchanged-review skip; it retains the prior overall verdict. The `ai-review` label, a `/ai-review` PR comment, or `force-review: "true"` still forces a fresh full review. Comment re-review is for triage-or-higher commenters only (fork PRs get a reply pointing at the fork review workflow) and an empty `rereview-command` disables it — see [Verdicts and publishing](docs/verdicts-and-publishing.md#comment-command).
+
+Stop reading the removed incremental outputs (`effective_review_scope`, `previous_head_sha`, `previous_base_sha`, `baseline_clean`) and remove `escalate_on_dirty_baseline` if configured. Previous findings and evidence are not carried into a new review. No replacement scope or dirty-baseline setting is needed.
+
+## 🧪 Development
+
+```bash
+npm ci && npm run typecheck && npm test   # v3 suite, end-to-end against mock platform and model servers
+GIT_CONFIG_GLOBAL=/dev/null python3 tests/parity_harness.py   # v3 snapshot boundaries over deterministic fixtures (add --update to re-baseline)
+pytest tests/ -q                           # retained Python gates and tooling
+```
+
+Contributor and agent docs (code map, architecture, eval runbooks) start at [`AGENTS.md`](AGENTS.md); evaluation is in [`docs/evals.md`](docs/evals.md).
+
+## 🔐 Security
+
+See [SECURITY.md](SECURITY.md) for the threat model, controls, and operational guidance.
+
+### Fork PR reviews
+
+Pull requests from forks are reviewed by a separate, privilege-separated
+workflow (`fork-ai-review.yaml`): default-deny behind the maintainer-only
+`ai-review-fork` label, local models only, no fork code ever checked out or
+executed in the privileged run, and bounded compute. The same-repository
+dogfood reviewer skips fork PRs cleanly. See
+[docs/fork-review.md](docs/fork-review.md) for the threat model, the
+authorization flow, and the required `FORK_*` configuration.
+
+## 📄 License
+
+[MIT](LICENSE)
+
+---
+
+<div align="center">
+
+Built for homelabs and production alike — if this action reviews your PRs well, consider **[starring the repo ⭐](https://github.com/misospace/pr-reviewer-action)**
+
+<sub>[⬆ Back to top](#-pr-reviewer-action)</sub>
+
+</div>
 
 ## Privacy
 
