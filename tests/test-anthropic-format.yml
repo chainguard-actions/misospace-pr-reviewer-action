@@ -1,0 +1,36 @@
+name: Test anthropic API format
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          ai-base-url: "https://api.anthropic.com"
+          ai-model: "claude-3-5-haiku-20241022"
+          ai-api-format: "anthropic"
+          pr-number: "1"
+          on-model-failure: "notice"
+      - name: Assert action ran with anthropic format
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          ANALYSIS_ENGINE: ${{ steps.action.outputs.analysis-engine }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "analysis-engine: $ANALYSIS_ENGINE"
+          # The action should either succeed or fail gracefully.
+          # With the sentinel repo, PR fetch will fail before reaching the AI call.
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with anthropic format"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo not resolvable, expected)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

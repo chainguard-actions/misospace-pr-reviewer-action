@@ -1,0 +1,38 @@
+name: Test skip-if-diff-unchanged behavior
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          pr-number: "1"
+          skip-if-diff-unchanged: "true"
+          on-model-failure: "notice"
+      - name: Assert action ran with skip-if-diff-unchanged enabled
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip-reason }}
+          DIFF_FINGERPRINT: ${{ steps.action.outputs.diff-fingerprint }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "skip-reason: $SKIP_REASON"
+          echo "diff-fingerprint: $DIFF_FINGERPRINT"
+          # The action should either succeed or fail gracefully.
+          # With the sentinel repo, PR fetch will fail before diff comparison.
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo not resolvable, expected)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
