@@ -38,6 +38,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | v3.2.0 | [`v3.2.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.2.0) | [`c86f3e9`](https://github.com/misospace/pr-reviewer-action/commit/c86f3e94191c9078e92714b10f39deb8d3466268) |
 | v3.3.0 | [`v3.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.3.0) | [`829f395`](https://github.com/misospace/pr-reviewer-action/commit/829f395f7154b4d87c229500fd09b30a8ad2224d) |
 | v3.4.0 | [`v3.4.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.4.0) | [`e78e531`](https://github.com/misospace/pr-reviewer-action/commit/e78e531cee6c7b10279be68454f3f7051fd85048) |
+| v3.4.1 | [`v3.4.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.4.1) | [`768a132`](https://github.com/misospace/pr-reviewer-action/commit/768a1320d67f14b99737633a5f8ba58449c3caeb) |
 
 ## Privacy
 
