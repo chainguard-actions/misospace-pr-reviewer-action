@@ -1,0 +1,27 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Review PR with self-hosted model
+        uses: misospace/pr-reviewer-action@v3
+        with:
+          ai-base-url: http://llama-server.internal:8080/v1
+          ai-model: qwen3-32b

@@ -1,0 +1,3455 @@
+#!/usr/bin/env python3
+"""A/B evaluation harness for comparing PR review modes.
+
+Compares review approaches on a shared PR corpus:
+  - tools_off:     no tool harness, direct model call only
+  - native_loop:   native tool-calling loop (the only tool mode as of 2.0)
+
+For each PR the harness runs all enabled modes and collects:
+  - findings quality  (vs known-good findings)
+  - token usage       (input + output tokens per mode)
+  - wall-clock time   (seconds from first to last model call)
+
+Outputs a JSON report with per-mode metrics and a side-by-side comparison.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from pr_reviewer.semantic_eval import (
+    SemanticCorpus,
+    SemanticResult,
+    _safe_relative_path,
+    MERGE_SAFETY_DISPOSITIONS_ORDER,
+    SEMANTIC_EVAL_VERSION,
+    _collect_signals_from_run,
+    _falsification_summary,
+    aggregate_semantic_runs,
+    evaluate_semantic_capability as evaluate_semantic_run,
+    validate_semantic_corpus,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+# Closed set of deep-review specialist roles (#607/#608): the aggregate
+# specialists.json and the per-role specialist-<role>.json artifacts are
+# keyed by exactly these names.
+SPECIALIST_ROLES = ("correctness", "security", "tests")
+
+# Deep-review specialist execution shapes (#635 benchmark). Mirrors
+# run_specialists.py's DEEP_REVIEW_EXECUTION knob; three_call is the
+# production default and the only shape a plain `--deep-review true` run
+# exercises. Labels: `+deep` / `+deep-scout` / `+deep-prime`.
+DEEP_EXECUTIONS = ("three_call", "combined_scout", "prime_then_fanout")
+
+
+def deep_execution_label(execution: str) -> str:
+    """Label suffix for a deep run's specialist execution shape."""
+    return {
+        "three_call": "+deep",
+        "combined_scout": "+deep-scout",
+        "prime_then_fanout": "+deep-prime",
+    }.get(execution, "+deep")
+
+
+@dataclass
+class KnownFinding:
+    """A single known-good finding for a PR."""
+    category: str          # e.g. "security", "correctness", "style"
+    severity: str          # "critical", "high", "medium", "low", "info"
+    description: str
+    file_path: str | None = None
+    line_range: tuple[int, int] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d = {
+            "category": self.category,
+            "severity": self.severity,
+            "description": self.description,
+        }
+        if self.file_path:
+            d["file_path"] = self.file_path
+        if self.line_range:
+            d["line_range"] = list(self.line_range)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> KnownFinding:
+        lr = d.get("line_range")
+        return cls(
+            category=d["category"],
+            severity=d["severity"],
+            description=d["description"],
+            file_path=d.get("file_path"),
+            line_range=tuple(lr) if lr else None,
+        )
+
+
+@dataclass
+class ReviewRun:
+    """Results from a single review mode on a single PR."""
+    mode: str              # "tools_off", "native_loop"
+    pr_number: int
+    repo_full_name: str
+    stage: str | None = None
+    route: str | None = None
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
+    primary_findings: list[dict[str, Any]] = field(default_factory=list)
+    specialist_leads: list[dict[str, Any]] = field(default_factory=list)
+    tokens_input: int = 0
+    tokens_output: int = 0
+    wall_clock_sec: float = 0.0
+    verdict: str | None = None          # "approve" or "request_changes"
+    verdict_source: str | None = None   # "model" / "findings" / "carry_forward"
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    review_markdown: str = ""
+    error: str | None = None
+    # Set only when the run's error is a wall-clock timeout (#840): kept
+    # distinct from other error causes so a lopsided timeout loss on one
+    # arm/mode is visible in the report instead of blending into "errors".
+    timed_out: bool = False
+    model_used: str = ""
+    # Structured trace from tool-harness.json: each is {tool, args, status}.
+    # Populated for native_loop (and any harness mode that emits tool_calls);
+    # the capability checker grades the agentic evidence chain against it.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_stop_reason: str | None = None
+    # Deep-review (#610): when the specialist phase ran, `mode` is the
+    # labelled form (e.g. "native_loop+deep") and `specialists` holds the
+    # normalized telemetry from the run's specialist artifacts.
+    deep_review: bool = False
+    specialists: dict[str, Any] | None = None
+    # The exact PR-head commit this run reviewed (the checked-out
+    # refs/pull/<PR>/head); None when the run errored before/without
+    # materializing the PR head.
+    commit_sha: str | None = None
+    # #838: the private artifact directory this run's review wrote to
+    # (PR_REVIEWER_RUN_DIR) — never the reviewed checkout. Internal
+    # bookkeeping only (a caller that needs a run's artifacts after the
+    # fact, e.g. score_context, reads through this); not part of to_dict.
+    run_dir: Path | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"mode": self.mode, "pr_number": self.pr_number}
+        if self.commit_sha is not None:
+            # Additive, near pr_number: present only once the run
+            # materialized a PR head; None runs keep the pre-existing shape.
+            d["commit_sha"] = self.commit_sha
+        if self.stage is not None:
+            d["stage"] = self.stage
+        if self.route is not None:
+            d["route"] = self.route
+        d.update({
+            "repo_full_name": self.repo_full_name,
+            "tokens_input": self.tokens_input,
+            "tokens_output": self.tokens_output,
+            "wall_clock_sec": round(self.wall_clock_sec, 3),
+            "verdict": self.verdict,
+            "verdict_source": self.verdict_source,
+            "findings_count": len(self.findings),
+            "findings": self.findings,
+            "tool_calls": self.tool_calls,
+            "tool_stop_reason": self.tool_stop_reason,
+            "error": self.error,
+            "timed_out": self.timed_out,
+            "model_used": self.model_used,
+            "deep_review": self.deep_review,
+            "specialists": self.specialists,
+        })
+        if self.artifacts:
+            d["artifacts"] = self.artifacts
+        if self.primary_findings:
+            d["primary_findings"] = self.primary_findings
+        if self.specialist_leads:
+            d["specialist_leads"] = self.specialist_leads
+        return d
+
+
+@dataclass
+class BenchmarkResult:
+    """Aggregated results for one PR across all modes."""
+    pr_number: int
+    repo_full_name: str
+    runs: list[ReviewRun] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pr_number": self.pr_number,
+            "repo_full_name": self.repo_full_name,
+            "runs": [r.to_dict() for r in self.runs],
+        }
+
+
+@dataclass
+class BenchmarkCorpus:
+    """The full benchmark corpus with optional semantic scenarios.
+
+    Benchmark entries may also pin a retained fixture (#712) via an
+    entry-level ``fixture`` ref (``path`` + ``sha256``, resolved under the
+    corpus directory): the corpus PRs are long merged, so a live
+    ``gh pr diff`` degrades against the moved base. A pinned fixture
+    materializes the exact authored diff through the semantic-fixture path
+    instead (see :func:`run_review_for_pr`).
+    """
+
+    prs: list[dict[str, Any]] = field(default_factory=list)
+    semantic_corpus: SemanticCorpus | None = None
+
+    @classmethod
+    def from_file(cls, path: Path) -> BenchmarkCorpus:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        semantic = None
+        if isinstance(data.get("semantic_corpus"), list):
+            semantic = SemanticCorpus.from_file(path)
+            validate_semantic_corpus(semantic)
+        prs = data.get("benchmark_corpus", [])
+        # Entry-level retained fixtures (#712): load eagerly so a corrupt
+        # ref fails at corpus load, not mid-benchmark.
+        pinned = [e for e in prs if isinstance(e, dict) and "fixture" in e]
+        if pinned:
+            fixture_root = SemanticCorpus(fixture_root=path.parent)
+            for entry in pinned:
+                entry["_semantic_fixture"] = _load_semantic_fixture(
+                    fixture_root, entry["fixture"]
+                )
+        if not prs and semantic is not None:
+            prs = []
+            for scenario in semantic.scenarios:
+                entry = {
+                    "number": scenario.number,
+                    "repo_full_name": scenario.repo_full_name,
+                    "url": scenario.url,
+                    "title": scenario.title,
+                    "known_findings": scenario.known_findings,
+                }
+                if scenario.fixture is not None:
+                    fixture_data, fixture_path = _load_semantic_fixture(semantic, scenario.fixture)
+                    entry["_semantic_fixture"] = (fixture_data, fixture_path)
+                prs.append(entry)
+        return cls(prs=prs, semantic_corpus=semantic)
+
+
+# ---------------------------------------------------------------------------
+# Real-PR corpus (#779): real merged PRs reviewed at their pinned head, where
+# a later merged PR fixed a defect the PR introduced (vulnerable), or where
+# no later PR ever fixed one (clean control). Unlike BenchmarkCorpus's
+# category/severity+description ``known_findings`` matching, a real PR's
+# defect is anchored to a file (and optionally a line range) recovered from
+# the fixing PR's own diff/description — the fixture corpus format doesn't
+# fit that shape, so this is a deliberately separate, minimal corpus format
+# (top-level ``real_pr_corpus`` key) and scorer rather than an extension of
+# BenchmarkCorpus/compute_precision_recall.
+# ---------------------------------------------------------------------------
+
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+# Widen a defect's authored line range by this many lines on each side when
+# checking whether a finding's reported line falls inside it (#779 step 3):
+# reviewers commonly report a line a few lines off the exact anchor even
+# when they correctly identified the defective block.
+REAL_PR_LINE_TOLERANCE = 10
+
+
+@dataclass
+class RealPRDefect:
+    """The known-defect anchor for one vulnerable real-PR scenario."""
+    description: str
+    file: str | None
+    line_range: tuple[int, int] | None
+    severity: str | None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RealPRDefect:
+        lr = d.get("line_range")
+        return cls(
+            description=str(d.get("description", "")),
+            file=d.get("file"),
+            line_range=tuple(lr) if isinstance(lr, (list, tuple)) else lr,
+            severity=d.get("severity"),
+        )
+
+
+@dataclass
+class RealPRScenario:
+    """One real-PR corpus entry, vulnerable or clean."""
+    id: str
+    repo_full_name: str
+    number: int
+    head_sha: str
+    expected_clean: Any
+    defect: RealPRDefect | None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RealPRScenario:
+        defect = RealPRDefect.from_dict(d["defect"]) if isinstance(d.get("defect"), dict) else None
+        return cls(
+            id=str(d.get("id") or f"{d.get('repo_full_name')}#{d.get('number')}"),
+            repo_full_name=d.get("repo_full_name", ""),
+            number=d.get("number", 0),
+            head_sha=str(d.get("head_sha", "")),
+            expected_clean=d.get("expected_clean", False),
+            defect=defect,
+            raw=d,
+        )
+
+    def to_pr_entry(self) -> dict[str, Any]:
+        """The subset run_review_for_pr needs: number/repo_full_name/head_sha,
+        plus ``base_sha`` when the entry pins the diff base."""
+        entry = {
+            "number": self.number,
+            "repo_full_name": self.repo_full_name,
+            "head_sha": self.head_sha,
+        }
+        base_sha = self.raw.get("base_sha")
+        if base_sha:
+            entry["base_sha"] = base_sha
+        return entry
+
+
+_REPO_FULL_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def validate_real_pr_corpus(vulnerable: list[RealPRScenario], clean: list[RealPRScenario]) -> None:
+    """Raise ValueError (with every problem listed) on a malformed corpus.
+
+    Every entry (vulnerable or clean) must pin a full 40-hex commit SHA.
+    Every vulnerable entry must carry a defect with a non-empty description
+    and file; when it declares a line_range, that must be an ascending
+    [start, end] pair of positive ints. Every clean entry must declare
+    expected_clean: true (so a scenario can never silently score on the
+    wrong side because a flag was left off).
+    """
+    errors: list[str] = []
+
+    def _check_sha(scenario: RealPRScenario) -> None:
+        if not scenario.head_sha or not _FULL_SHA_RE.fullmatch(scenario.head_sha):
+            errors.append(
+                f"{scenario.id}: head_sha must be a full 40-hex commit SHA, "
+                f"got {scenario.head_sha!r}"
+            )
+
+    def _check_identity(scenario: RealPRScenario) -> None:
+        base_sha = scenario.raw.get("base_sha")
+        if base_sha is not None and not (isinstance(base_sha, str) and _FULL_SHA_RE.fullmatch(base_sha)):
+            errors.append(f"{scenario.id}: base_sha must be a full 40-hex commit SHA, got {base_sha!r}")
+        number = scenario.number
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            errors.append(f"{scenario.id}: number must be a positive int, got {number!r}")
+        if not isinstance(scenario.repo_full_name, str) or not _REPO_FULL_NAME_RE.fullmatch(scenario.repo_full_name):
+            errors.append(f"{scenario.id}: repo_full_name must be owner/repo, got {scenario.repo_full_name!r}")
+
+    for scenario in vulnerable:
+        _check_sha(scenario)
+        _check_identity(scenario)
+        if scenario.expected_clean is not False:
+            errors.append(f"{scenario.id}: vulnerable entry must not set expected_clean")
+        defect_file = scenario.defect.file if scenario.defect is not None else None
+        if scenario.defect is None or not scenario.defect.description or not isinstance(defect_file, str) or not defect_file.strip():
+            errors.append(
+                f"{scenario.id}: vulnerable entry must have a defect with a "
+                "description and a file"
+            )
+        elif scenario.defect.line_range is not None:
+            lr = scenario.defect.line_range
+            lo, hi = lr if isinstance(lr, tuple) and len(lr) == 2 else (None, None)
+            valid = (
+                isinstance(lo, int) and not isinstance(lo, bool)
+                and isinstance(hi, int) and not isinstance(hi, bool)
+                and lo > 0 and hi >= lo
+            )
+            if not valid:
+                errors.append(
+                    f"{scenario.id}: defect.line_range must be an ascending "
+                    f"[start, end] pair of positive ints, got {scenario.defect.line_range!r}"
+                )
+
+    for scenario in clean:
+        _check_sha(scenario)
+        _check_identity(scenario)
+        if scenario.expected_clean is not True:
+            errors.append(f"{scenario.id}: clean entry must set expected_clean: true (a JSON boolean)")
+
+    if errors:
+        raise ValueError(
+            "real-PR corpus validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        )
+
+
+@dataclass
+class RealPRCorpus:
+    vulnerable: list[RealPRScenario] = field(default_factory=list)
+    clean: list[RealPRScenario] = field(default_factory=list)
+
+    @classmethod
+    def from_file(cls, path: Path) -> RealPRCorpus:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        block = data.get("real_pr_corpus") if isinstance(data, dict) else None
+        if not isinstance(block, dict):
+            raise ValueError(f"{path}: missing top-level 'real_pr_corpus' object")
+        vulnerable_raw = block.get("vulnerable", [])
+        clean_raw = block.get("clean", [])
+        if not isinstance(vulnerable_raw, list) or not isinstance(clean_raw, list):
+            raise ValueError(f"{path}: 'real_pr_corpus.vulnerable' and '.clean' must be lists")
+        if not all(isinstance(e, dict) for e in [*vulnerable_raw, *clean_raw]):
+            raise ValueError(f"{path}: every real_pr_corpus entry must be an object")
+        vulnerable = [RealPRScenario.from_dict(e) for e in vulnerable_raw]
+        clean = [RealPRScenario.from_dict(e) for e in clean_raw]
+        validate_real_pr_corpus(vulnerable, clean)
+        return cls(vulnerable=vulnerable, clean=clean)
+
+
+def _normalize_path_for_match(path: str) -> str:
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.lstrip("/").lower()
+
+
+def _finding_file_matches_anchor(finding_file: Any, anchor_file: str) -> bool:
+    """Loose file match: exact, a path-boundary suffix, or nested under a
+    directory anchor.
+
+    This is the single matcher shared by the real-PR scorer (here) and
+    ``scripts/check_corpus_anchor_in_diff.py``'s anchor-in-diff check, so
+    the two can never silently drift on what counts as a match (#877).
+
+    Findings may report a path relative to the repo root, or (less
+    commonly) something shorter/longer; treat a match as either exact or a
+    suffix aligned on a '/' boundary so ``foo.sh`` doesn't
+    false-positive-match ``scripts/other_foo.sh``.
+
+    A directory anchor — ``anchor_file`` ending in ``/`` — instead matches
+    any file nested under it (e.g. a defect that's repeated identically in
+    every file under a directory, like #861's ``.../virtualkeys/``
+    corpus entry). The trailing slash is required and load-bearing: it is
+    the only signal that distinguishes a directory anchor from an
+    ordinary extension-less file anchor (e.g. ``scripts/Makefile``), which
+    must still match only by exact-or-suffix, never as a path prefix.
+    """
+    if not isinstance(finding_file, str) or not finding_file:
+        return False
+    f = _normalize_path_for_match(finding_file)
+    a = _normalize_path_for_match(anchor_file)
+    if not f or not a:
+        return False
+    if a.endswith("/"):
+        a_dir = a.rstrip("/")
+        if not a_dir:
+            return False
+        if f == a_dir or ("/" + a_dir + "/") in ("/" + f):
+            return True
+        # Shorter-root leniency, as for file anchors: the finding may name
+        # the path from any '/'-aligned tail of the directory anchor.
+        parts = a_dir.split("/")
+        return any(f.startswith("/".join(parts[i:]) + "/") for i in range(len(parts)))
+    return f == a or f.endswith("/" + a) or a.endswith("/" + f)
+
+
+def score_vulnerable_run(
+    run: ReviewRun, defect: RealPRDefect, tolerance: int = REAL_PR_LINE_TOLERANCE,
+) -> dict[str, Any]:
+    """Score one run of a vulnerable real-PR scenario against its defect anchor.
+
+    ``hit`` (strict): some finding's file matches the defect's file AND,
+    when the defect declares a line_range, that finding's line falls inside
+    [start - tolerance, end + tolerance]. When the defect has no line_range,
+    ``hit`` degrades to the file-only match.
+    ``file_only_hit``: some finding's file matches the defect's file,
+    regardless of line — the looser signal for anchors this exercise can't
+    line-check (or a reviewer that got the file right but misreported the
+    line). An errored run scores as a miss on every field (it produced no
+    findings to check).
+
+    A directory anchor (``defect.file`` ending in ``/``, see
+    ``_finding_file_matches_anchor``) has no single line to check a
+    finding against, so a matching finding is always a file-level
+    ``hit`` — the same as a file anchor with no ``line_range`` — even if
+    the defect happens to also carry a ``line_range`` (which shouldn't
+    occur for a directory anchor in practice, but is handled the same
+    way rather than left to silently miss).
+    """
+    hit = False
+    file_only_hit = False
+    if not run.error and defect.file:
+        findings = run.findings if isinstance(run.findings, list) else []
+        lo_hi = defect.line_range
+        is_dir_anchor = _normalize_path_for_match(defect.file).endswith("/")
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            if not _finding_file_matches_anchor(finding.get("file"), defect.file):
+                continue
+            file_only_hit = True
+            if lo_hi is None or is_dir_anchor:
+                # No line to check against (either the defect has no
+                # line_range, or the anchor is a directory and there's no
+                # single line a directory match could be checked
+                # against) — the file-level match is the whole signal.
+                hit = True
+                continue
+            line = finding.get("line")
+            if isinstance(line, int) and not isinstance(line, bool):
+                lo, hi = lo_hi
+                if (lo - tolerance) <= line <= (hi + tolerance):
+                    hit = True
+    return {
+        "errored": bool(run.error),
+        "error": run.error,
+        "timed_out": run.timed_out,
+        "hit": hit,
+        "file_only_hit": file_only_hit,
+        "has_line_anchor": defect.line_range is not None,
+        "verdict": run.verdict,
+        "request_changes": run.verdict == "request_changes",
+    }
+
+
+def score_clean_run(run: ReviewRun) -> dict[str, Any]:
+    """Score one run of a clean-control real-PR scenario for false positives.
+
+    Records both any-severity findings and blocker/major-only findings
+    (the higher-signal false-positive bar), plus whether the run's verdict
+    was request_changes. An errored run produced no findings and no
+    verdict, so it scores as zero false positives and not request_changes —
+    errored_count is tracked alongside so it isn't mistaken for a clean pass.
+    """
+    findings = run.findings if isinstance(run.findings, list) else []
+    blocker_major = [
+        f for f in findings
+        if isinstance(f, dict)
+        and str(f.get("severity", "")).strip().lower() in ("blocker", "major")
+    ]
+    return {
+        "errored": bool(run.error),
+        "error": run.error,
+        "timed_out": run.timed_out,
+        "any_finding_count": len(findings),
+        "blocker_major_finding_count": len(blocker_major),
+        "false_positive": len(findings) > 0,
+        "blocker_major_false_positive": len(blocker_major) > 0,
+        "verdict": run.verdict,
+        "request_changes": run.verdict == "request_changes",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Corpus helpers
+# ---------------------------------------------------------------------------
+
+def load_known_findings(pr_entry: dict[str, Any]) -> list[KnownFinding]:
+    """Extract known-good findings from a corpus PR entry."""
+    raw = pr_entry.get("known_findings", [])
+    return [KnownFinding.from_dict(f) for f in raw]
+
+
+def extract_findings_from_review(review_run: ReviewRun) -> list[dict[str, Any]]:
+    """Parse findings out of a review's markdown body.
+
+    Finds lines matching common patterns like:
+      - `- [security/high] description`
+      - `- [correctness/medium] ...`
+      - severity-prefixed bullets
+    Returns list of dicts with category, severity, description.
+    """
+    findings = []
+    if not review_run.review_markdown:
+        return findings
+
+    # Pattern: [category/severity] or category/severity prefix
+    pattern = re.compile(
+        r"[-*]\s+\[?(\w+)/(\w+)\]?\s+(.+)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(review_run.review_markdown):
+        cat = match.group(1).lower()
+        sev = match.group(2).lower()
+        desc = match.group(3).strip()
+        if cat and sev:
+            findings.append({
+                "category": cat,
+                "severity": sev,
+                "description": desc,
+            })
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Quality comparison
+# ---------------------------------------------------------------------------
+
+def compute_precision_recall(
+    found_findings: list[dict[str, Any]],
+    known_findings: list[KnownFinding],
+) -> dict[str, float]:
+    """Compute precision and recall against known-good findings.
+
+    Simple matching: a finding is "correct" if its category and severity
+    match any known finding AND the description has >50% word overlap.
+    """
+    # Always include total_found/total_known so callers don't need special casing.
+    if not known_findings:
+        return {
+            "precision": 0.0, "recall": 0.0, "f1": 0.0,
+            "matched_found": 0, "total_found": len(found_findings), "total_known": 0,
+        }
+    if not found_findings:
+        return {
+            "precision": 0.0, "recall": 0.0, "f1": 0.0,
+            "matched_found": 0, "total_found": 0, "total_known": len(known_findings),
+        }
+
+    # Build a set of (category, severity) tuples from known findings
+    known_keys = {(f.category.lower(), f.severity.lower()) for f in known_findings}
+
+    # Word-overlap threshold for description matching
+    def word_overlap(a: str, b: str) -> float:
+        words_a = set(re.findall(r"\w+", a.lower()))
+        words_b = set(re.findall(r"\w+", b.lower()))
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / min(len(words_a), len(words_b))
+
+    matched_found = 0
+    matched_known = 0
+
+    for found in found_findings:
+        fk = (found["category"], found["severity"])
+        if fk not in known_keys:
+            continue
+        # Check description overlap with any matching known finding
+        for kf in known_findings:
+            if (kf.category.lower(), kf.severity.lower()) == fk:
+                if word_overlap(found["description"], kf.description) > 0.5:
+                    matched_found += 1
+                    matched_known += 1
+                    break
+
+    precision = matched_found / len(found_findings) if found_findings else 0.0
+    recall = matched_known / len(known_findings) if known_findings else 0.0
+    f1 = (2 * precision * recall / (precision + recall)
+          if (precision + recall) > 0 else 0.0)
+
+    return {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "matched_found": matched_found,
+        "total_found": len(found_findings),
+        "total_known": len(known_findings),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Capability checks (the agentic-evidence-chain criterion, #203/#207)
+# ---------------------------------------------------------------------------
+#
+# Findings precision/recall can't express the home-ops#7462 acceptance bar —
+# "did the reviewer chain tools to consult the platform's compatibility matrix
+# and cite it?" That is a *capability* assertion on the evidence-gathering, not
+# a findings-quality score. A scenario declares it as `expected_evidence` and
+# the harness grades each run pass/fail; the bar is met as a RATE over many
+# runs (a single green run proves nothing at the fast tier's reliability).
+#
+# Check kinds (capability passes iff ALL checks pass):
+#   tool_call      — some executed tool_call matches `tool` and, for each key in
+#                    `args_contains`, that call's arg holds ALL listed substrings
+#   review_mentions — the published review markdown contains ANY of `any_of`
+# Both are substring/case-insensitive: the grader names concrete evidence (it is
+# not the reviewer), but stays loose on phrasing.
+
+
+def _arg_value(call: dict[str, Any], key: str) -> str:
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return ""
+    val = args.get(key)
+    return val if isinstance(val, str) else ""
+
+
+def evaluate_capability(
+    run: ReviewRun, expected_evidence: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Grade a run against a scenario's expected_evidence.
+
+    Returns None when the scenario declares no capability checks (so callers
+    can skip capability aggregation for ordinary findings-only PRs). Otherwise
+    returns {description, checks: [{id, type, passed, ...}], passed: bool}.
+    A run that errored fails every check (no evidence was produced).
+    """
+    if not expected_evidence:
+        return None
+    checks = expected_evidence.get("checks", [])
+    if not checks:
+        return None
+
+    results: list[dict[str, Any]] = []
+    review_lc = (run.review_markdown or "").lower()
+
+    for check in checks:
+        ctype = check.get("type")
+        cid = check.get("id", ctype or "check")
+        passed = False
+
+        if run.error:
+            passed = False
+        elif ctype == "tool_call":
+            want_tool = check.get("tool")
+            # ``tool`` may be a single name or a list of acceptable names — the
+            # latter lets one check credit either path to the same evidence
+            # (e.g. web_search OR web_fetch reaching a support matrix).
+            want_tools = (
+                want_tool if isinstance(want_tool, list)
+                else [want_tool] if want_tool else []
+            )
+            args_contains = check.get("args_contains", {})
+            # ``args_any_contains``: pass when ANY of the call's string arg
+            # values contains ANY listed substring — tool-agnostic, so it
+            # matches a matrix URL in web_fetch or a matrix query in web_search.
+            any_needles = [
+                str(n).lower() for n in check.get("args_any_contains", [])
+            ]
+            for call in run.tool_calls:
+                if want_tools and call.get("tool") not in want_tools:
+                    continue
+                if call.get("status") not in (None, "ok"):
+                    # A failed tool call isn't usable evidence.
+                    continue
+                ok = True
+                for key, needles in args_contains.items():
+                    hay = _arg_value(call, key).lower()
+                    needle_list = needles if isinstance(needles, list) else [needles]
+                    if not all(str(n).lower() in hay for n in needle_list):
+                        ok = False
+                        break
+                if ok and any_needles:
+                    arg_vals = (call.get("args") or {}).values()
+                    haystack = " ".join(
+                        v.lower() for v in arg_vals if isinstance(v, str)
+                    )
+                    ok = any(n in haystack for n in any_needles)
+                if ok:
+                    passed = True
+                    break
+        elif ctype == "review_mentions":
+            any_of = check.get("any_of", [])
+            passed = any(str(s).lower() in review_lc for s in any_of)
+        elif ctype == "max_tool_calls":
+            maximum = check.get("max")
+            # Every emitted request consumes budget, including failed requests.
+            passed = (
+                isinstance(maximum, int)
+                and not isinstance(maximum, bool)
+                and isinstance(run.tool_calls, list)
+                and len(run.tool_calls) <= maximum
+            )
+
+        results.append({"id": cid, "type": ctype, "passed": passed})
+
+    return {
+        "description": expected_evidence.get("description", ""),
+        "checks": results,
+        "passed": all(c["passed"] for c in results),
+    }
+
+
+#
+# Specialist checks (deep-review #610): the counterpart of the capability
+# checks for the specialist phase. A scenario declares
+# `specialist_expectations` with TWO closed check groups:
+#
+#   lead_checks — graded ONLY on deep runs (run.deep_review): deep-only
+#   diagnostics of the specialist phase, never comparable against standard
+#   runs. Kinds:
+#     lead_generated   — `min` (default 1) / optional `max` matching leads
+#                        for `role` (str or list; default all roles) under
+#                        the lead predicates (category_any / file_any /
+#                        message_any_contains; absent = no constraint)
+#     lead_disposition — `disposition` in
+#                        verified/rejected/unused/not_adopted; `any` passes
+#                        iff any lead was generated. Computed disposition:
+#                        "unused" when no lead matched, "verified" when a
+#                        matching final finding exists, else "rejected";
+#                        "not_adopted" passes when NO matching final finding
+#                        exists, whether or not a lead existed (a
+#                        hallucinated lead must not be adopted). "verified"
+#                        ADDITIONALLY requires concrete file evidence: the
+#                        check must carry a non-empty finding_file_any and at
+#                        least one matched finding must satisfy it — a
+#                        finding that merely repeats the lead's
+#                        category/message without the lead's file computes as
+#                        "rejected".
+#   effectiveness_checks — graded on ALL runs (standard AND deep): the
+#   comparable A/B subset. Kinds:
+#     final_findings_count  — `min` (default 0) / optional `max` on the
+#                             finding predicate against run.findings
+#     dedupe_final_findings — final_findings_count with default max=1 (an
+#                             explicit max overrides)
+#
+# Finding predicates consume the PRODUCTION finding shape
+# (the ai-output.json artifact: severity/category/file/line/message — there
+# is no "description" key), so description needles match `finding["description"]`
+# when present, else `finding["message"]`. All finding-consuming scorer paths
+# flow through the single _finding_predicate_matches. Same loose,
+# substring/case-insensitive predicate style as the capability checks; no regex.
+
+
+def _run_leads_by_role(run: ReviewRun) -> dict[str, list[dict[str, Any]]]:
+    """The run's normalized specialist leads; empty per role when absent."""
+    spec = run.specialists
+    if isinstance(spec, dict) and isinstance(spec.get("leads_by_role"), dict):
+        raw = spec["leads_by_role"]
+        out: dict[str, list[dict[str, Any]]] = {}
+        for role in SPECIALIST_ROLES:
+            leads = raw.get(role)
+            out[role] = (
+                [l for l in leads if isinstance(l, dict)]
+                if isinstance(leads, list)
+                else []
+            )
+        return out
+    return {role: [] for role in SPECIALIST_ROLES}
+
+
+def _needles(value: Any) -> list[str] | None:
+    """Lowercase the predicate value into a needle list (None = no constraint)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(v).lower() for v in value]
+    return [str(value).lower()]
+
+
+def _lead_predicate_matches(lead: dict[str, Any], check: dict[str, Any]) -> bool:
+    """Case-insensitive substring match of a lead against a check's predicates."""
+    cat = _needles(check.get("category_any"))
+    if cat and not any(n in str(lead.get("category", "") or "").lower() for n in cat):
+        return False
+    file_any = _needles(check.get("file_any"))
+    if file_any:
+        f = lead.get("file")
+        if f is None:
+            return False
+        if not any(n in str(f).lower() for n in file_any):
+            return False
+    msg = _needles(check.get("message_any_contains"))
+    if msg and not any(n in str(lead.get("message", "") or "").lower() for n in msg):
+        return False
+    return True
+
+
+def _finding_predicate_matches(finding: dict[str, Any], check: dict[str, Any]) -> bool:
+    """Case-insensitive substring match of a final finding against a check.
+
+    The production finding shape (the ai-output.json artifact) is
+    severity/category/file/line/message with NO "description" key, so the
+    description needles match `finding["description"]` when that key is
+    present, else `finding["message"]`. finding_category_any /
+    finding_description_any_contains default to mirroring the lead's
+    category_any / message_any_contains needles. Optional finding_file_any
+    (the finding's `file` must be non-None and contain a needle) and
+    finding_line (the finding must carry an integer line) add concrete
+    grounding. This is the single predicate every finding-consuming scorer
+    path (final_findings_count, dedupe_final_findings, the lead_disposition
+    finding side) flows through.
+    """
+    cat = _needles(check.get("finding_category_any"))
+    if cat is None:
+        cat = _needles(check.get("category_any"))
+    if cat and not any(
+        n in str(finding.get("category", "") or "").lower() for n in cat
+    ):
+        return False
+    desc = _needles(check.get("finding_description_any_contains"))
+    if desc is None:
+        desc = _needles(check.get("message_any_contains"))
+    if desc:
+        text = finding.get("description")
+        if text is None:
+            text = finding.get("message", "")
+        if not any(n in str(text or "").lower() for n in desc):
+            return False
+    file_any = _needles(check.get("finding_file_any"))
+    if file_any:
+        f = finding.get("file")
+        if f is None or not any(n in str(f).lower() for n in file_any):
+            return False
+    if check.get("finding_line"):
+        line = finding.get("line")
+        if isinstance(line, bool) or not isinstance(line, int):
+            return False
+    return True
+
+
+def _count_leads(run: ReviewRun, check: dict[str, Any]) -> int:
+    role_spec = check.get("role")
+    roles = (
+        role_spec
+        if isinstance(role_spec, list)
+        else [role_spec] if role_spec is not None
+        else list(SPECIALIST_ROLES)
+    )
+    leads_by_role = _run_leads_by_role(run)
+    count = 0
+    for role in roles:
+        for lead in leads_by_role.get(role, []):
+            if _lead_predicate_matches(lead, check):
+                count += 1
+    return count
+
+
+def _count_findings(run: ReviewRun, check: dict[str, Any]) -> int:
+    findings = run.findings if isinstance(run.findings, list) else []
+    return sum(
+        1
+        for f in findings
+        if isinstance(f, dict) and _finding_predicate_matches(f, check)
+    )
+
+
+def _within_bounds(count: int, minimum: Any, maximum: Any) -> bool:
+    min_ok = (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum <= count
+    )
+    max_ok = (
+        maximum is None
+        or (isinstance(maximum, int) and not isinstance(maximum, bool) and count <= maximum)
+    )
+    return min_ok and max_ok
+
+
+def evaluate_specialist_expectations(
+    run: ReviewRun, expectations: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Grade a run against a scenario's specialist_expectations.
+
+    The expectations carry two closed check groups:
+      lead_checks        — graded ONLY on deep runs (run.deep_review):
+                           deep-only diagnostics, never comparable against
+                           standard runs.
+      effectiveness_checks — graded on ALL runs (standard AND deep): the
+                           comparable A/B subset.
+
+    Returns None when no check applies to the run (e.g. a standard run whose
+    fixture declares only lead checks, or a scenario with no specialist
+    checks at all — so callers can skip specialist aggregation for ordinary
+    runs). Otherwise returns
+    {description, checks: [{id, type, scope, passed, detail}], passed,
+     effectiveness_passed, lead_passed}: `passed` is all evaluated checks;
+    `effectiveness_passed` / `lead_passed` are None when their group is empty
+    (a standard run never grades lead checks, so its lead_passed is None).
+    A run that errored fails every check.
+    """
+    if not expectations:
+        return None
+    lead_checks = expectations.get("lead_checks")
+    effectiveness_checks = expectations.get("effectiveness_checks")
+    if not isinstance(lead_checks, list):
+        lead_checks = []
+    if not isinstance(effectiveness_checks, list):
+        effectiveness_checks = []
+
+    # Lead checks are deep-only diagnostics: a standard run is graded on its
+    # effectiveness checks alone.
+    applicable = (
+        [(check, "lead") for check in lead_checks]
+        if run.deep_review
+        else []
+    ) + [(check, "effectiveness") for check in effectiveness_checks]
+    if not applicable:
+        return None
+
+    results: list[dict[str, Any]] = []
+
+    for check, scope in applicable:
+        ctype = check.get("type")
+        cid = check.get("id", ctype or "check")
+        passed = False
+        detail = ""
+
+        if run.error:
+            passed = False
+            detail = f"run errored: {run.error}"
+        elif ctype == "lead_generated":
+            count = _count_leads(run, check)
+            minimum = check.get("min", 1)
+            maximum = check.get("max")
+            passed = _within_bounds(count, minimum, maximum)
+            detail = f"{count} matching lead(s); min={minimum}, max={maximum}"
+        elif ctype == "lead_disposition":
+            disposition = check.get("disposition", "any")
+            lead_count = _count_leads(run, check)
+            if disposition not in ("verified", "rejected", "unused", "any", "not_adopted"):
+                passed = False
+                detail = f"unknown disposition: {disposition!r}"
+            elif disposition == "any":
+                passed = lead_count > 0
+                detail = (
+                    f"{lead_count} lead(s) generated; disposition=any"
+                    if lead_count > 0
+                    else "0 lead(s) generated; disposition=any"
+                )
+            elif disposition == "not_adopted":
+                # Passes when NO final finding matches the check's finding
+                # predicate, whether or not a lead was generated: if the
+                # specialist hallucinated an unsupported lead, the final
+                # reviewer must not publish a matching finding.
+                finding_count = _count_findings(run, check)
+                passed = finding_count == 0
+                detail = (
+                    f"{lead_count} matching lead(s), {finding_count} matching "
+                    f"finding(s); computed="
+                    f"{'not_adopted' if passed else 'adopted'}, expected=not_adopted"
+                )
+            elif disposition == "verified":
+                # "verified" demands concrete file evidence: the check must
+                # carry a non-empty finding_file_any and a matched finding
+                # must satisfy it (the finding predicate already applies it).
+                # A finding that merely repeats the lead's category/message
+                # without the file therefore computes as "rejected".
+                if not _needles(check.get("finding_file_any")):
+                    passed = False
+                    detail = "verified requires finding_file_any"
+                else:
+                    finding_count = _count_findings(run, check)
+                    if lead_count == 0:
+                        computed = "unused"
+                    elif finding_count > 0:
+                        computed = "verified"
+                    else:
+                        computed = "rejected"
+                    passed = computed == "verified"
+                    detail = (
+                        f"{lead_count} matching lead(s), {finding_count} matching "
+                        f"grounded finding(s); computed={computed}, expected=verified"
+                    )
+            else:
+                finding_count = _count_findings(run, check)
+                if lead_count == 0:
+                    computed = "unused"
+                elif finding_count > 0:
+                    computed = "verified"
+                else:
+                    computed = "rejected"
+                passed = computed == disposition
+                detail = (
+                    f"{lead_count} matching lead(s), {finding_count} matching "
+                    f"finding(s); computed={computed}, expected={disposition}"
+                )
+        elif ctype == "final_findings_count":
+            count = _count_findings(run, check)
+            minimum = check.get("min", 0)
+            maximum = check.get("max")
+            passed = _within_bounds(count, minimum, maximum)
+            detail = f"{count} matching finding(s); min={minimum}, max={maximum}"
+        elif ctype == "dedupe_final_findings":
+            count = _count_findings(run, check)
+            minimum = check.get("min", 0)
+            maximum = check.get("max", 1)
+            passed = _within_bounds(count, minimum, maximum)
+            detail = f"{count} matching finding(s); min={minimum}, max={maximum} (dedupe)"
+        else:
+            passed = False
+            detail = "unknown check type"
+
+        results.append({
+            "id": cid,
+            "type": ctype,
+            "scope": scope,
+            "passed": passed,
+            "detail": detail,
+        })
+
+    lead_results = [c for c in results if c["scope"] == "lead"]
+    effectiveness_results = [c for c in results if c["scope"] == "effectiveness"]
+
+    return {
+        "description": expectations.get("description", ""),
+        "checks": results,
+        "passed": all(c["passed"] for c in results),
+        "effectiveness_passed": (
+            all(c["passed"] for c in effectiveness_results)
+            if effectiveness_results
+            else None
+        ),
+        "lead_passed": (
+            all(c["passed"] for c in lead_results) if lead_results else None
+        ),
+    }
+
+
+def populate_tool_trace(run: ReviewRun, repo_path: Path) -> None:
+    """Read tool-harness.json (the run's PR_REVIEWER_RUN_DIR) into the ReviewRun.
+
+    The native_loop harness emits a `tool_calls` array ({tool, args, status});
+    older planner modes emit only `tool_results` (tool + status, no args), so
+    fall back to that. Either way the capability checker gets the trace it can
+    grade; absence of the file is silently fine (tools_off mode).
+    """
+    harness_file = repo_path / "tool-harness.json"
+    if not harness_file.exists():
+        return
+    try:
+        data = json.loads(harness_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    run.tool_stop_reason = data.get("stop_reason")
+    if isinstance(data.get("tool_calls"), list):
+        run.tool_calls = data["tool_calls"]
+    elif isinstance(data.get("tool_results"), list):
+        run.tool_calls = [
+            {"tool": r.get("tool"), "args": {}, "status": r.get("status")}
+            for r in data["tool_results"]
+            if isinstance(r, dict)
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Review execution
+# ---------------------------------------------------------------------------
+
+def run_label(mode: str, deep: bool, execution: str = "three_call") -> str:
+    """Label for a run in reports.
+
+    Deep variants are suffixed by their specialist execution shape (#635):
+    ``+deep`` (three_call, the production default), ``+deep-scout``
+    (combined_scout), or ``+deep-prime`` (prime_then_fanout)."""
+    if not deep:
+        return mode
+    return f"{mode}{deep_execution_label(execution)}"
+
+
+def _normalize_lead(lead: Any) -> dict[str, Any] | None:
+    """Coerce one raw lead into the normalized shape; None when unusable.
+
+    Keeps only dict entries; strings are coerced and defensively truncated
+    (category 64, file 512, message 2000 chars); a junk line degrades to None.
+    """
+    if not isinstance(lead, dict):
+        return None
+    file_val = lead.get("file")
+    if isinstance(file_val, str):
+        file_val = file_val[:512]
+    else:
+        file_val = None
+    line = lead.get("line")
+    if isinstance(line, bool) or not isinstance(line, int):
+        line = None
+    return {
+        "severity": str(lead.get("severity", "") or ""),
+        "category": str(lead.get("category", "") or "")[:64],
+        "file": file_val,
+        "line": line,
+        "message": str(lead.get("message", "") or "")[:2000],
+    }
+
+
+def _sum_role_usage(roles_out: list[dict[str, Any]], key: str) -> int:
+    """Sum one usage field across role entries; absent/malformed sums to 0."""
+    total = 0
+    for r in roles_out:
+        usage = r.get("usage")
+        if isinstance(usage, dict):
+            val = usage.get(key)
+            if isinstance(val, int) and not isinstance(val, bool):
+                total += val
+    return total
+
+
+def load_specialist_telemetry(workdir: Path) -> dict[str, Any] | None:
+    """Load the deep-review specialist artifacts from a run's workspace.
+
+    Never raises. Returns None only when NO specialist artifact exists at all
+    (no parseable specialists.json aggregate and no parseable per-role
+    specialist-<role>.json file). Malformed artifacts are tolerated: the
+    aggregate degrades to a derivation from the role files, and a single
+    bad role file simply contributes no leads.
+
+    When a parseable aggregate is present it is authoritative: a role
+    recorded with status "skipped" contributes no leads, even if a stale
+    specialist-<role>.json from a previous run in a reused workspace is
+    still on disk (#633). The legacy derivation is unchanged when the
+    aggregate is absent or malformed.
+
+    Normalized shape (identical keys in both paths):
+      {"enabled": bool, "aggregate_elapsed_sec": float | None,
+       "execution": str | None,              # #635 execution shape
+       "specialist_tokens_input": int,       # #635 actual transport totals
+       "specialist_tokens_output": int,      #   (aggregate usage_totals when
+       "specialist_tokens_cached": int,      #   present, else role sums)
+       "request_count": int | None,          # #635 actual wire attempts
+       "request_bytes_total": int | None,    # #635 serialized payload bytes
+       "total_leads": int, "any_errors": bool, "derived": bool,
+       "specialist_corpus_bytes": int | None,   # #632
+       "specialist_max_tokens": int | None,     # #632
+       "roles": [{"role", "status", "error_kind", "lead_count",
+                  "elapsed_sec", "usage"} ... one per SPECIALIST_ROLES],
+       "leads_by_role": {"<role>": [lead, ...]}}
+    """
+
+    def _read_json(path: Path) -> Any:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _num(val: Any) -> float | None:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        return float(val)
+
+    def _int(val: Any) -> int | None:
+        if isinstance(val, bool) or not isinstance(val, int):
+            return None
+        return val
+
+    def _norm_leads(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        leads: list[dict[str, Any]] = []
+        for lead in raw:
+            norm = _normalize_lead(lead)
+            if norm is not None:
+                leads.append(norm)
+        return leads
+
+    aggregate = _read_json(workdir / "specialists.json")
+    aggregate_ok = isinstance(aggregate, dict)
+
+    role_files: dict[str, dict[str, Any]] = {}
+    for role in SPECIALIST_ROLES:
+        data = _read_json(workdir / f"specialist-{role}.json")
+        if isinstance(data, dict):
+            role_files[role] = data
+
+    if not aggregate_ok and not role_files:
+        return None
+
+    leads_by_role = {
+        role: _norm_leads(role_files.get(role, {}).get("leads"))
+        for role in SPECIALIST_ROLES
+    }
+
+    if aggregate_ok:
+        # The current aggregate is authoritative (#633): a role recorded as
+        # "skipped" ran no pass in THIS run, so leads on disk for it are
+        # stale artifacts from a previous run in a reused workspace and must
+        # never leak into this run's telemetry or grading. A missing or
+        # malformed aggregate keeps the legacy derivation below untouched.
+        skipped_roles = {
+            r.get("role")
+            for r in (aggregate.get("roles") or [])
+            if isinstance(r, dict)
+            and r.get("role") in SPECIALIST_ROLES
+            and r.get("status") == "skipped"
+        }
+        for role in skipped_roles:
+            leads_by_role[role] = []
+
+        roles_out: list[dict[str, Any]] = []
+        for role in SPECIALIST_ROLES:
+            entry = next(
+                (
+                    r
+                    for r in (aggregate.get("roles") or [])
+                    if isinstance(r, dict) and r.get("role") == role
+                ),
+                None,
+            )
+            if entry is None:
+                roles_out.append({
+                    "role": role,
+                    "status": "ok",
+                    "error_kind": None,
+                    "lead_count": len(leads_by_role[role]),
+                    "elapsed_sec": 0.0,
+                    "usage": None,
+                })
+                continue
+            lead_count = _int(entry.get("lead_count"))
+            elapsed = _num(entry.get("elapsed_sec"))
+            status = entry.get("status")
+            error_kind = entry.get("error_kind")
+            usage = entry.get("usage")
+            roles_out.append({
+                "role": role,
+                "status": status if isinstance(status, str) else "ok",
+                "error_kind": error_kind if isinstance(error_kind, str) else None,
+                "lead_count": (
+                    lead_count if lead_count is not None
+                    else len(leads_by_role[role])
+                ),
+                "elapsed_sec": elapsed if elapsed is not None else 0.0,
+                "usage": usage if isinstance(usage, dict) else None,
+            })
+
+        enabled = aggregate.get("enabled")
+        total_leads = _int(aggregate.get("total_leads"))
+        any_errors = aggregate.get("any_errors")
+        if not isinstance(any_errors, bool):
+            any_errors = False
+            for r in aggregate.get("roles") or []:
+                if not isinstance(r, dict):
+                    continue
+                if r.get("status") != "ok":
+                    any_errors = True
+                    break
+                ec = r.get("errors_count")
+                if isinstance(ec, int) and not isinstance(ec, bool) and ec > 0:
+                    any_errors = True
+                    break
+
+        # #635: ACTUAL transport totals live on the aggregate (metered per
+        # wire attempt) — NEVER in a re-sum of role entries. In
+        # combined_scout mode the three roles share ONE call, so role-entry
+        # usage/bytes would multiply it by three. Role sums remain the
+        # fallback only for legacy aggregates that predate the meter.
+        usage_totals = aggregate.get("usage_totals")
+        request_count = _int(aggregate.get("request_count"))
+        request_bytes = _int(aggregate.get("request_bytes"))
+        if isinstance(usage_totals, dict):
+            tokens_in = _int_or_zero(usage_totals.get("prompt_tokens"))
+            tokens_out = _int_or_zero(usage_totals.get("completion_tokens"))
+            tokens_cached = _int_or_zero(usage_totals.get("cached_tokens"))
+        else:
+            tokens_in = _sum_role_usage(roles_out, "prompt_tokens")
+            tokens_out = _sum_role_usage(roles_out, "completion_tokens")
+            tokens_cached = _sum_role_usage(roles_out, "cached_tokens")
+
+        return {
+            "enabled": enabled if isinstance(enabled, bool) else True,
+            "aggregate_elapsed_sec": _num(aggregate.get("aggregate_elapsed_sec")),
+            # #635: which specialist execution shape ran (None = pre-#635
+            # aggregate without the field); token sums come from the
+            # aggregate's metered usage_totals when present (actual
+            # transport totals per request), falling back to role sums for
+            # legacy aggregates.
+            "execution": (
+                aggregate.get("execution")
+                if isinstance(aggregate.get("execution"), str)
+                else None
+            ),
+            "specialist_tokens_input": tokens_in,
+            "specialist_tokens_output": tokens_out,
+            "specialist_tokens_cached": tokens_cached,
+            "request_count": request_count,
+            "request_bytes_total": request_bytes,
+            "total_leads": (
+                total_leads if total_leads is not None
+                else sum(r["lead_count"] for r in roles_out)
+            ),
+            "any_errors": any_errors,
+            "derived": False,
+            "specialist_corpus_bytes": _int(aggregate.get("specialist_corpus_bytes")),
+            "specialist_max_tokens": _int(aggregate.get("specialist_max_tokens")),
+            "roles": roles_out,
+            "leads_by_role": leads_by_role,
+        }
+
+    # No usable aggregate: derive from the per-role files.
+    roles_out = []
+    any_errors = False
+    for role in SPECIALIST_ROLES:
+        data = role_files.get(role)
+        if data is None:
+            roles_out.append({
+                "role": role,
+                "status": "ok",
+                "error_kind": None,
+                "lead_count": 0,
+                "elapsed_sec": 0.0,
+                "usage": None,
+            })
+            continue
+        errors = data.get("errors")
+        has_errors = isinstance(errors, list) and len(errors) > 0
+        if has_errors:
+            any_errors = True
+        roles_out.append({
+            "role": role,
+            "status": "error" if has_errors else "ok",
+            "error_kind": "role_errors" if has_errors else None,
+            "lead_count": len(leads_by_role[role]),
+            "elapsed_sec": 0.0,
+            "usage": None,
+        })
+
+    return {
+        "enabled": True,
+        "aggregate_elapsed_sec": None,
+        "execution": None,
+        "specialist_tokens_input": _sum_role_usage(roles_out, "prompt_tokens"),
+        "specialist_tokens_output": _sum_role_usage(roles_out, "completion_tokens"),
+        "specialist_tokens_cached": _sum_role_usage(roles_out, "cached_tokens"),
+        "request_count": None,
+        "request_bytes_total": None,
+        "total_leads": sum(len(v) for v in leads_by_role.values()),
+        "any_errors": any_errors,
+        "derived": True,
+        "specialist_corpus_bytes": None,
+        "specialist_max_tokens": None,
+        "roles": roles_out,
+        "leads_by_role": leads_by_role,
+    }
+
+
+def _read_json_soft(path: Path) -> Any:
+    """json.loads that degrades to None on missing/malformed files."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _int_or_zero(value: Any) -> int:
+    """Coerce a token-usage value to int; 0 when absent/malformed."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+    return 0
+
+
+def _normalize_harness_finding(item: Any) -> dict[str, Any] | None:
+    """Coerce one raw ai-output.json finding to the production shape.
+
+    Keeps exactly the five production keys (severity / category / file /
+    line / message — there is NO 'description' key); non-dict entries
+    degrade to None and junk values degrade field-by-field the way
+    the runtime's verdict parser does (bool/float/str line junk -> None).
+    """
+    if not isinstance(item, dict):
+        return None
+    file_val = item.get("file")
+    if isinstance(file_val, str):
+        file_val = file_val.strip() or None
+    else:
+        file_val = None
+    raw_line = item.get("line")
+    line: int | None = None
+    if not isinstance(raw_line, bool):
+        if isinstance(raw_line, int) and raw_line > 0:
+            line = raw_line
+        elif isinstance(raw_line, float) and raw_line.is_integer() and raw_line > 0:
+            line = int(raw_line)
+        elif isinstance(raw_line, str) and raw_line.strip().isdigit():
+            line = int(raw_line.strip())
+    return {
+        "severity": str(item.get("severity") or "").strip(),
+        "category": str(item.get("category") or "").strip(),
+        "file": file_val,
+        "line": line,
+        "message": str(item.get("message") or "").strip(),
+    }
+
+
+def _load_review_artifact_findings(path: Path) -> list[dict[str, Any]]:
+    payload = _read_json_soft(path)
+    if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+        return []
+    findings: list[dict[str, Any]] = []
+    for item in payload["findings"]:
+        finding = _normalize_harness_finding(item)
+        if finding is not None:
+            finding["stage"] = "primary"
+            findings.append(finding)
+    return findings
+
+
+def populate_review_output(run: ReviewRun, repo_path: Path) -> None:
+    """Read a run's review artifacts into the ReviewRun. Never raises.
+
+    The validated review artifact is ai-output.json in the run's private
+    artifact directory (PR_REVIEWER_RUN_DIR) — verdict.json is not a pipeline output. A missing or
+    malformed ai-output.json leaves the run's fields at their defaults.
+    Findings are normalized to the production five-key shape. The model
+    string comes from analysis_engine.txt; token usage from the first
+    ai-response.<tier>.json carrying a `usage` object, preferring the tier
+    that matches the analysis_engine marker (a string containing
+    'escalated' or 'smart' -> smart first, 'fallback' -> fallback first,
+    else primary first) and falling through the remaining tiers fail-soft.
+    """
+    try:
+        payload = _read_json_soft(repo_path / "ai-output.json")
+        if isinstance(payload, dict):
+            run.verdict = payload.get("verdict")
+            markdown = payload.get("review_markdown", "")
+            run.review_markdown = (
+                markdown if isinstance(markdown, str) else str(markdown)
+            )
+            raw_findings = payload.get("findings")
+            findings: list[dict[str, Any]] = []
+            if isinstance(raw_findings, list):
+                for item in raw_findings:
+                    norm = _normalize_harness_finding(item)
+                    if norm is not None:
+                        findings.append(norm)
+            run.findings = findings
+            if "verdict_source" in payload:
+                vs = payload["verdict_source"]
+                run.verdict_source = vs if isinstance(vs, str) else None
+
+
+        model_text = ""
+        try:
+            model_text = (
+                repo_path / "analysis_engine.txt"
+            ).read_text(encoding="utf-8").strip()
+        except OSError:
+            model_text = ""
+        if model_text:
+            run.model_used = model_text
+
+        marker = model_text.lower()
+        tier = "primary"
+        if "escalated" in marker or "smart" in marker:
+            tier = "smart"
+        elif "fallback" in marker:
+            tier = "fallback"
+        order = [tier] + [t for t in ("smart", "fallback", "primary") if t != tier]
+        for name in order:
+            data = _read_json_soft(repo_path / f"ai-response.{name}.json")
+            if not isinstance(data, dict):
+                continue
+            usage = data.get("usage")
+            if not isinstance(usage, dict):
+                continue
+
+            def _pick(mapping: dict[str, Any], *keys: str) -> Any:
+                for key in keys:
+                    if key in mapping:
+                        return mapping[key]
+                return None
+
+            run.tokens_input = _int_or_zero(
+                _pick(usage, "prompt_tokens", "input_tokens")
+            )
+            run.tokens_output = _int_or_zero(
+                _pick(usage, "completion_tokens", "output_tokens")
+            )
+            break
+    except Exception:
+        return
+
+
+def _load_semantic_fixture(corpus: SemanticCorpus, fixture_ref: dict[str, Any]) -> tuple[dict[str, Any], Path]:
+    if corpus.fixture_root is None:
+        raise ValueError("semantic fixture root is unavailable")
+    fixture_name = fixture_ref.get("path")
+    fixture_hash = fixture_ref.get("sha256")
+    if not _safe_relative_path(fixture_name):
+        raise ValueError(f"semantic fixture path is unsafe: {fixture_name}")
+    if not isinstance(fixture_hash, str) or re.fullmatch(r"[0-9a-f]{64}", fixture_hash) is None:
+        raise ValueError("semantic fixture sha256 must be 64 lowercase hexadecimal characters")
+    fixture_path = (corpus.fixture_root / fixture_name).resolve()
+    if corpus.fixture_root.resolve() not in fixture_path.parents:
+        raise ValueError(f"semantic fixture escapes corpus root: {fixture_name}")
+    raw = fixture_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != fixture_hash:
+        raise ValueError(f"semantic fixture hash mismatch for {fixture_path}")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"semantic fixture must be an object: {fixture_path}")
+    return data, fixture_path
+
+
+def _review_timeout_sec() -> int:
+    """Per-review wall clock (EVAL_REVIEW_TIMEOUT_SEC, default 1200s). Slow
+    local models need longer; a timed-out run is scored as an error, which
+    silently drops the longest reviews from an A/B (#840: 300s dropped every
+    early native_loop+deep-review run against a hosted model in the #796
+    launch, so the default now covers a production-default review)."""
+    try:
+        return max(30, int(os.getenv("EVAL_REVIEW_TIMEOUT_SEC", "1200")))
+    except ValueError:
+        return 1200
+
+
+def _fixture_pr_object(pr_json: dict[str, Any], repo_full_name: str | None) -> dict[str, Any]:
+    """Give a fixture PR object the head/base repo identity it usually omits.
+
+    `derive_is_fork_pr` fails closed on a missing head repo, so a fixture
+    without one was reviewed as a fork and the tool loop was skipped: every
+    native_loop run over the semantic corpus silently ran tools-off. Default
+    both sides to the scenario's own repository (the dogfood fixtures are
+    same-repo PRs); a fixture that states its head or base keeps it.
+    """
+    if not repo_full_name:
+        return pr_json
+    pr = dict(pr_json)
+    for side in ("head", "base"):
+        ref = dict(pr.get(side) or {})
+        repo = dict(ref.get("repo") or {})
+        repo.setdefault("full_name", repo_full_name)
+        ref["repo"] = repo
+        pr[side] = ref
+    return pr
+
+
+def _materialize_semantic_fixture(
+    repo_path: Path,
+    fixture: dict[str, Any],
+    repo_full_name: str | None = None,
+) -> str:
+    repo_path.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "-C", str(repo_path), "init"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo_path), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo_path), "config", "user.email", "eval@test"], check=True, env=env)
+    subprocess.run(["git", "-C", str(repo_path), "config", "user.name", "semantic-eval"], check=True, env=env)
+    for entry in fixture.get("files", []):
+        relative_name = entry["path"]
+        if not _safe_relative_path(relative_name):
+            raise ValueError(f"semantic fixture path is unsafe: {relative_name}")
+        relative = Path(str(relative_name))
+        destination = repo_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(str(entry["content"]), encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_path), "add", "."], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo_path), "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-m", "materialize semantic fixture"], check=True, capture_output=True, env=env)
+    api_root = repo_path / ".semantic-fixture"
+    api_root.mkdir()
+    (api_root / "pr.json").write_text(
+        json.dumps(_fixture_pr_object(fixture["pr_json"], repo_full_name)), encoding="utf-8"
+    )
+    (api_root / "diff").write_text(str(fixture["diff"]), encoding="utf-8")
+    (api_root / "files.json").write_text(json.dumps(fixture["pr_files"]), encoding="utf-8")
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    return result.stdout.strip()
+
+
+def _checkout_pr_head(repo_path: Path, pr_number: int) -> tuple[bool, str | None, str]:
+    """Fetch refs/pull/<pr>/head from origin and detach onto it.
+
+    Returns (ok, commit_sha, error). Never leaves the run silently on the
+    default branch: any fetch/checkout/rev-parse failure yields ok=False
+    with a human-readable error and commit_sha None (or the partial value).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_path), "fetch", "--no-tags", "--force",
+                "origin", f"+refs/pull/{pr_number}/head:refs/pull/{pr_number}/head",
+            ],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if result.returncode != 0:
+            return (
+                False, None,
+                f"fetch refs/pull/{pr_number}/head failed (exit "
+                f"{result.returncode}): {result.stderr[:300]}",
+            )
+
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_path), "checkout",
+                "--force", "--detach", "FETCH_HEAD",
+            ],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if result.returncode != 0:
+            return (
+                False, None,
+                f"checkout PR head failed (exit {result.returncode}): "
+                f"{result.stderr[:300]}",
+            )
+
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        sha = result.stdout.strip()
+        if result.returncode != 0 or not sha:
+            return (False, None, "could not resolve checked-out HEAD")
+
+        return (True, sha, "")
+    except subprocess.TimeoutExpired:
+        return (
+            False, None,
+            "git timed out while materializing the PR head",
+        )
+
+
+_GIT_STATUS_KIND = {"A": "added", "M": "modified", "D": "removed", "R": "renamed", "C": "copied", "T": "changed"}
+
+
+def _files_from_pinned_diff(repo_path: Path, base_sha: str, head_sha: str) -> str | None:
+    """Derive the ``pr-files.json`` projection's raw shape from ``base...head``.
+
+    Zips ``--numstat`` (per-file additions/deletions) with ``--name-status``
+    (per-file status, and old/new paths for renames): both are computed with
+    the same ``-M`` diff and so list files in the same order. Returns ``None``
+    on any git failure or shape mismatch rather than guess at a manifest.
+    """
+    numstat = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", "--numstat", "-M", f"{base_sha}...{head_sha}"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    name_status = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", "--name-status", "-M", f"{base_sha}...{head_sha}"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if numstat.returncode != 0 or name_status.returncode != 0:
+        return None
+    numstat_lines = [line for line in numstat.stdout.split("\n") if line]
+    status_lines = [line for line in name_status.stdout.split("\n") if line]
+    if len(numstat_lines) != len(status_lines):
+        return None
+    entries = []
+    for num_line, status_line in zip(numstat_lines, status_lines):
+        num_parts = num_line.split("\t")
+        status_parts = status_line.split("\t")
+        if len(num_parts) != 3 or len(status_parts) < 2:
+            return None
+        added_raw, deleted_raw, _path_field = num_parts
+        kind = _GIT_STATUS_KIND.get(status_parts[0][0], "changed")
+        previous_filename = None
+        if kind in ("renamed", "copied") and len(status_parts) == 3:
+            previous_filename, filename = status_parts[1], status_parts[2]
+        else:
+            filename = status_parts[-1]
+        additions = None if added_raw == "-" else int(added_raw)
+        deletions = None if deleted_raw == "-" else int(deleted_raw)
+        changes = None if additions is None or deletions is None else additions + deletions
+        entries.append({
+            "filename": filename,
+            "status": kind,
+            "additions": additions,
+            "deletions": deletions,
+            "changes": changes,
+            "previous_filename": previous_filename,
+        })
+    return json.dumps(entries)
+
+
+def _prepare_pinned_workspace(
+    repo_path: Path, artifact_dir: Path, head_sha: str, base_sha: str | None = None,
+) -> tuple[bool, str]:
+    """Reset a reused clone, and seed the pinned diff outside it (#838).
+
+    The clone is shared by every scenario of a repo, so a stale untracked
+    file from a previous scenario must never linger; this removes every
+    untracked/ignored file from ``repo_path`` first. When ``base_sha`` is
+    given, it then writes ``pr.diff`` as ``base...head`` — so the review sees
+    the diff as it was at that head rather than the PR's current state — and
+    ``pr-files.seed.json`` with that same diff's file manifest — so the
+    runtime's file list and size totals match the diff instead of the PR's
+    live, possibly-since-changed file list. Both are written to
+    ``artifact_dir`` (the run's private ``PR_REVIEWER_RUN_DIR``), never into
+    ``repo_path``: the reviewed checkout must never be able to seed its own
+    review artifacts. The manifest is part of the pinned replay's identity,
+    not best-effort: a manifest derivation failure fails the whole prepare,
+    exactly like a diff failure, rather than leaving the review to fall back
+    to the live file list. Returns (ok, error).
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "clean", "-ffdxq"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if result.returncode != 0:
+        return False, f"git clean failed: {result.stderr[:300]}"
+    if not base_sha:
+        return True, ""
+    if subprocess.run(
+        ["git", "-C", str(repo_path), "cat-file", "-e", f"{base_sha}^{{commit}}"],
+        capture_output=True, check=False,
+    ).returncode != 0:
+        subprocess.run(
+            ["git", "-C", str(repo_path), "fetch", "--no-tags", "origin", base_sha],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", f"{base_sha}...{head_sha}"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return False, f"diff {base_sha[:12]}...{head_sha[:12]} failed: {result.stderr[:300]}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "pr.diff").write_text(result.stdout, encoding="utf-8")
+    files_json = _files_from_pinned_diff(repo_path, base_sha, head_sha)
+    if files_json is None:
+        return False, f"file manifest {base_sha[:12]}...{head_sha[:12]} could not be derived"
+    (artifact_dir / "pr-files.seed.json").write_text(files_json, encoding="utf-8")
+    return True, ""
+
+
+def _checkout_pinned_commit(
+    repo_path: Path, commit_sha: str, pr_number: int | None = None,
+) -> tuple[bool, str | None, str]:
+    """Checkout an exact commit, verifying the checkout landed on it.
+
+    Real-PR corpus entries (#779) pin the exact head SHA a scenario was
+    authored against, so a repository history change since (a force-push,
+    an unlikely PR-number reuse) can never silently swap in a different
+    revision. Tries the cheap ``refs/pull/<pr>/head`` fetch first (GitHub
+    retains PR refs indefinitely, even long after merge) and accepts it only
+    when the resolved SHA matches ``commit_sha`` exactly; otherwise falls
+    back to fetching the commit SHA directly and checking that out. Returns
+    (ok, commit_sha, error) like ``_checkout_pr_head`` — ok is False (never
+    silently on the wrong commit) unless the checked-out HEAD equals
+    ``commit_sha``.
+    """
+    if pr_number is not None:
+        ok, sha, _err = _checkout_pr_head(repo_path, pr_number)
+        if ok and sha == commit_sha:
+            return True, sha, ""
+
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_path), "fetch", "--no-tags", "--force",
+                "origin", commit_sha,
+            ],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if result.returncode != 0:
+            return (
+                False, None,
+                f"fetch of pinned commit {commit_sha} failed (exit "
+                f"{result.returncode}): {result.stderr[:300]}",
+            )
+
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_path), "checkout",
+                "--force", "--detach", commit_sha,
+            ],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if result.returncode != 0:
+            return (
+                False, None,
+                f"checkout of pinned commit {commit_sha} failed (exit "
+                f"{result.returncode}): {result.stderr[:300]}",
+            )
+
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        sha = result.stdout.strip()
+        if result.returncode != 0 or not sha:
+            return (False, None, "could not resolve checked-out HEAD")
+        if sha != commit_sha:
+            return (
+                False, None,
+                f"checked-out HEAD {sha} does not match pinned commit {commit_sha}",
+            )
+
+        return (True, sha, "")
+    except subprocess.TimeoutExpired:
+        return (
+            False, None,
+            "git timed out while materializing the pinned commit",
+        )
+
+
+# The built runtime bundle the default (no review_script) execution invokes.
+# Module-level so tests can point it at a placeholder without touching the
+# real dist/ on disk.
+RUNTIME_ENTRYPOINT = Path(__file__).resolve().parent.parent / "dist" / "index.js"
+
+
+def run_review_for_pr(
+    pr_entry: dict[str, Any],
+    mode: str,
+    work_dir: Path,
+    model_config: dict[str, str],
+    deep_review: bool = False,
+    review_script: Path | None = None,
+    deep_execution: str = "three_call",
+    claim_falsification: bool = False,
+    requirement_trace: bool = False,
+) -> ReviewRun:
+    """Execute one review mode for a single PR.
+
+    This is the integration point with the actual review pipeline. Normal
+    benchmark entries materialize the corpus PR's exact head revision
+    (refs/pull/<PR>/head, fetched from the clone's origin and checked out
+    detached). Semantic fixture entries instead build a fresh local Git
+    repository from the immutable fixture and provide fixture-backed platform
+    responses, so they never fetch a live PR head. The orchestrator's
+    GITHUB_WORKSPACE is pinned to the run's repo clone, because the
+    production helpers resolve their workspace from it, never from cwd.
+    Its artifacts (pinned pr.diff/pr-files.seed.json in, ai-output.json/
+    review-corpus.md/tool-harness.json/etc. out) live in a separate, fresh
+    directory the harness passes as PR_REVIEWER_RUN_DIR (#838) — the
+    reviewed checkout is never treated as this run's own artifact store.
+
+    Args:
+        pr_entry: Corpus entry for one PR (with url, number, repo_full_name).
+          Semantic entries may carry the private `_semantic_fixture` tuple.
+        mode: One of "tools_off", "native_loop".
+        work_dir: Working directory for this run's artifacts.
+        model_config: Model configuration (base_url, model, api_key, etc.).
+        deep_review: When True, run the deep-review specialist phase
+            (DEEP_REVIEW=true) and collect specialist telemetry into
+            run.specialists. The run's mode is labelled via run_label.
+        review_script: Orchestrator command to execute, verbatim. When None
+            (default) the built TypeScript runtime bundle next to this
+            harness (`node dist/index.js run`) is invoked. Test seam for
+            substituting a fake orchestrator script.
+        deep_execution: Specialist execution shape for deep runs (#635):
+            "three_call" (production default), "combined_scout", or
+            "prime_then_fanout". Forwarded as DEEP_REVIEW_EXECUTION and
+            reflected in the run label; ignored when deep_review is False.
+        claim_falsification: When True, exports CLAIM_FALSIFICATION=true so
+            the runtime's opt-in claim falsification pre-pass (#785) runs.
+            The A/B knob for the pre-v3-measurement gate on that feature;
+            recorded in the report metadata, not the per-run label.
+        requirement_trace: #874 A/B knob. Forwarded as REQUIREMENT_TRACE=true
+            when set (the input defaults to false in production, so a plain
+            run forwards nothing).
+
+    Returns:
+        ReviewRun with collected metrics.
+    """
+    pr_number = pr_entry["number"]
+    repo_full_name = pr_entry["repo_full_name"]
+    semantic_fixture = pr_entry.get("_semantic_fixture")
+
+    run = ReviewRun(
+        mode=run_label(mode, deep_review, deep_execution),
+        pr_number=pr_number,
+        repo_full_name=repo_full_name,
+        deep_review=deep_review,
+    )
+
+    try:
+        start = time.monotonic()
+
+        # Determine tool_mode argument for the runtime invocation
+        if mode == "tools_off":
+            tool_mode_arg = ""
+        elif mode == "native_loop":
+            tool_mode_arg = "native_loop"
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # Build the review corpus and run the review
+        if semantic_fixture is not None:
+            repo_path = Path(tempfile.mkdtemp(prefix=f"semantic-{pr_number}-", dir=work_dir))
+            fixture_data = semantic_fixture[0]
+            run.commit_sha = _materialize_semantic_fixture(
+                repo_path, fixture_data, pr_entry.get("repo_full_name")
+            )
+        else:
+            repo_path = work_dir / repo_full_name.replace("/", "-")
+            if not repo_path.exists():
+                subprocess.run(
+                    ["git", "clone", f"https://github.com/{repo_full_name}.git", str(repo_path)],
+                    check=False,
+                    capture_output=True,
+                )
+            if not repo_path.exists():
+                run.error = f"Repo {repo_full_name} not available locally"
+                return run
+
+        # #838: every artifact this run's review produces or is seeded with
+        # (the pinned pr.diff/pr-files.seed.json below, and everything the
+        # runtime itself writes) lives in a private directory outside the
+        # checkout, fresh per invocation — never repo_path, which a corpus
+        # entry's own commits could otherwise seed to control what the
+        # reviewer sees.
+        run_dir = Path(tempfile.mkdtemp(prefix=f"artifacts-{pr_number}-", dir=work_dir))
+        run.run_dir = run_dir
+
+        # Materialize the corpus PR's exact head revision (detached) before
+        # any context is read: a cloned/reused repo_path sits on the
+        # default branch until we check the PR head out, and every
+        # filesystem-based context (repo map, related-code, native
+        # read_file/git_grep, tree exploration, specialist verification)
+        # would otherwise come from the current default-branch tree.
+        if semantic_fixture is None:
+            pinned_sha = pr_entry.get("head_sha")
+            if pinned_sha:
+                ok, sha, err = _checkout_pinned_commit(repo_path, pinned_sha, pr_number)
+            else:
+                ok, sha, err = _checkout_pr_head(repo_path, pr_number)
+            if ok:
+                ok, err = _prepare_pinned_workspace(repo_path, run_dir, sha, pr_entry.get("base_sha"))
+            if not ok:
+                run.error = f"PR head not materialized: {err}"
+                run.wall_clock_sec = time.monotonic() - start
+                return run
+            run.commit_sha = sha
+
+        # Drop stale run artifacts so a reused run_dir can never present a
+        # prior run's verdict/tool trace/specialists as this run's. run_dir is
+        # freshly created above, so this is defensive (never a no-op today),
+        # not load-bearing.
+        stale_artifacts = (
+            [
+                "ai-output.json", "ai-output.primary.json",
+                "ai-response.primary.json", "ai-response.fallback.json",
+                "ai-response.smart.json",
+                "analysis_engine.txt",
+                "tool-harness.json", "specialists.json", "eval-harness-output.txt",
+                "specialist-scout.json", "specialist-scout.request.json",
+                "specialist-scout.response.json",
+            ]
+            + [
+                f"specialist-{role}.{suffix}"
+                for role in SPECIALIST_ROLES
+                for suffix in ("json", "request.json", "response.json")
+            ]
+        )
+        for name in stale_artifacts:
+            (run_dir / name).unlink(missing_ok=True)
+
+        # Set environment for the review run. REPO + PR_NUMBER are required
+        # by the runtime's env validation (it exits without them); AI_* are
+        # the model endpoint.
+        env = os.environ.copy()
+        python_dir = str(Path(sys.executable).resolve().parent)
+        env["PATH"] = python_dir + os.pathsep + env.get("PATH", "")
+        env["GITHUB_TOKEN"] = model_config.get("github_token", "")
+        env["REPO"] = pr_entry["repo_full_name"]
+        env["PR_NUMBER"] = str(pr_number)
+        env["AI_BASE_URL"] = model_config.get("base_url", "")
+        env["AI_MODEL"] = model_config.get("model", "")
+        env["AI_API_KEY"] = model_config.get("api_key", "")
+        # #757 A/B arm override: replace-mode prompt substitution, verbatim
+        # (config.sh applies no bundled default and no fragment substitution
+        # in replace mode), so both arms run the same corpus through the same
+        # pipeline with only the prompt text differing.
+        if model_config.get("system_prompt_file"):
+            env["SYSTEM_PROMPT_FILE"] = model_config["system_prompt_file"]
+            env["SYSTEM_PROMPT_MODE"] = "replace"
+        if model_config.get("system_prompt"):
+            env["SYSTEM_PROMPT"] = model_config["system_prompt"]
+            # Force replace like the file arm: an ambient SYSTEM_PROMPT_MODE=append
+            # must not silently turn the pinned arm into an addendum on top of the
+            # bundled default (that would dilute the A/B arm).
+            env["SYSTEM_PROMPT_MODE"] = "replace"
+        # Production helpers prefer GITHUB_WORKSPACE over cwd: pin it to this
+        # run's temp clone so an ambient Actions value cannot steer the
+        # orchestrator at the workflow checkout.
+        env["GITHUB_WORKSPACE"] = str(repo_path)
+        # #838: the runtime's own artifact directory, explicit and private —
+        # never left to default to GITHUB_WORKSPACE/cwd (the checkout).
+        env["PR_REVIEWER_RUN_DIR"] = str(run_dir)
+        env["GITHUB_OUTPUT"] = str(run_dir / "eval-harness-output.txt")
+        if semantic_fixture is not None:
+            env["SEMANTIC_FIXTURE_DIR"] = str(repo_path)
+            env["SEMANTIC_FIXTURE_MODE"] = "true"
+            env["FORCE_REVIEW"] = "true"
+            env["SKIP_IF_DIFF_UNCHANGED"] = "false"
+        if tool_mode_arg:
+            env["TOOL_MODE"] = tool_mode_arg
+        if deep_review:
+            env["DEEP_REVIEW"] = "true"
+            # #635 benchmark execution shape; the default is the production
+            # architecture, so a plain deep run forwards nothing.
+            if deep_execution != "three_call":
+                env["DEEP_REVIEW_EXECUTION"] = deep_execution
+            else:
+                env.pop("DEEP_REVIEW_EXECUTION", None)
+        else:
+            env.pop("DEEP_REVIEW", None)
+            env.pop("DEEP_REVIEW_EXECUTION", None)
+        # #785 A/B: the contract input projects to this exact env key
+        # (src/run/env.ts stageEnvFromConfig: `claim-falsification` ->
+        # `CLAIM_FALSIFICATION`); only "true" enables the pre-pass, matching
+        # the runtime's own case-insensitive gate (review.ts lowercases the
+        # value before comparing).
+        if claim_falsification:
+            env["CLAIM_FALSIFICATION"] = "true"
+        else:
+            env.pop("CLAIM_FALSIFICATION", None)
+        # #874 A/B: same pattern for the requirement-trace arm.
+        if requirement_trace:
+            env["REQUIREMENT_TRACE"] = "true"
+        else:
+            env.pop("REQUIREMENT_TRACE", None)
+        env.update(model_config.get("extra_env") or {})
+
+        # Run the review through the TypeScript runtime (the v3 `run`
+        # entrypoint: same env contract, same artifact names in run_dir).
+        # By default that is the built bundle next to this harness
+        # (resolved relative to this script, so the harness is not pinned
+        # to one machine's checkout path); `review_script` is the test seam
+        # that substitutes a fake orchestrator and is used verbatim when
+        # provided.
+        command: list[str] | None = None
+        if review_script is None:
+            entrypoint = RUNTIME_ENTRYPOINT
+            node = shutil.which("node")
+            if node is None:
+                run.error = "node not found on PATH; the review runtime requires Node"
+            elif not entrypoint.is_file():
+                run.error = f"review runtime bundle not found at {entrypoint} (run `npm run build`)"
+            else:
+                command = [node, str(entrypoint), "run"]
+        elif review_script.exists():
+            command = [str(review_script)]
+        else:
+            run.error = f"orchestrator script not found at {review_script}"
+
+        if command is not None:
+            result = subprocess.run(
+                command,
+                cwd=str(repo_path),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_review_timeout_sec(),
+            )
+            run.wall_clock_sec = time.monotonic() - start
+
+            # Parse outputs. The validated review artifact is ai-output.json
+            # in the run's private artifact directory (PR_REVIEWER_RUN_DIR),
+            # not verdict.json and never repo_path.
+            if result.returncode == 0:
+                populate_review_output(run, run_dir)
+                run.primary_findings = _load_review_artifact_findings(run_dir / "ai-output.primary.json")
+                if not run.review_markdown:
+                    run.review_markdown = result.stdout[:2000] if result.stdout else ""
+
+                populate_tool_trace(run, run_dir)
+                output_lines: dict[str, str] = {}
+                try:
+                    for line in (run_dir / "eval-harness-output.txt").read_text(encoding="utf-8").splitlines():
+                        key, separator, value = line.partition("=")
+                        if separator:
+                            output_lines[key] = value
+                except OSError:
+                    # eval-harness-output.txt is optional; a missing file just skips route/stage inference.
+                    output_lines.clear()
+                # The runtime writes kebab-case output keys; the v2
+                # orchestrator's snake_case form stays a fallback.
+                route = output_lines.get("review-route", output_lines.get("review_route", "")).strip()
+                if route:
+                    run.route = route
+                if run.route == "escalated":
+                    run.stage = "escalation"
+                elif run.route in {"primary", "fast", "smart", "legacy"}:
+                    run.stage = "primary"
+                else:
+                    run.stage = "unknown"
+                if deep_review:
+                    run.specialists = load_specialist_telemetry(run_dir)
+                    if run.specialists:
+                        run.specialist_leads = [
+                            lead
+                            for leads in run.specialists.get("leads_by_role", {}).values()
+                            for lead in leads
+                            if isinstance(lead, dict)
+                        ]
+            else:
+                run.error = f"Review failed (exit {result.returncode}): {result.stderr[:500]}"
+
+    except subprocess.TimeoutExpired:
+        run.wall_clock_sec = time.monotonic() - start
+        run.error = f"Review timed out after {_review_timeout_sec()}s"
+        run.timed_out = True
+    except Exception as exc:
+        run.wall_clock_sec = time.monotonic() - start
+        run.error = f"Review error: {exc}"
+
+    return run
+
+
+def _live_duplicate_count(run: ReviewRun) -> int:
+    seen: set[tuple[str, str, str, str]] = set()
+    duplicates = 0
+    for finding in run.findings:
+        if not isinstance(finding, dict):
+            continue
+        key = (
+            str(finding.get("category") or "").casefold(),
+            str(finding.get("severity") or "").casefold(),
+            str(finding.get("file") or "").casefold(),
+            str(finding.get("message") or finding.get("description") or "").casefold(),
+        )
+        if key in seen:
+            duplicates += 1
+        else:
+            seen.add(key)
+    return duplicates
+
+
+def _cross_role_lead_overlap(run: ReviewRun) -> int:
+    """Lead-overlap metric between specialist roles (#635).
+
+    Counts leads whose casefolded (category, file, message) key was already
+    seen from a DIFFERENT role — i.e. duplicate work across lanes. Same-role
+    repeats do not count (the normalizer already exact-dedupes within a
+    role); a key seen in two roles counts once per extra role occurrence.
+    """
+    leads_by_role = _run_leads_by_role(run)
+    seen: dict[tuple[str, str, str], set[str]] = {}
+    overlap = 0
+    for role in SPECIALIST_ROLES:
+        for lead in leads_by_role.get(role, []):
+            key = (
+                str(lead.get("category") or "").casefold(),
+                str(lead.get("file") or "").casefold(),
+                str(lead.get("message") or "").casefold(),
+            )
+            roles_seen = seen.setdefault(key, set())
+            if roles_seen and role not in roles_seen:
+                overlap += 1
+            roles_seen.add(role)
+    return overlap
+
+
+def evaluate_live_semantics(
+    corpus: SemanticCorpus | None,
+    results: list[BenchmarkResult],
+) -> dict[str, Any] | None:
+    if corpus is None:
+        return None
+    validate_semantic_corpus(corpus)
+    by_key: dict[tuple[str, int], list[ReviewRun]] = {}
+    for benchmark in results:
+        by_key[(benchmark.repo_full_name, benchmark.pr_number)] = benchmark.runs
+    scenario_reports: list[dict[str, Any]] = []
+    for scenario in corpus.scenarios:
+        # Semantic scenarios can share historical PR provenance but each owns a
+        # distinct reconstructed fixture and therefore its own benchmark run.
+        runs = by_key.get((scenario.repo_full_name, scenario.number), [])
+        per_run: list[SemanticResult] = []
+        for run in runs:
+            expected_mode = scenario.review_mode
+            # Deep labels: "+deep" plus the #635 execution suffixes
+            # (+deep-scout / +deep-prime).
+            actual_mode = (
+                "deep"
+                if "+deep" in run.mode or run.mode == "deep"
+                else "standard"
+            )
+            if expected_mode != "any" and actual_mode != expected_mode:
+                continue
+            signals = _collect_signals_from_run(run)
+            metadata = {
+                "mode": run.mode,
+                "route": run.route,
+                "stage": run.stage,
+                "escalated": run.route in {"escalated", "escalation"} or run.stage == "escalation",
+                "tool_call_count": len(run.tool_calls),
+                "duplicate_count": _live_duplicate_count(run),
+                "latency_sec": run.wall_clock_sec,
+            }
+            per_run.append(evaluate_semantic_run(scenario, signals, metadata))
+        aggregate = aggregate_semantic_runs(scenario, per_run)
+        aggregate["evaluation_missing"] = not per_run
+        aggregate["provenance"] = scenario.provenance
+        aggregate["class"] = scenario.klass
+        aggregate["negative_control"] = scenario.negative_control
+        aggregate["diff_polarity"] = scenario.diff_polarity
+        aggregate["review_mode"] = scenario.review_mode
+        aggregate["route_expected"] = scenario.route
+        aggregate["stage_attribution_expected"] = scenario.stage_attribution
+        aggregate["attribution_rates"] = {
+            stage: round(sum(stage in result.stages_hit for result in per_run) / len(per_run), 4) if per_run else 0.0
+            for stage in ("specialist", "primary", "escalation")
+        }
+        aggregate["per_run"] = [result.to_dict() for result in per_run]
+        scenario_reports.append(aggregate)
+    scored = [item for item in scenario_reports if item["runs"]]
+    negative_controls = [item for item in scenario_reports if item["negative_control"]]
+    incomplete_scenarios = [
+        {"scenario_number": item["scenario_number"], "reason": "no applicable runs after mode filtering"}
+        for item in scenario_reports
+        if item["evaluation_missing"]
+    ]
+    return {
+        "evaluator_version": SEMANTIC_EVAL_VERSION,
+        "corpus_version": corpus.version,
+        "metadata": corpus.metadata,
+        "scenarios": scenario_reports,
+        "per_scenario_summary": {
+            str(item["scenario_number"]): item for item in scenario_reports
+        },
+        "summary": {
+            "scenarios": len(scenario_reports),
+            "scored_scenarios": len(scored),
+            "pass_rate": round(sum(item["pass_rate"] for item in scored) / len(scored), 4) if scored else 0.0,
+            "false_positive_rate": round(sum(item["false_positive_rate"] for item in negative_controls) / len(negative_controls), 4) if negative_controls else 0.0,
+            "average_tool_calls": round(sum(item["average_tool_calls"] for item in scored) / len(scored), 4) if scored else 0.0,
+            "average_duplicate_count": round(sum(item["average_duplicate_count"] for item in scored) / len(scored), 4) if scored else 0.0,
+            "average_latency_sec": round(sum(item["average_latency_sec"] for item in scored) / len(scored), 4) if scored else 0.0,
+            "escalation_frequency": round(sum(item["escalation_frequency"] for item in scored) / len(scored), 4) if scored else 0.0,
+            "merge_safety_disposition_counts": {
+                disposition: sum(item["merge_safety_disposition_counts"].get(disposition, 0) for item in scored)
+                for disposition in MERGE_SAFETY_DISPOSITIONS_ORDER
+            },
+            # #757 counterexample-driven falsification telemetry.
+            "falsification": _falsification_summary(scored, negative_controls),
+        },
+        "incomplete_scenarios": incomplete_scenarios,
+        "negative_control_summary": {
+            "scenarios": len(negative_controls),
+            "false_positive_rate": round(sum(item["false_positive_rate"] for item in negative_controls) / len(negative_controls), 4) if negative_controls else 0.0,
+        },
+        "passed": not incomplete_scenarios
+        and bool(scored)
+        and all(item["pass_rate"] == 1.0 for item in scored)
+        and all(item["false_positive_rate"] == 0.0 for item in negative_controls)
+        and all(
+            item["disposition_calibration_rate"] == 1.0
+            for item in scored
+            if item["disposition_calibration_rate"] is not None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def generate_report(
+    results: list[BenchmarkResult],
+    corpus: BenchmarkCorpus,
+    equivalent_paths: str | None = None,
+) -> dict[str, Any]:
+    """Generate the full benchmark report."""
+    active_modes = set()
+
+    def _new_mode_metrics() -> dict[str, Any]:
+        return {
+            "runs": 0,
+            "successful_runs": 0,
+            "total_tokens_input": 0,
+            "total_tokens_output": 0,
+            "total_wall_clock_sec": 0.0,
+            "findings_count": 0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "errors": 0,
+            # Capability checks (agentic-evidence-chain criterion). Counted only
+            # for scenarios that declare expected_evidence; pass_rate is the
+            # headline number for the home-ops#7462-style regression.
+            "capability_runs": 0,
+            "capability_passes": 0,
+            # #840: timeouts are a subset of `errors`, counted separately so
+            # a lopsided timeout loss on one mode/arm doesn't blend into
+            # generic error noise.
+            "timeouts": 0,
+            # Specialist checks (deep-review #610), split by grading scope so
+            # the comparable A/B subset stays visible per mode label:
+            # effectiveness checks grade on standard AND deep runs; lead
+            # checks are deep-run-only diagnostics.
+            "specialist_effectiveness_runs": 0,
+            "specialist_effectiveness_passes": 0,
+            "specialist_lead_runs": 0,
+            "specialist_lead_passes": 0,
+            # #635 specialist-phase telemetry, summed over successful deep
+            # runs of this mode label: role-usage token totals (cached = the
+            # provider's cached-input count where exposed) and cross-role
+            # lead overlap.
+            "deep_runs": 0,
+            "specialist_tokens_input": 0,
+            "specialist_tokens_output": 0,
+            "specialist_tokens_cached": 0,
+            "specialist_lead_overlap": 0,
+            "specialist_request_count": 0,
+            "specialist_request_bytes": 0,
+        }
+
+    # Per-mode aggregation. The classic modes are pre-seeded; any other run
+    # label (e.g. "native_loop+deep") is created on first encounter with the
+    # same shape, so all modes carry uniform keys.
+    mode_metrics: dict[str, dict[str, Any]] = {
+        m: _new_mode_metrics() for m in ("tools_off", "native_loop")
+    }
+
+    report_results = []
+
+    for bm in results:
+        entry: dict[str, Any] = {
+            "pr_number": bm.pr_number,
+            "repo_full_name": bm.repo_full_name,
+        }
+
+        # Get known findings for this PR
+        pr_entry = next(
+            (p for p in corpus.prs if p["number"] == bm.pr_number),
+            None,
+        )
+        known_findings = load_known_findings(pr_entry) if pr_entry else []
+        expected_evidence = pr_entry.get("expected_evidence") if pr_entry else None
+        specialist_expectations = pr_entry.get("specialist_expectations") if pr_entry else None
+
+        mode_runs: dict[str, ReviewRun] = {}
+        # Per-mode capability tallies for THIS PR (a PR may run N times/mode).
+        pr_capability: dict[str, dict[str, int]] = {}
+        pr_specialist_effectiveness: dict[str, dict[str, int]] = {}
+        pr_specialist_lead: dict[str, dict[str, int]] = {}
+        for run in bm.runs:
+            active_modes.add(run.mode)
+            mm = mode_metrics.setdefault(run.mode, _new_mode_metrics())
+            mm["runs"] += 1
+            if not run.error:
+                mm["successful_runs"] += 1
+                mm["total_tokens_input"] += run.tokens_input
+                mm["total_tokens_output"] += run.tokens_output
+                mm["total_wall_clock_sec"] += run.wall_clock_sec
+                mm["findings_count"] += len(run.findings)
+                if run.deep_review and isinstance(run.specialists, dict):
+                    mm["deep_runs"] += 1
+                    mm["specialist_tokens_input"] += _int_or_zero(
+                        run.specialists.get("specialist_tokens_input")
+                    )
+                    mm["specialist_tokens_output"] += _int_or_zero(
+                        run.specialists.get("specialist_tokens_output")
+                    )
+                    mm["specialist_tokens_cached"] += _int_or_zero(
+                        run.specialists.get("specialist_tokens_cached")
+                    )
+                    mm["specialist_lead_overlap"] += _cross_role_lead_overlap(run)
+                    mm["specialist_request_count"] += _int_or_zero(
+                        run.specialists.get("request_count")
+                    )
+                    mm["specialist_request_bytes"] += _int_or_zero(
+                        run.specialists.get("request_bytes_total")
+                    )
+            else:
+                mm["errors"] += 1
+                if run.timed_out:
+                    mm["timeouts"] += 1
+
+            cap = evaluate_capability(run, expected_evidence)
+            if cap is not None:
+                mm["capability_runs"] += 1
+                tally = pr_capability.setdefault(run.mode, {"runs": 0, "passes": 0})
+                tally["runs"] += 1
+                if cap["passed"]:
+                    mm["capability_passes"] += 1
+                    tally["passes"] += 1
+
+            # Specialist checks (deep-review #610), by grading scope:
+            # effectiveness is tallied for standard AND deep runs (the
+            # comparable A/B subset); lead for deep runs only (the
+            # deep-only diagnostics).
+            scap = evaluate_specialist_expectations(run, specialist_expectations)
+            if scap is not None:
+                if scap["effectiveness_passed"] is not None:
+                    mm["specialist_effectiveness_runs"] += 1
+                    stally = pr_specialist_effectiveness.setdefault(
+                        run.mode, {"runs": 0, "passes": 0}
+                    )
+                    stally["runs"] += 1
+                    if scap["effectiveness_passed"]:
+                        mm["specialist_effectiveness_passes"] += 1
+                        stally["passes"] += 1
+                if scap["lead_passed"] is not None:
+                    mm["specialist_lead_runs"] += 1
+                    stally = pr_specialist_lead.setdefault(
+                        run.mode, {"runs": 0, "passes": 0}
+                    )
+                    stally["runs"] += 1
+                    if scap["lead_passed"]:
+                        mm["specialist_lead_passes"] += 1
+                        stally["passes"] += 1
+
+            # Keep the last run's full detail for the per-PR entry; repeated
+            # runs of the same mode are summarised by the capability tally.
+            mode_runs[run.mode] = run
+            entry[run.mode] = run.to_dict()
+            if cap is not None:
+                entry[run.mode]["capability"] = cap
+            if scap is not None:
+                entry[run.mode]["specialist_capability"] = scap
+
+        if pr_capability:
+            entry["capability_pass_rate"] = {
+                mode: round(t["passes"] / t["runs"], 4) if t["runs"] else 0.0
+                for mode, t in pr_capability.items()
+            }
+
+        if pr_specialist_effectiveness:
+            entry["specialist_effectiveness_pass_rate"] = {
+                mode: round(t["passes"] / t["runs"], 4) if t["runs"] else 0.0
+                for mode, t in pr_specialist_effectiveness.items()
+            }
+        if pr_specialist_lead:
+            entry["specialist_lead_pass_rate"] = {
+                mode: round(t["passes"] / t["runs"], 4) if t["runs"] else 0.0
+                for mode, t in pr_specialist_lead.items()
+            }
+
+        # Quality comparison for each mode
+        for mode in active_modes:
+            if mode in mode_runs and not mode_runs[mode].error:
+                found = extract_findings_from_review(mode_runs[mode])
+                quality = compute_precision_recall(found, known_findings)
+                mm = mode_metrics[mode]
+                # Weighted average for precision/recall
+                if quality["total_found"] > 0 and quality["total_known"] > 0:
+                    mm["precision"] = (
+                        (mm["precision"] * (mm["runs"] - 1) + quality["precision"])
+                        / mm["runs"]
+                    )
+                    mm["recall"] = (
+                        (mm["recall"] * (mm["runs"] - 1) + quality["recall"])
+                        / mm["runs"]
+                    )
+                    mm["f1"] = (
+                        (mm["f1"] * (mm["runs"] - 1) + quality["f1"])
+                        / mm["runs"]
+                    )
+
+        report_results.append(entry)
+
+    # Compute averages for each mode
+    for m, mm in mode_metrics.items():
+        if mm["successful_runs"] > 0:
+            n = mm["successful_runs"]
+            mm["avg_tokens_input"] = round(mm["total_tokens_input"] / n, 1)
+            mm["avg_tokens_output"] = round(mm["total_tokens_output"] / n, 1)
+            mm["avg_wall_clock_sec"] = round(mm["total_wall_clock_sec"] / n, 3)
+        else:
+            mm["avg_tokens_input"] = 0
+            mm["avg_tokens_output"] = 0
+            mm["avg_wall_clock_sec"] = 0
+        # Headline agentic-capability number: fraction of capability-scored runs
+        # that closed the expected evidence chain. None when no scenario in the
+        # corpus declared expected_evidence for this mode.
+        mm["capability_pass_rate"] = (
+            round(mm["capability_passes"] / mm["capability_runs"], 4)
+            if mm["capability_runs"] > 0
+            else None
+        )
+        # Deep-review specialist headlines. The effectiveness rate is the
+        # comparable A/B number (scored on standard AND deep runs, so both
+        # `<mode>` and `<mode>+deep` labels carry it); the lead rate is a
+        # deep-only diagnostic. None when the scope scored no runs for this
+        # mode.
+        mm["specialist_effectiveness_pass_rate"] = (
+            round(
+                mm["specialist_effectiveness_passes"]
+                / mm["specialist_effectiveness_runs"],
+                4,
+            )
+            if mm["specialist_effectiveness_runs"] > 0
+            else None
+        )
+        mm["specialist_lead_pass_rate"] = (
+            round(
+                mm["specialist_lead_passes"]
+                / mm["specialist_lead_runs"], 4
+            )
+            if mm["specialist_lead_runs"] > 0
+            else None
+        )
+        # #635 specialist-phase telemetry averages over successful deep runs
+        # of this mode label (None when the mode scored no deep run).
+        if mm["deep_runs"] > 0:
+            n_deep = mm["deep_runs"]
+            mm["avg_specialist_tokens_input"] = round(
+                mm["specialist_tokens_input"] / n_deep, 1
+            )
+            mm["avg_specialist_tokens_output"] = round(
+                mm["specialist_tokens_output"] / n_deep, 1
+            )
+            mm["avg_specialist_tokens_cached"] = round(
+                mm["specialist_tokens_cached"] / n_deep, 1
+            )
+            mm["avg_specialist_lead_overlap"] = round(
+                mm["specialist_lead_overlap"] / n_deep, 4
+            )
+            # #635: actual transport accounting per deep run — wire attempts
+            # (retries included) and serialized request bytes. For
+            # combined_scout this counts ONE request, not three.
+            mm["avg_specialist_requests"] = round(
+                mm["specialist_request_count"] / n_deep, 4
+            )
+            mm["avg_specialist_request_bytes"] = round(
+                mm["specialist_request_bytes"] / n_deep, 1
+            )
+        else:
+            mm["avg_specialist_tokens_input"] = None
+            mm["avg_specialist_tokens_output"] = None
+            mm["avg_specialist_tokens_cached"] = None
+            mm["avg_specialist_lead_overlap"] = None
+            mm["avg_specialist_requests"] = None
+            mm["avg_specialist_request_bytes"] = None
+
+    semantic_report = evaluate_live_semantics(corpus.semantic_corpus, results)
+    total_runs = sum(len(bm.runs) for bm in results)
+    completed_runs = sum(1 for bm in results for r in bm.runs if not r.error)
+    report = {
+        "metadata": {
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "harness_version": "0.1.0",
+            "modes_tested": sorted(active_modes),
+            "total_prs": len(results),
+            # Machine-checkable completion counts (#711): a sweep where every
+            # run errored has pass_rate=None everywhere, which must fail the
+            # CI job instead of publishing an empty success summary.
+            "total_runs": total_runs,
+            "completed_runs": completed_runs,
+            "errored_runs": total_runs - completed_runs,
+            "corpus_source": None,  # set by caller
+            # #875 A/B provenance: which equivalent-paths arm produced this
+            # report (None = the runtime's own default was left in force).
+            "equivalent_paths": equivalent_paths,
+        },
+        "mode_summary": {m: mode_metrics[m] for m in sorted(mode_metrics)},
+        "per_pr_results": report_results,
+    }
+    if semantic_report is not None:
+        report["semantic_eval"] = semantic_report
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Real-PR report generation (#779)
+# ---------------------------------------------------------------------------
+
+def _new_real_pr_mode_summary() -> dict[str, Any]:
+    return {
+        "vulnerable_total": 0,
+        "vulnerable_errors": 0,
+        "vulnerable_timeouts": 0,
+        "hits": 0,
+        "file_only_hits": 0,
+        "vulnerable_request_changes": 0,
+        "clean_total": 0,
+        "clean_errors": 0,
+        "clean_timeouts": 0,
+        "any_finding_false_positives": 0,
+        "blocker_major_false_positives": 0,
+        "clean_request_changes": 0,
+    }
+
+
+def generate_real_pr_report(
+    scenario_runs: list[tuple[RealPRScenario, dict[str, ReviewRun | list[ReviewRun]]]],
+    corpus_source: str | None = None,
+    equivalent_paths: str | None = None,
+) -> dict[str, Any]:
+    """Build the real-PR corpus report from every scenario's per-mode runs.
+
+    ``scenario_runs`` is a list of (scenario, {mode: run_or_runs}) pairs —
+    one entry per corpus scenario actually run. Each mode's value is either
+    a single ``ReviewRun`` (the pre-#839 shape, still accepted so existing
+    callers with N=1 need no change) or a ``list[ReviewRun]`` of N runs
+    (``--runs-per-mode N``, #839): every run in the list is scored
+    individually and folded into the same ``mode_summary`` counters, so a
+    mode run 3x contributes 3x to ``vulnerable_total``/``clean_total`` and
+    the rates below are per-RUN pass rates across all repetitions, not
+    per-scenario. The per-scenario ``runs[mode]`` entry mirrors this: a
+    single scored run dict when N=1 (unchanged shape), or a list of N
+    scored run dicts when N>1, plus a small ``aggregate`` block summarizing
+    that scenario's own repeats.
+
+    Rates are DELIBERATELY denominated differently by design, both spelled
+    out in each mode block so a reader never has to guess:
+      - recall (strict/file-level) divides by the TOTAL vulnerable runs for
+        that mode, counting an errored run as a miss — a crash didn't catch
+        the defect either.
+      - false-positive and request-changes rates divide by the total run
+        count for that kind (vulnerable or clean) as well, for the same
+        reason: an errored run is scored, not excluded.
+      - verdict_agreement_rate treats vulnerable+clean together as a single
+        binary classification (should this PR get request_changes?) and
+        reports the combined accuracy — the one number meant to move
+        together with recall and the FP rate rather than trade off against
+        them silently.
+    """
+    per_scenario: list[dict[str, Any]] = []
+    mode_summary: dict[str, dict[str, Any]] = {}
+    modes_seen: set[str] = set()
+
+    def _as_list(value: ReviewRun | list[ReviewRun]) -> list[ReviewRun]:
+        return value if isinstance(value, list) else [value]
+
+    for scenario, mode_runs in scenario_runs:
+        kind = "clean" if scenario.expected_clean is True else "vulnerable"
+        entry: dict[str, Any] = {
+            "id": scenario.id,
+            "repo_full_name": scenario.repo_full_name,
+            "number": scenario.number,
+            "head_sha": scenario.head_sha,
+            "kind": kind,
+        }
+        if scenario.defect is not None:
+            entry["defect"] = {
+                "description": scenario.defect.description,
+                "file": scenario.defect.file,
+                "line_range": list(scenario.defect.line_range) if scenario.defect.line_range else None,
+                "severity": scenario.defect.severity,
+            }
+        runs_out: dict[str, Any] = {}
+        runs_aggregate: dict[str, Any] = {}
+        for mode, run_or_runs in mode_runs.items():
+            runs = _as_list(run_or_runs)
+            modes_seen.add(mode)
+            mm = mode_summary.setdefault(mode, _new_real_pr_mode_summary())
+            scored_dicts: list[dict[str, Any]] = []
+            agg = {"runs": len(runs), "errors": 0, "timeouts": 0}
+            if kind == "vulnerable":
+                agg.update(hits=0, file_only_hits=0, request_changes=0)
+            else:
+                agg.update(false_positives=0, blocker_major_false_positives=0, request_changes=0)
+            for run in runs:
+                run_dict = run.to_dict()
+                if kind == "vulnerable" and scenario.defect is not None:
+                    score = score_vulnerable_run(run, scenario.defect)
+                    mm["vulnerable_total"] += 1
+                    if score["errored"]:
+                        mm["vulnerable_errors"] += 1
+                        agg["errors"] += 1
+                    if score["timed_out"]:
+                        mm["vulnerable_timeouts"] += 1
+                        agg["timeouts"] += 1
+                    if score["hit"]:
+                        mm["hits"] += 1
+                        agg["hits"] += 1
+                    if score["file_only_hit"]:
+                        mm["file_only_hits"] += 1
+                        agg["file_only_hits"] += 1
+                    if score["request_changes"]:
+                        mm["vulnerable_request_changes"] += 1
+                        agg["request_changes"] += 1
+                else:
+                    score = score_clean_run(run)
+                    mm["clean_total"] += 1
+                    if score["errored"]:
+                        mm["clean_errors"] += 1
+                        agg["errors"] += 1
+                    if score["timed_out"]:
+                        mm["clean_timeouts"] += 1
+                        agg["timeouts"] += 1
+                    if score["false_positive"]:
+                        mm["any_finding_false_positives"] += 1
+                        agg["false_positives"] += 1
+                    if score["blocker_major_false_positive"]:
+                        mm["blocker_major_false_positives"] += 1
+                        agg["blocker_major_false_positives"] += 1
+                    if score["request_changes"]:
+                        mm["clean_request_changes"] += 1
+                        agg["request_changes"] += 1
+                run_dict["score"] = score
+                scored_dicts.append(run_dict)
+            # Backward-compatible shape (#839): a single run stays a single
+            # dict, exactly as before; only N>1 introduces the list form.
+            runs_out[mode] = scored_dicts[0] if len(scored_dicts) == 1 else scored_dicts
+            if len(scored_dicts) > 1:
+                runs_aggregate[mode] = agg
+        entry["runs"] = runs_out
+        if runs_aggregate:
+            entry["runs_aggregate"] = runs_aggregate
+        per_scenario.append(entry)
+
+    def _rate(numer: int, denom: int) -> float | None:
+        return round(numer / denom, 4) if denom else None
+
+    for mode, mm in mode_summary.items():
+        mm["recall_strict"] = _rate(mm["hits"], mm["vulnerable_total"])
+        mm["recall_file_level"] = _rate(mm["file_only_hits"], mm["vulnerable_total"])
+        mm["vulnerable_request_changes_rate"] = _rate(
+            mm["vulnerable_request_changes"], mm["vulnerable_total"]
+        )
+        mm["false_positive_rate"] = _rate(mm["any_finding_false_positives"], mm["clean_total"])
+        mm["blocker_major_false_positive_rate"] = _rate(
+            mm["blocker_major_false_positives"], mm["clean_total"]
+        )
+        mm["clean_request_changes_rate"] = _rate(mm["clean_request_changes"], mm["clean_total"])
+        total_scenarios = mm["vulnerable_total"] + mm["clean_total"]
+        agreeing = mm["vulnerable_request_changes"] + (
+            mm["clean_total"] - mm["clean_request_changes"]
+        )
+        mm["verdict_agreement_rate"] = _rate(agreeing, total_scenarios)
+
+    total_runs = sum(len(_as_list(r)) for _s, runs in scenario_runs for r in runs.values())
+    completed_runs = sum(
+        1 for _s, runs in scenario_runs for r in runs.values() for run in _as_list(r) if not run.error
+    )
+    return {
+        "metadata": {
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "harness_version": "0.1.0",
+            "corpus_kind": "real_pr_corpus",
+            "corpus_source": corpus_source,
+            "modes_tested": sorted(modes_seen),
+            "vulnerable_scenarios": sum(1 for s, _ in scenario_runs if not s.expected_clean),
+            "clean_scenarios": sum(1 for s, _ in scenario_runs if s.expected_clean),
+            "total_runs": total_runs,
+            "completed_runs": completed_runs,
+            "errored_runs": total_runs - completed_runs,
+            # #875 A/B provenance (same key as the fixture-corpus report):
+            # which equivalent-paths arm produced this report.
+            "equivalent_paths": equivalent_paths,
+        },
+        "mode_summary": {m: mode_summary[m] for m in sorted(mode_summary)},
+        "per_scenario_results": per_scenario,
+    }
+
+
+# A replay reviews a historical head, but the PR thread, review threads and
+# human reviews are fetched live, so they can carry the later human finding
+# itself. Pinned replays always run without them.
+REPLAY_ENV = {
+    "PR_THREAD_CONTEXT": "false",
+    "REVIEW_THREADS_CONTEXT": "false",
+    "HUMAN_REVIEWS_CONTEXT": "false",
+}
+
+# --context-only: build the review context and stop at the model call, with
+# no inference. The endpoint is a closed local port and retries are off, so
+# the call fails immediately after the corpus is assembled.
+CONTEXT_ONLY_ENV = {
+    "AI_BASE_URL": "http://127.0.0.1:9/v1",
+    "AI_MODEL": "context-only",
+    "AI_API_KEY": "none",
+    "AI_PRIMARY_RETRIES": "0",
+    "AI_PRIMARY_RETRY_DELAY_SEC": "0",
+    "AI_FALLBACK_RETRIES": "0",
+    "AI_SMART_RETRIES": "0",
+    "AI_CONNECT_TIMEOUT_SEC": "2",
+    "AI_FALLBACK_BASE_URL": "",
+    "AI_SMART_BASE_URL": "",
+    "TOOL_MODE": "off",
+    "DEEP_REVIEW": "false",
+    "CI_STATUS_CHECK": "false",
+}
+
+
+def score_context(repo_path: Path, run_dir: Path, scenario: RealPRScenario) -> dict[str, Any]:
+    """Whether a vulnerable scenario's defect reached the assembled context.
+
+    Reads the review corpus the pipeline wrote and reports: its size, whether
+    the defect file is in the PR diff, and, when the defect has a line range,
+    how many of those (non-trivial) head lines appear in the corpus and how
+    far into the corpus the first one sits. ``review-corpus.md`` and
+    ``pr.diff`` are the run's own artifacts (#838: read from ``run_dir``, the
+    run's private ``PR_REVIEWER_RUN_DIR`` — never from the reviewed checkout);
+    ``repo_path`` is used only for the checkout's `git show` below.
+    """
+    corpus_path = run_dir / "review-corpus.md"
+    if not corpus_path.is_file():
+        return {"context_built": False}
+    corpus = corpus_path.read_text(encoding="utf-8", errors="replace")
+    diff = (run_dir / "pr.diff").read_text(encoding="utf-8", errors="replace") if (run_dir / "pr.diff").is_file() else ""
+    out: dict[str, Any] = {"context_built": True, "corpus_bytes": len(corpus.encode("utf-8"))}
+    defect = scenario.defect
+    if defect is None:
+        return out
+    out["defect_file_in_diff"] = f"b/{defect.file}" in diff
+    if defect.line_range:
+        shown = subprocess.run(
+            ["git", "-C", str(repo_path), "show", f"HEAD:{defect.file}"],
+            capture_output=True, text=True, check=False,
+        ).stdout.splitlines()
+        lo, hi = defect.line_range
+        lines = [line.strip() for line in shown[max(0, lo - 1):hi] if len(line.strip()) > 8]
+        found = [corpus.find(line) for line in lines if line in corpus]
+        out["defect_lines"] = len(lines)
+        out["defect_lines_in_context"] = len(found)
+        if found:
+            out["defect_position_pct"] = round(100 * min(found) / max(1, len(corpus)))
+    return out
+
+
+def run_real_pr_corpus(
+    corpus: RealPRCorpus,
+    modes: list[str],
+    work_dir: Path,
+    model_config: dict[str, str],
+    max_entries: int | None = None,
+    dry_run: bool = False,
+    context_only: bool = False,
+    runs_per_mode: int = 1,
+    claim_falsification: bool = False,
+    equivalent_paths: str | None = None,
+    requirement_trace: bool = False,
+) -> dict[str, Any] | None:
+    """Run every scenario in a real-PR corpus across the given modes.
+
+    ``max_entries`` limits the VULNERABLE and CLEAN lists independently
+    (first N of each), so ``--max-prs 1`` gives exactly one of each kind —
+    the shape the #779 smoke test needs — rather than truncating the
+    concatenated list and starving the clean side.
+
+    ``runs_per_mode`` (#839) repeats each (scenario, mode) N times, like the
+    fixture-corpus path, so repeated-run measurements (e.g. a 3-runs-per-arm
+    A/B) no longer need an external loop. Ignored under ``--context-only``:
+    context assembly for a pinned head is deterministic, so repeating it
+    only wastes clone/checkout time.
+
+    Returns None (having printed the planned runs) in dry-run mode instead
+    of a report.
+    """
+    vulnerable = corpus.vulnerable[:max_entries] if max_entries else corpus.vulnerable
+    clean = corpus.clean[:max_entries] if max_entries else corpus.clean
+    scenarios = [*vulnerable, *clean]
+    runs_per_mode = max(1, runs_per_mode) if not context_only else 1
+
+    if dry_run:
+        suffix = f" x{runs_per_mode}" if runs_per_mode > 1 else ""
+        for scenario in scenarios:
+            kind = "clean" if scenario.expected_clean is True else "vulnerable"
+            for mode in modes:
+                print(
+                    f"  Would run: [{kind}] {scenario.repo_full_name}#{scenario.number} "
+                    f"@{scenario.head_sha[:12]} [{mode}]{suffix}"
+                )
+        return None
+
+    extra_env = {**(model_config.get("extra_env") or {}), **REPLAY_ENV, **(CONTEXT_ONLY_ENV if context_only else {})}
+    model_config = {**model_config, "extra_env": extra_env}
+    if context_only:
+        modes = ["tools_off"]
+    context_rows: list[dict[str, Any]] = []
+    scenario_runs: list[tuple[RealPRScenario, dict[str, ReviewRun | list[ReviewRun]]]] = []
+    for i, scenario in enumerate(scenarios, 1):
+        kind = "clean" if scenario.expected_clean is True else "vulnerable"
+        print(
+            f"[{i}/{len(scenarios)}] [{kind}] {scenario.repo_full_name}#{scenario.number}",
+            file=sys.stderr,
+        )
+        pr_entry = scenario.to_pr_entry()
+        mode_runs: dict[str, ReviewRun | list[ReviewRun]] = {}
+        for mode in modes:
+            reps: list[ReviewRun] = []
+            for rep in range(runs_per_mode):
+                run = run_review_for_pr(
+                    pr_entry, mode, work_dir, model_config,
+                    claim_falsification=claim_falsification, requirement_trace=requirement_trace,
+                )
+                reps.append(run)
+                label = mode if runs_per_mode == 1 else f"{mode} {rep + 1}/{runs_per_mode}"
+                if context_only:
+                    repo_path = work_dir / scenario.repo_full_name.replace("/", "-")
+                    run_artifact_dir = run.run_dir if run.run_dir is not None else repo_path
+                    row = {"id": scenario.id, "kind": kind, **score_context(repo_path, run_artifact_dir, scenario)}
+                    context_rows.append(row)
+                    print(f"    [context] {json.dumps(row)}", file=sys.stderr)
+                    continue
+                if run.error:
+                    tag = "TIMEOUT" if run.timed_out else "ERROR"
+                    print(f"    [{label}] {tag}: {run.error}", file=sys.stderr)
+                else:
+                    findings = run.findings if isinstance(run.findings, list) else []
+                    print(
+                        f"    [{label}] verdict={run.verdict} findings={len(findings)} "
+                        f"commit={run.commit_sha} wall={run.wall_clock_sec:.1f}s",
+                        file=sys.stderr,
+                    )
+            mode_runs[mode] = reps[0] if runs_per_mode == 1 else reps
+        scenario_runs.append((scenario, mode_runs))
+
+    if context_only:
+        context_report = generate_context_report(context_rows, equivalent_paths=equivalent_paths)
+        context_report["metadata"]["claim_falsification"] = claim_falsification
+        context_report["metadata"]["requirement_trace"] = requirement_trace
+        return context_report
+    real_pr_report = generate_real_pr_report(scenario_runs, equivalent_paths=equivalent_paths)
+    real_pr_report["metadata"]["claim_falsification"] = claim_falsification
+    real_pr_report["metadata"]["requirement_trace"] = requirement_trace
+    return real_pr_report
+
+
+def generate_context_report(
+    rows: list[dict[str, Any]],
+    equivalent_paths: str | None = None,
+) -> dict[str, Any]:
+    """Summarize --context-only rows: how often the defect reached the context."""
+    vulnerable = [r for r in rows if r["kind"] == "vulnerable" and r.get("context_built")]
+    with_lines = [r for r in vulnerable if r.get("defect_lines")]
+    sizes = sorted(r["corpus_bytes"] for r in rows if r.get("context_built"))
+    positions = sorted(r["defect_position_pct"] for r in with_lines if "defect_position_pct" in r)
+    def median(values: list[int]) -> int | None:
+        return values[len(values) // 2] if values else None
+    return {
+        "metadata": {"mode": "context_only", "scenarios": len(rows),
+                     "context_built": sum(1 for r in rows if r.get("context_built")),
+                     "equivalent_paths": equivalent_paths},
+        "summary": {
+            "vulnerable_built": len(vulnerable),
+            "defect_file_in_diff": sum(1 for r in vulnerable if r.get("defect_file_in_diff")),
+            "with_line_range": len(with_lines),
+            "defect_lines_all_in_context": sum(1 for r in with_lines if r["defect_lines_in_context"] == r["defect_lines"]),
+            "defect_lines_none_in_context": sum(1 for r in with_lines if r["defect_lines_in_context"] == 0),
+            "corpus_bytes_median": median(sizes),
+            "defect_position_pct_median": median(positions),
+        },
+        "per_scenario": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def count_completed_runs(report: dict[str, Any]) -> int:
+    """The report's completed-run count, tolerating pre-#711 reports.
+
+    Prefers ``metadata.completed_runs``; when absent (a report written by an
+    older harness) falls back to summing ``mode_summary[*].successful_runs``.
+    The eval-harness workflow's summary step mirrors this same fallback.
+    """
+    completed = report.get("metadata", {}).get("completed_runs")
+    if isinstance(completed, bool) or not isinstance(completed, int):
+        completed = sum(
+            block.get("successful_runs", 0)
+            for block in report.get("mode_summary", {}).values()
+            if isinstance(block, dict) and isinstance(block.get("successful_runs", 0), int)
+        )
+    return completed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="A/B evaluation harness for PR review modes",
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        required=True,
+        help="Path to benchmark corpus JSON file",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=["tools_off", "native_loop"],
+        help="Review modes to run (default: tools_off native_loop)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=os.getenv("AI_MODEL", ""),
+        help="Model name for review runs",
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=os.getenv("AI_BASE_URL", ""),
+        help="AI API base URL",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.getenv("AI_API_KEY", ""),
+        help="AI API key",
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        default=os.getenv("GITHUB_TOKEN", ""),
+        help="GitHub token for PR data access",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output report path (default: stdout)",
+    )
+    parser.add_argument(
+        "--deep-review",
+        choices=["false", "true", "both"],
+        default="false",
+        help=(
+            "Deep-review (specialist) A/B: 'false' = standard runs only, "
+            "'true' = deep runs only, 'both' = standard and deep for each mode "
+            "(deep runs are labelled '<mode>+deep')"
+        ),
+    )
+    parser.add_argument(
+        "--deep-execution",
+        choices=list(DEEP_EXECUTIONS),
+        default="three_call",
+        help=(
+            "Specialist execution shape for deep runs (#635 benchmark): "
+            "'three_call' = three concurrent role calls (production default), "
+            "'combined_scout' = one role-keyed call split into per-role "
+            "artifacts, 'prime_then_fanout' = three calls with the first "
+            "role completing before the rest launch. Ignored unless "
+            "--deep-review enables deep runs."
+        ),
+    )
+    parser.add_argument(
+        "--claim-falsification",
+        choices=["false", "true"],
+        default="false",
+        help=(
+            "Claim falsification pre-pass A/B (#785, the gate for shipping "
+            "it on by default): 'true' exports CLAIM_FALSIFICATION=true for "
+            "every review run (real-PR and fixture corpora alike); 'false' "
+            "(default) leaves it unset. Recorded in the report metadata so "
+            "runs from the two arms are distinguishable; run the same "
+            "corpus once per value and diff the reports for the A/B."
+        ),
+    )
+    parser.add_argument(
+        "--requirement-trace",
+        choices=["true", "false"],
+        default="false",
+        help=(
+            "#874 A/B knob: 'true' sets REQUIREMENT_TRACE=true for every run "
+            "(per-requirement enforcement/test trace, deterministically "
+            "verified, before crediting an acceptance/normative requirement). "
+            "'false' (default) matches the production default and forwards "
+            "nothing. Honored on both the real-PR-corpus and synthetic "
+            "benchmark paths."
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Override the review system prompt inline (SYSTEM_PROMPT, "
+            "SYSTEM_PROMPT_MODE=replace: used verbatim, no bundled default, "
+            "no fragment substitution). Intended for A/B arms (#757): run "
+            "both arms over the same corpus with the same harness and "
+            "compare the report's falsification telemetry."
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        type=Path,
+        default=None,
+        help=(
+            "Override the review system prompt from a file (SYSTEM_PROMPT_FILE, "
+            "SYSTEM_PROMPT_MODE=replace: used verbatim, no bundled default, "
+            "no fragment substitution — pre-resolve any {{...}} placeholders "
+            "when materializing a baseline arm). Same A/B contract as "
+            "--system-prompt."
+        ),
+    )
+    parser.add_argument(
+        "--equivalent-paths",
+        choices=["true", "false"],
+        default=None,
+        help=(
+            "#875 A/B knob: forward EQUIVALENT_PATHS to the runtime "
+            "('true' turns on the bounded equivalent-implementation-path "
+            "detector and its correctness-specialist hint). Omit to leave "
+            "the runtime's own default (off) in force."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned runs without executing",
+    )
+    parser.add_argument(
+        "--context-only",
+        action="store_true",
+        help=(
+            "Real-PR corpora only: build each scenario's review context and stop "
+            "before the model call (no inference); report whether each defect "
+            "reached the context."
+        ),
+    )
+    parser.add_argument(
+        "--max-prs",
+        type=int,
+        default=None,
+        help="Limit to first N PRs from corpus",
+    )
+    parser.add_argument(
+        "--runs-per-mode",
+        type=int,
+        default=1,
+        help=(
+            "Repeat each mode N times per PR and report capability pass RATE. "
+            "Use >=10 for the agentic-evidence-chain criterion — a single run "
+            "is noise at the fast tier's reliability (Tau2 ~68%%). Also "
+            "honored for real-PR corpora (#839: N runs per scenario/mode, "
+            "each recorded plus per-mode aggregates); ignored under "
+            "--context-only, which is deterministic per pinned head."
+        ),
+    )
+    return parser
+
+
+def _main_real_pr_corpus(args: argparse.Namespace) -> int:
+    """The real-PR corpus (#779) CLI path: score hits/FPs, not known_findings."""
+    try:
+        corpus = RealPRCorpus.from_file(args.corpus)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if not corpus.vulnerable and not corpus.clean:
+        print("Error: real-PR corpus is empty", file=sys.stderr)
+        return 1
+
+    model_config = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "api_key": args.api_key,
+        "github_token": args.github_token,
+    }
+    # #875 A/B arm: main()'s fixture-path application never runs for the
+    # real-PR split (main() dispatches here first), so the arm must be
+    # applied here too — without it both supposed A/B arms run the runtime's
+    # own default (off) on the required real-PR catch/FP measurement path.
+    if args.equivalent_paths is not None:
+        model_config["extra_env"] = {
+            **(model_config.get("extra_env") or {}),
+            "EQUIVALENT_PATHS": args.equivalent_paths,
+        }
+
+    print(
+        f"Loaded {len(corpus.vulnerable)} vulnerable + {len(corpus.clean)} clean "
+        "real-PR scenarios" + (f", capped at {args.max_prs} each" if args.max_prs else ""),
+        file=sys.stderr,
+    )
+    print(f"Modes: {args.modes}", file=sys.stderr)
+    print(f"Model: {args.model or '(not set)'}", file=sys.stderr)
+    print(f"Claim falsification: {args.claim_falsification}", file=sys.stderr)
+    if args.runs_per_mode > 1:
+        print(f"Runs per mode: {args.runs_per_mode}", file=sys.stderr)
+
+    with tempfile.TemporaryDirectory(prefix="eval-harness-realpr-") as tmpdir:
+        report = run_real_pr_corpus(
+            corpus,
+            args.modes,
+            Path(tmpdir),
+            model_config,
+            max_entries=args.max_prs,
+            dry_run=args.dry_run,
+            context_only=args.context_only,
+            runs_per_mode=args.runs_per_mode,
+            claim_falsification=args.claim_falsification == "true",
+            equivalent_paths=args.equivalent_paths,
+            requirement_trace=args.requirement_trace == "true",
+        )
+
+    if args.dry_run:
+        return 0
+
+    # #840: surface timeout counts per mode prominently.
+    timeout_lines = [
+        f"    {mode}: {mm['vulnerable_timeouts'] + mm['clean_timeouts']} timeout(s)"
+        for mode, mm in report.get("mode_summary", {}).items()
+        if mm.get("vulnerable_timeouts") or mm.get("clean_timeouts")
+    ]
+    if timeout_lines:
+        print("Timeouts:", file=sys.stderr)
+        for line in timeout_lines:
+            print(line, file=sys.stderr)
+
+    output_text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output_text, encoding="utf-8")
+        print(f"\nReport written to {args.output}", file=sys.stderr)
+    else:
+        print(output_text)
+
+    if args.context_only:
+        return 0 if report["metadata"]["context_built"] else 1
+    if report["metadata"]["completed_runs"] == 0:
+        print(
+            "Error: 0 of "
+            f"{report['metadata']['total_runs']} real-PR harness runs completed; "
+            "every run errored, so no rates exist. Failing (mirrors #711).",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Load corpus
+    if not args.corpus.exists():
+        print(f"Error: corpus file not found: {args.corpus}", file=sys.stderr)
+        return 1
+
+    # Real-PR corpora (#779) carry a top-level 'real_pr_corpus' key instead of
+    # 'benchmark_corpus'/'semantic_corpus' and run a different scorer (defect
+    # file/line hits + clean-control false positives rather than
+    # category/severity+description known_findings matching), so they're
+    # detected up front and routed to a separate path.
+    try:
+        peek = json.loads(args.corpus.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"Error: could not read corpus file {args.corpus}: {exc}", file=sys.stderr)
+        return 1
+    if isinstance(peek, dict) and "real_pr_corpus" in peek:
+        return _main_real_pr_corpus(args)
+
+    corpus = BenchmarkCorpus.from_file(args.corpus)
+    if not corpus.prs:
+        print("Error: corpus is empty", file=sys.stderr)
+        return 1
+
+    # Limit PRs if requested
+    prs = corpus.prs[:args.max_prs] if args.max_prs else corpus.prs
+
+    model_config = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "api_key": args.api_key,
+        "github_token": args.github_token,
+    }
+    if args.system_prompt is not None:
+        model_config["system_prompt"] = args.system_prompt
+    if args.system_prompt_file is not None:
+        if not args.system_prompt_file.exists():
+            print(f"Error: system prompt file not found: {args.system_prompt_file}", file=sys.stderr)
+            return 1
+        model_config["system_prompt_file"] = str(args.system_prompt_file)
+    if args.equivalent_paths is not None:
+        model_config["extra_env"] = {
+            **(model_config.get("extra_env") or {}),
+            "EQUIVALENT_PATHS": args.equivalent_paths,
+        }
+
+    print(f"Loaded {len(corpus.prs)} PRs from corpus, running {len(prs)}...", file=sys.stderr)
+    print(f"Modes: {args.modes}", file=sys.stderr)
+    print(f"Deep review: {args.deep_review}", file=sys.stderr)
+    print(f"Deep execution: {args.deep_execution}", file=sys.stderr)
+    print(f"Claim falsification: {args.claim_falsification}", file=sys.stderr)
+    print(f"Model: {args.model or '(not set)'}", file=sys.stderr)
+    claim_falsification = args.claim_falsification == "true"
+
+    runs_per_mode = max(1, args.runs_per_mode)
+    deep_variants = (
+        [False, True] if args.deep_review == "both" else [args.deep_review == "true"]
+    )
+
+    if args.dry_run:
+        for pr in prs:
+            for mode in args.modes:
+                for deep in deep_variants:
+                    label = run_label(mode, deep, args.deep_execution)
+                    suffix = f" x{runs_per_mode}" if runs_per_mode > 1 else ""
+                    print(
+                        f"  Would run: {pr['repo_full_name']}#{pr['number']} "
+                        f"[{label}]{suffix}"
+                    )
+        return 0
+
+    # Execute reviews
+    results: list[BenchmarkResult] = []
+    with tempfile.TemporaryDirectory(prefix="eval-harness-") as tmpdir:
+        work_dir = Path(tmpdir)
+
+        for i, pr in enumerate(prs, 1):
+            print(f"[{i}/{len(prs)}] {pr['repo_full_name']}#{pr['number']}", file=sys.stderr)
+
+            bm = BenchmarkResult(
+                pr_number=pr["number"],
+                repo_full_name=pr["repo_full_name"],
+            )
+
+            for mode in args.modes:
+                for deep in deep_variants:
+                    for rep in range(runs_per_mode):
+                        run = run_review_for_pr(
+                            pr, mode, work_dir, model_config, deep_review=deep,
+                            deep_execution=args.deep_execution,
+                            claim_falsification=claim_falsification,
+                            requirement_trace=args.requirement_trace == "true",
+                        )
+                        bm.runs.append(run)
+                        base = run_label(mode, deep, args.deep_execution)
+                        label = (
+                            base
+                            if runs_per_mode == 1
+                            else f"{base} {rep + 1}/{runs_per_mode}"
+                        )
+                    if run.error:
+                        tag = "TIMEOUT" if run.timed_out else "ERROR"
+                        print(f"    [{label}] {tag}: {run.error}", file=sys.stderr)
+                    else:
+                        findings = extract_findings_from_review(run)
+                        print(
+                            f"    [{label}] verdict={run.verdict} "
+                            f"findings={len(findings)} "
+                            f"tools={len(run.tool_calls)} "
+                            f"tokens_in={run.tokens_input} "
+                            f"tokens_out={run.tokens_output} "
+                            f"wall={run.wall_clock_sec:.1f}s",
+                            file=sys.stderr,
+                        )
+
+            results.append(bm)
+
+    # Generate report
+    report = generate_report(results, corpus, equivalent_paths=args.equivalent_paths)
+    report["metadata"]["corpus_source"] = str(args.corpus)
+    report["metadata"]["claim_falsification"] = claim_falsification
+    report["metadata"]["requirement_trace"] = args.requirement_trace == "true"
+
+    # #840: surface timeout counts per mode prominently, so a lopsided
+    # timeout loss on one arm is visible without reading the full report.
+    timeout_lines = [
+        f"    {mode}: {mm['timeouts']} timeout(s) of {mm['runs']} run(s)"
+        for mode, mm in report["mode_summary"].items()
+        if mm.get("timeouts")
+    ]
+    if timeout_lines:
+        print("Timeouts:", file=sys.stderr)
+        for line in timeout_lines:
+            print(line, file=sys.stderr)
+
+    output_text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+
+    # Write the report first even when failing, so the CI artifact upload
+    # still captures the per-run errors for debugging (#711).
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output_text, encoding="utf-8")
+        print(f"\nReport written to {args.output}", file=sys.stderr)
+    else:
+        print(output_text)
+
+    # Fail when zero runs completed (#711): every pass rate is undefined, so
+    # reporting success would hide a broken sweep (e.g. the scheduled run
+    # where the runtime entrypoint could not be invoked at all). Partial
+    # failures stay non-fatal — those reports carry real pass rates.
+    completed_runs = count_completed_runs(report)
+    if completed_runs == 0:
+        print(
+            "Error: 0 of "
+            f"{report['metadata'].get('total_runs', 'unknown')} harness runs "
+            "completed; every run errored, so no pass rates exist. "
+            "Failing (issue #711).",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

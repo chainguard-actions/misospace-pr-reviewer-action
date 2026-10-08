@@ -1,0 +1,738 @@
+import { ciAttemptTimeoutMs, isTransientCiRead } from "./bounded.js";
+import { ForgejoEnrichClient } from "./enrich.js";
+import { PlatformRequestError, requestJson, requestText, type FetchLike } from "./http.js";
+import {
+  forgejoReviewCommentId,
+  groupForgejoReviewThreads,
+  forgejoSelfStatusMatches,
+  forgejoJobStatusPathsMatch,
+  normalizeForgejoRunJobs,
+  normalizeExternalChecks,
+  normalizeForgejoCommitStatus,
+  normalizeForgejoConversationComments,
+  normalizeForgejoIssue,
+  normalizeForgejoPrFiles,
+  normalizeForgejoReviews,
+  pyJsonDecode,
+  type ForgejoRunJobsNormalization,
+  type ExternalCheck,
+} from "./normalize.js";
+import { parseRepoRef, repoScopedUrl } from "./repo-ref.js";
+import { parsePlatformBaseUrl } from "./urls.js";
+import { validateEndpoint, type EndpointValidation } from "./endpoint.js";
+import type {
+  ExternalChecksOptions,
+  GhApiResult,
+  ManagedComment,
+  ManagedReview,
+  PlatformReadAdapter,
+  ReadResult,
+} from "./types.js";
+
+/** Forgejo has no check-runs API: the v2 seam substitutes this empty
+ * struct, and the commit-status read carries the CI signal. */
+const FORGEJO_EMPTY_CHECK_RUNS = '{"check_runs":[],"total_count":0}';
+const NUMBER_RE = /^[0-9]+$/;
+const SHA_RE = /^(?!\.+$)[A-Za-z0-9._-]+$/;
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 25_000;
+const FORGEJO_RUN_JOBS_PAGE_SIZE = 50;
+const JWT_TTL_SECONDS = 2700;
+
+export interface ForgejoAdapterOptions {
+  repo: string;
+  prNumber: string;
+  /** FORGEJO_API_URL — validated before any credential is attached. */
+  baseUrl: string;
+  /** Resolved token (FORGEJO_TOKEN → GITHUB_TOKEN → GH_TOKEN chain). */
+  token?: string | undefined;
+  /** "token" (default) or "authorized_integration" (#254 lineage). */
+  authMethod?: string | undefined;
+  /** Audience for the authorized-integration OIDC JWT exchange. */
+  authorizedIntegrationAudience?: string | undefined;
+  timeoutMs?: number | undefined;
+  fetchImpl?: FetchLike | undefined;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** #970: the forge-reported author login of a Forgejo comment/review `user`
+ * object. Never reads body content; a missing or non-string login is
+ * `undefined` (unproven ownership, which callers fail closed on). */
+function forgejoAuthor(user: unknown): string | undefined {
+  if (!isObject(user)) return undefined;
+  const login = user.login;
+  return typeof login === "string" && login !== "" ? login : undefined;
+}
+
+function parseRepo(repo: string): { owner: string; repo: string } {
+  const ref = parseRepoRef(repo);
+  if (ref === null) throw new Error(`Invalid repo full name: ${repo}`);
+  return { owner: ref.owner, repo: ref.name };
+}
+
+/**
+ * Forgejo REST adapter used by the precheck/fingerprint path (#674).
+ *
+ * The base URL is parsed and validated before any credential is attached
+ * (http/https only, no embedded credentials — the #670/#682 SSRF boundary).
+ * Every request is bound to that validated origin and redirects are refused,
+ * so the token can never leak to an attacker-controlled host. The
+ * User-Agent must stay non-default: Cloudflare bot-fight fronting
+ * self-hosted Forgejo blocks the default fetch UA.
+ */
+export class ForgejoAdapter implements PlatformReadAdapter {
+  readonly platform = "forgejo" as const;
+  readonly repo: string;
+  readonly prNumber: string;
+  private readonly baseUrl: string;
+  private readonly origin: string;
+  private readonly token: string | undefined;
+  private readonly authMethod: string;
+  private readonly audience: string;
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: FetchLike;
+  private jwtCache: { token: string; fetchedAt: number } | null = null;
+
+  constructor(options: ForgejoAdapterOptions) {
+    const parsed = parsePlatformBaseUrl(options.baseUrl, "Forgejo API base URL");
+    this.baseUrl = parsed.base;
+    this.origin = parsed.origin;
+    this.repo = options.repo;
+    this.prNumber = options.prNumber;
+    this.token = options.token;
+    this.authMethod = options.authMethod ?? "token";
+    this.audience = options.authorizedIntegrationAudience ?? "";
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+
+  private apiPath(path: string): string {
+    return `${this.baseUrl}/api/v1${path}`;
+  }
+
+  /** A repo-scoped /api/v1 URL, refused (throws) when the repo ref is
+   * invalid or the normalized path escapes the intended prefix. */
+  private repoUrl(staticTail: string, dynamicTail = "", repo = this.repo): string {
+    const url = repoScopedUrl(this.apiPath(""), repo, staticTail, dynamicTail);
+    if (url === null) throw new Error(`Refusing a request outside repository ${repo}`);
+    return url;
+  }
+
+  private isAuthorizedIntegrationMode(): boolean {
+    return this.audience.trim() !== "";
+  }
+
+  /** Resolve the Authorization header (port of `_resolve_auth_header`):
+   * authorized-integration mode with no explicit token uses the OIDC JWT;
+   * an explicit token always wins; token="" opts out of authentication. */
+  private async authorizationHeader(): Promise<string | undefined> {
+    if (this.isAuthorizedIntegrationMode()) {
+      if (this.token === "") return undefined;
+      if (this.token) return `token ${this.token}`;
+      return `Bearer ${await this.getJwt()}`;
+    }
+    if (!this.token) return undefined;
+    return `token ${this.token}`;
+  }
+
+  private async options(accept?: string): Promise<Parameters<typeof requestJson>[1]> {
+    return {
+      token: await this.authorizationHeader(),
+      accept,
+      timeoutMs: this.timeoutMs,
+      fetchImpl: this.fetchImpl,
+      allowedOrigin: this.origin,
+    };
+  }
+
+  /** Exchange the runner's OIDC identity for a JWT (port of
+   * `_fetch_authorized_integration_jwt`), cached for 45 minutes. */
+  private async getJwt(): Promise<string> {
+    const cached = this.jwtCache;
+    if (cached && Date.now() - cached.fetchedAt < JWT_TTL_SECONDS * 1000) return cached.token;
+    const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL ?? "";
+    const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ?? "";
+    if (!requestUrl || !requestToken) {
+      throw new PlatformRequestError(
+        "Authorized-integration mode requires ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        null,
+        "missing-oidc-env",
+      );
+    }
+    const { status, text } = await requestText(`${requestUrl}&audience=${encodeURIComponent(this.audience)}`, {
+      token: `bearer ${requestToken}`,
+      timeoutMs: this.timeoutMs,
+      fetchImpl: this.fetchImpl,
+      allowedOrigin: new URL(requestUrl).origin,
+    });
+    if (status !== 200) {
+      throw new PlatformRequestError(`OIDC token exchange failed with status ${status}`, status, "oidc");
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new PlatformRequestError("OIDC token exchange returned invalid JSON", null, "invalid-json");
+    }
+    const jwt = isObject(payload) && typeof payload.value === "string" ? payload.value : "";
+    if (!jwt) throw new PlatformRequestError("OIDC token exchange returned no token value", null, "oidc");
+    this.jwtCache = { token: jwt, fetchedAt: Date.now() };
+    return jwt;
+  }
+
+  /** Normalize a Forgejo PR payload into the GitHub shape (#254 golden
+   * fixtures). head.repo.full_name missing → "" so fork detection fails
+   * closed; head.repo is never defaulted to the base repo. */
+  private static prToGithubShape(data: unknown, owner: string, repo: string, prNumber: string): unknown {
+    if (!isObject(data)) return null;
+    const head = isObject(data.head) ? data.head : {};
+    const base = isObject(data.base) ? data.base : {};
+    const branchRepoFullName = (branch: Record<string, unknown>): string => {
+      const branchRepo = isObject(branch.repo) ? branch.repo : {};
+      return typeof branchRepo.full_name === "string" ? branchRepo.full_name : "";
+    };
+    return {
+      number: data.number ?? prNumber,
+      title: data.title ?? "",
+      body: data.body ?? "",
+      state: data.state ?? "open",
+      user: { login: isObject(data.user) ? data.user.login ?? "" : "" },
+      head: {
+        sha: head.sha ?? "",
+        ref: head.ref ?? "",
+        repo: { full_name: branchRepoFullName(head) },
+      },
+      base: {
+        sha: base.sha ?? "",
+        ref: base.ref ?? "",
+        repo: { full_name: branchRepoFullName(base) || `${owner}/${repo}` },
+      },
+      merged_at: data.merged_at ?? null,
+      created_at: data.created_at ?? "",
+      updated_at: data.updated_at ?? "",
+      url: data.html_url ?? "",
+      draft: Boolean(data.draft),
+      labels: Array.isArray(data.labels)
+        ? data.labels.map((label: unknown) => ({ name: isObject(label) ? label.name ?? "" : "" }))
+        : [],
+    };
+  }
+
+  async getPr(): Promise<unknown | null> {
+    const { owner, repo } = parseRepo(this.repo);
+    try {
+      const { status, data } = await requestJson(
+        this.repoUrl("/pulls/", this.prNumber),
+        (await this.options()),
+      );
+      if (status !== 200) return null;
+      return ForgejoAdapter.prToGithubShape(data, owner, repo, this.prNumber);
+    } catch {
+      return null;
+    }
+  }
+
+  async getPrDiff(): Promise<string> {
+    parseRepo(this.repo);
+    try {
+      const { status, text } = await requestText(
+        this.repoUrl("/pulls/", `${this.prNumber}.diff`),
+        (await this.options("application/json")),
+      );
+      return status === 200 ? text : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async listIssueComments(): Promise<ManagedComment[]> {
+    parseRepo(this.repo);
+    const allComments: ManagedComment[] = [];
+    let page = 1;
+    for (;;) {
+      let status = 0;
+      let comments: unknown = null;
+      try {
+        const result = await requestJson(
+          this.repoUrl("/issues/", `${this.prNumber}/comments?page=${page}&limit=50`),
+          (await this.options()),
+        );
+        status = result.status;
+        comments = result.data;
+      } catch {
+        break;
+      }
+      if (status !== 200 || !Array.isArray(comments) || comments.length === 0) break;
+      for (const comment of comments) {
+        if (!isObject(comment)) continue;
+        allComments.push({
+          id: typeof comment.id === "number" || typeof comment.id === "string" ? comment.id : undefined,
+          body: typeof comment.body === "string" ? comment.body : "",
+          created_at: typeof comment.created_at === "string" ? comment.created_at : typeof comment.created_on === "string" ? comment.created_on : undefined,
+          updated_at: typeof comment.updated_at === "string" ? comment.updated_at : typeof comment.updated_on === "string" ? comment.updated_on : undefined,
+          author: forgejoAuthor(comment.user),
+        });
+      }
+      if (comments.length < 50) break;
+      page += 1;
+    }
+    return allComments;
+  }
+
+  async listPrReviews(): Promise<ManagedReview[]> {
+    parseRepo(this.repo);
+    let data: unknown = null;
+    let status = 0;
+    try {
+      const result = await requestJson(this.repoUrl("/pulls/", `${this.prNumber}/reviews`), (await this.options()));
+      status = result.status;
+      data = result.data;
+    } catch {
+      return [];
+    }
+    if (status !== 200 || !Array.isArray(data)) return [];
+    return data
+      .filter(isObject)
+      .map((review) => ({
+        id: review.id,
+        body: typeof review.body === "string" ? review.body : "",
+        submitted_at:
+          typeof review.submitted_at === "string" ? review.submitted_at : typeof review.updated_at === "string" ? review.updated_at : undefined,
+        author: forgejoAuthor(review.user),
+      }));
+  }
+
+  /** #970: resolve the login this token posts as (`GET /user`). The
+   * authorized-integration mode's OIDC JWT may not resolve to a user there;
+   * any failure is `null` and the precheck fails closed rather than trusting
+   * an unauthenticated marker. */
+  async authenticatedIdentity(): Promise<string | null> {
+    try {
+      const { status, data } = await requestJson(this.apiPath("/user"), await this.options("application/json"));
+      if (status !== 200 || !isObject(data)) return null;
+      const login = data.login;
+      return typeof login === "string" && login.trim() !== "" ? login : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** `_curl` semantics for a read: `{status, text}`, with a transport
+   * failure reported as status 0 (v2: curl's nonzero exit code stands in
+   * for the HTTP status, so it is never 200). A credential failure (the
+   * authorized-integration JWT exchange) throws: v2's CLI raises there. */
+  private async curl(url: string, timeoutMs?: number, preserveRedirectStatus = false): Promise<{ status: number; text: string }> {
+    const options = await this.options();
+    try {
+      const { status, text } = await requestText(url, { ...options, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+      return { status, text };
+    } catch (error) {
+      if (preserveRedirectStatus && error instanceof PlatformRequestError
+        && error.kind === "redirect-blocked" && error.status !== null) {
+        return { status: error.status, text: "" };
+      }
+      return { status: 0, text: "" };
+    }
+  }
+
+  /** Run one read; anything the v2 CLI would raise on fails the read. The
+   * body builds every URL through `at`, which refuses (before any request)
+   * an invalid repo ref or a path that normalizes outside the repo. */
+  private async read<T>(body: (at: (staticTail: string, dynamicTail?: string) => string) => Promise<T>, repo = this.repo): Promise<ReadResult<T>> {
+    if (parseRepoRef(repo) === null) return { ok: false, error: `Invalid repo full name: ${repo}` };
+    try {
+      return { ok: true, data: await body((staticTail, dynamicTail = "") => this.repoUrl(staticTail, dynamicTail, repo)) };
+    } catch (error) {
+      return { ok: false, error: errorText(error) };
+    }
+  }
+
+  /** `list_pr_files`: a failed or non-list read is `[]`. */
+  listPrFiles(): Promise<ReadResult<unknown>> {
+    return this.read(async (at) => {
+      const { status, text } = await this.curl(at("/pulls/", `${this.prNumber}/files`));
+      return status === 200 ? normalizeForgejoPrFiles(pyJsonDecode(text)) : [];
+    });
+  }
+
+  /** `fetch_issue`. v2 quirk kept for parity: a failed Forgejo fetch is a
+   * SUCCESSFUL read whose payload is `null` (the CLI prints `null` and exits
+   * 0), unlike GitHub, where the read fails. */
+  async getIssue(repo: string, issueNumber: string): Promise<ReadResult<unknown>> {
+    if (!NUMBER_RE.test(issueNumber)) return { ok: false, error: "invalid issue reference" };
+    return this.read(async (at) => {
+      const { status, text } = await this.curl(at("/issues/", issueNumber));
+      return status === 200 ? normalizeForgejoIssue(pyJsonDecode(text)) : null;
+    }, repo);
+  }
+
+  /** `list_comments` (Forgejo) normalized, then the seam's
+   * `sort_by(.created_at // "") | reverse | .[0:100]`. Pages of 50; a
+   * failed or empty page ends the listing with what was collected. */
+  listPrConversationComments(): Promise<ReadResult<unknown[]>> {
+    return this.read(async (at) => {
+      const all: unknown[] = [];
+      for (let page = 1; ; page += 1) {
+        const { status, text } = await this.curl(at("/issues/", `${this.prNumber}/comments?page=${page}&limit=50`));
+        if (status !== 200) break;
+        const comments = pyJsonDecode(text);
+        if (!Array.isArray(comments) || comments.length === 0) break;
+        all.push(...comments);
+        if (comments.length < 50) break;
+      }
+      return normalizeForgejoConversationComments(all);
+    });
+  }
+
+  /** `list_review_threads`: every review's comments grouped into threads. */
+  listReviewThreads(): Promise<ReadResult<unknown[]>> {
+    return this.read(async (at) => {
+      const { status, text } = await this.curl(at("/pulls/", `${this.prNumber}/reviews`));
+      if (status !== 200) return [];
+      const reviews = pyJsonDecode(text);
+      if (!Array.isArray(reviews)) return [];
+      const commentLists: unknown[][] = [];
+      for (const review of reviews) {
+        const reviewId = forgejoReviewCommentId(review);
+        if (reviewId === null) continue;
+        const response = await this.curl(at("/pulls/", `${this.prNumber}/reviews/${reviewId}/comments`));
+        if (response.status !== 200) continue;
+        const comments = pyJsonDecode(response.text);
+        if (Array.isArray(comments)) commentLists.push(comments);
+      }
+      return groupForgejoReviewThreads(commentLists);
+    });
+  }
+
+  /** `list_pr_reviews` (Forgejo serves every review in one response; the v2
+   * `paginate` argument does not change the Forgejo request). */
+  listPrReviewsPaginated(): Promise<ReadResult<unknown[]>> {
+    return this.read(async (at) => {
+      const { status, text } = await this.curl(at("/pulls/", `${this.prNumber}/reviews`));
+      return status === 200 ? normalizeForgejoReviews(pyJsonDecode(text)) : [];
+    });
+  }
+
+  /** `platform_external_checks` on Forgejo: the empty check-runs struct plus
+   * the `commit-status` CLI output. v2 quirk kept for parity: a failed
+   * status read prints `null`, which folds to `[]` ("no external CI"), not
+   * to the empty/transient signal. The status read is bounded like the
+   * GitHub CI reads (#663); a timeout or exhausted deadline counts as that
+   * same failed read. */
+  async externalChecks(sha: string, options: ExternalChecksOptions = {}): Promise<ExternalCheck[] | null> {
+    if (options.selfRunNumbers !== undefined && options.selfStatusDiscovery) {
+      options.selfStatusDiscovery.found = false;
+      options.selfStatusDiscovery.ambiguous = false;
+      options.selfStatusDiscovery.matchCount = 0;
+      options.selfStatusDiscovery.context = null;
+      options.selfStatusDiscovery.runJobs ??= "unknown";
+      options.selfStatusDiscovery.runJobCount ??= null;
+      options.selfStatusDiscovery.runJobCountExact ??= false;
+      options.selfStatusDiscovery.runJobHtmlUrl ??= null;
+      options.selfStatusDiscovery.runJobsUnavailableReason ??= null;
+    }
+    if (!SHA_RE.test(sha)) return null;
+    if (options.transientAsUnknown === true) return this.externalChecksStrict(sha, options);
+    const status = await this.read(async (at) => {
+      const timeoutMs = ciAttemptTimeoutMs(options);
+      if (timeoutMs === null) return "null";
+      const response = await this.curl(at("/commits/", `${sha}/status`), timeoutMs);
+      if (response.status !== 200) return "null";
+      const normalized = normalizeForgejoCommitStatus(pyJsonDecode(response.text));
+      return normalized === null ? "null" : JSON.stringify(normalized);
+    });
+    // A raising CLI prints nothing (`|| echo ""`).
+    const combinedText = status.ok ? status.data : "";
+    if (options.selfRunNumbers === undefined) {
+      return normalizeExternalChecks(FORGEJO_EMPTY_CHECK_RUNS, combinedText, options.runId ?? "", options.statusContext ?? "");
+    }
+    return this.normalizeAutoSelfStatus(combinedText, options);
+  }
+
+  /** `externalChecks` under the v3 CI gate's transient-read rule: no
+   * response, 429/5xx, or an undecodable 200 body is `null` ("unknown,
+   * retry") instead of the v2 `null` → `[]` fold. A non-200 JSON answer (for
+   * example a 404) and a malformed-but-decodable payload keep the v2 fold:
+   * they are persistent, and retrying cannot change them. */
+  private async externalChecksStrict(sha: string, options: ExternalChecksOptions): Promise<ExternalCheck[] | null> {
+    const status = await this.read(async (at): Promise<string | null> => {
+      const timeoutMs = ciAttemptTimeoutMs(options);
+      if (timeoutMs === null) return null;
+      const response = await this.curl(at("/commits/", `${sha}/status`), timeoutMs);
+      if (isTransientCiRead(response.status, response.status === 200 ? response.text : "null")) return null;
+      if (response.status !== 200) return "null";
+      const decoded = pyJsonDecode(response.text);
+      if (decoded === null) return null;
+      return JSON.stringify(normalizeForgejoCommitStatus(decoded));
+    });
+    if (status.ok && status.data === null) return null;
+    const combinedText = status.ok ? status.data ?? "" : "";
+    if (options.selfRunNumbers === undefined) {
+      return normalizeExternalChecks(FORGEJO_EMPTY_CHECK_RUNS, combinedText, options.runId ?? "", options.statusContext ?? "");
+    }
+    return this.normalizeAutoSelfStatus(combinedText, options);
+  }
+
+  private async readRunJobs(options: ExternalChecksOptions): Promise<ForgejoRunJobsNormalization | null> {
+    const runId = options.selfRunId?.trim() ?? "";
+    if (!NUMBER_RE.test(runId)) {
+      if (options.selfStatusDiscovery) options.selfStatusDiscovery.runJobsUnavailableReason = "run-id environment variable is missing or non-numeric";
+      return { state: "unavailable", count: null, exact: false };
+    }
+    const timeoutMs = ciAttemptTimeoutMs(options);
+    if (timeoutMs === null) return null;
+    let response: { status: number; text: string };
+    try {
+      const { owner, repo } = parseRepo(this.repo);
+      const url = this.apiPath(`/repos/${owner}/${repo}/actions/runs/${runId}/jobs`);
+      response = await this.curl(url, timeoutMs, true);
+    } catch {
+      if (options.selfStatusDiscovery) options.selfStatusDiscovery.runJobsUnavailableReason = "invalid repository for run-jobs endpoint";
+      return { state: "unavailable", count: null, exact: false };
+    }
+
+    // Unlike the shared CI-read rule, a jobs lookup treats timeout/early
+    // request responses as retryable rather than proof that the endpoint is absent.
+    if (response.status === 0 || response.status === 408 || response.status === 425
+      || response.status === 429 || response.status >= 500
+      || (response.status === 200 && isTransientCiRead(response.status, response.text))) return null;
+    if (response.status !== 200) {
+      if (options.selfStatusDiscovery) {
+        options.selfStatusDiscovery.runJobsUnavailableReason = `run-jobs endpoint returned HTTP ${response.status}`;
+      }
+      return { state: "unavailable", count: null, exact: false };
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(response.text);
+    } catch {
+      return null;
+    }
+    const result = normalizeForgejoRunJobs(decoded, FORGEJO_RUN_JOBS_PAGE_SIZE);
+    if (result.state === "unavailable" && options.selfStatusDiscovery) {
+      options.selfStatusDiscovery.runJobsUnavailableReason = "run-jobs response could not prove the run's job count";
+    }
+    return result;
+  }
+
+  private async normalizeAutoSelfStatus(combinedText: string, options: ExternalChecksOptions): Promise<ExternalCheck[] | null> {
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(combinedText.replace(/\n+$/, ""));
+    } catch {
+      if (options.selfStatusDiscovery) {
+        options.selfStatusDiscovery.found = false;
+        options.selfStatusDiscovery.ambiguous = false;
+        options.selfStatusDiscovery.matchCount = 0;
+        options.selfStatusDiscovery.context = null;
+      }
+      return [];
+    }
+    const statuses = isObject(decoded) && Array.isArray(decoded.statuses) ? decoded.statuses : [];
+    const matches = forgejoSelfStatusMatches(
+      statuses,
+      options.selfRunNumbers ?? [],
+      options.selfRunRepo ?? "",
+      options.selfRunOrigin ?? "",
+    );
+    const matchedStatus = matches.index === null ? null : statuses[matches.index];
+    const targetUrl = isObject(matchedStatus) && typeof matchedStatus.target_url === "string" ? matchedStatus.target_url : null;
+    const discovery = options.selfStatusDiscovery;
+    const ambiguous = matches.count > 1;
+    let excludeIndex: number | undefined;
+
+    // Ambiguity in the status payload is conclusive: do not spend a jobs API
+    // read or try to hide one of the sibling checks.
+    if (!ambiguous && matches.count === 1 && discovery?.runJobs === "unknown") {
+      const jobs = await this.readRunJobs(options);
+      if (jobs === null) return null;
+      discovery.runJobs = jobs.state;
+      discovery.runJobCount = jobs.count;
+      discovery.runJobCountExact = jobs.state === "single" || jobs.state === "multi" && jobs.exact;
+      discovery.runJobHtmlUrl = jobs.state === "single" ? jobs.htmlUrl : null;
+    }
+
+    if (discovery) {
+      discovery.found = false;
+      discovery.ambiguous = ambiguous;
+      discovery.matchCount = matches.count;
+      discovery.context = matches.context;
+      if (!ambiguous && matches.count === 1 && discovery.runJobs === "single"
+        && targetUrl !== null && discovery.runJobHtmlUrl !== null
+        && forgejoJobStatusPathsMatch(discovery.runJobHtmlUrl, targetUrl, options.selfRunOrigin ?? "")) {
+        discovery.found = true;
+        excludeIndex = matches.index ?? undefined;
+      }
+    }
+
+    return normalizeExternalChecks(FORGEJO_EMPTY_CHECK_RUNS, combinedText, options.runId ?? "", options.statusContext ?? "", {
+      selfRunNumbers: options.selfRunNumbers,
+      selfStatusIndex: excludeIndex,
+    });
+  }
+
+  /** Linked-source enrichment client whose configured-host credential is
+   * this adapter's (token or authorized-integration JWT). */
+  enrichClient(): ForgejoEnrichClient {
+    return new ForgejoEnrichClient({
+      configuredApiUrl: this.baseUrl,
+      configuredAuthorization: () => this.authorizationHeader(),
+      timeoutMs: this.timeoutMs,
+      fetchImpl: this.fetchImpl,
+    });
+  }
+
+  private static permissionFromRepoPayload(data: unknown): string | null {
+    if (!isObject(data)) return null;
+    const perms = isObject(data.permissions) ? data.permissions : null;
+    if (!perms) return null;
+    if (perms.admin === true) return "admin";
+    if (perms.write === true || perms.push === true) return "write";
+    if (perms.read === true || perms.pull === true) return "read";
+    return null;
+  }
+
+  /** Effective repository permission for the active token (port of
+   * `get_authenticated_repo_permission`): "read"|"write"|"admin" resolved
+   * against a recognized Forgejo schema, "unknown" when a 200 payload
+   * carries no recognizable permission field, null on transport/auth
+   * failure. */
+  async repoPermission(): Promise<string | null> {
+    parseRepo(this.repo);
+    const auth = await this.authorizationHeader();
+    const authOptions = { ...(await this.options()), token: auth };
+    const permissionFromRepoPayload = ForgejoAdapter.permissionFromRepoPayload;
+
+    if (this.isAuthorizedIntegrationMode()) {
+      let status = 0;
+      let body: unknown = null;
+      try {
+        const result = await requestJson(this.repoUrl(""), authOptions);
+        status = result.status;
+        body = result.data;
+      } catch {
+        return null;
+      }
+      const permission = permissionFromRepoPayload(body);
+      if (status === 200 && permission !== null) return permission;
+      if (status === 200) return "unknown";
+      return null;
+    }
+
+    let userStatus = 0;
+    let user: unknown = null;
+    try {
+      const result = await requestJson(this.apiPath("/user"), authOptions);
+      userStatus = result.status;
+      user = result.data;
+    } catch {
+      return null;
+    }
+    const login = userStatus === 200 && isObject(user) && typeof user.login === "string" ? user.login : "";
+    if (!login) {
+      if (userStatus === 200) return "unknown";
+      return null;
+    }
+    let status = 0;
+    let data: unknown = null;
+    try {
+      const result = await requestJson(
+        this.repoUrl("/collaborators/", `${encodeURIComponent(login)}/permission`),
+        authOptions,
+      );
+      status = result.status;
+      data = result.data;
+    } catch {
+      return null;
+    }
+    let permission = status === 200 && isObject(data) && typeof data.permission === "string" ? data.permission : "";
+    if (permission === "owner") permission = "admin";
+    if (permission === "read" || permission === "write" || permission === "admin") return permission;
+    if (status === 404) {
+      let fallbackStatus = 0;
+      let fallback: unknown = null;
+      try {
+        const result = await requestJson(this.repoUrl(""), authOptions);
+        fallbackStatus = result.status;
+        fallback = result.data;
+      } catch {
+        return null;
+      }
+      const repoPermission = permissionFromRepoPayload(fallback);
+      if (fallbackStatus === 200 && repoPermission !== null) return repoPermission;
+      if (fallbackStatus === 200) return "unknown";
+      return null;
+    }
+    if (status === 200) return "unknown";
+    return null;
+  }
+
+  private validate(endpoint: string): EndpointValidation {
+    return validateEndpoint(endpoint, "*", this.repo);
+  }
+
+  /** The validated read-only seam, mirroring `pr_reviewer.platform.gh_api`
+   * on the Forgejo backend: GitHub-shaped paths translated onto /api/v1,
+   * anything unmapped fails closed with "Endpoint not supported". */
+  async ghApi(endpoint: string): Promise<GhApiResult> {
+    const validated = this.validate(endpoint);
+    if ("error" in validated) return validated;
+    const translated = ForgejoAdapter.translate(validated.full_path, validated.repo_key);
+    if (!translated) {
+      return { error: `Endpoint not supported on PLATFORM=forgejo: ${endpoint}` };
+    }
+    if (!this.token && !this.isAuthorizedIntegrationMode()) {
+      return { error: "Missing FORGEJO_TOKEN" };
+    }
+    try {
+      // `translate` already returns the /api/v1-prefixed path (as v2's
+      // `_forgejo_translate` does); join it to the bare base like v2.
+      const { status, data } = await requestJson(`${this.baseUrl}${translated}`, (await this.options("application/json")));
+      if (status !== 200) return { error: `Forgejo API error: ${status}` };
+      return { data };
+    } catch (error) {
+      if (error instanceof PlatformRequestError && error.status !== null) {
+        return { error: `Forgejo API error: ${error.status}` };
+      }
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Port of `_forgejo_translate`: map a validated GitHub-shaped path onto
+   * the Forgejo /api/v1 namespace. Returns null (fail closed) for anything
+   * outside the table. */
+  static translate(fullPath: string, repoKey: string): string | null {
+    if (!repoKey) {
+      if (fullPath.startsWith("/search/")) return `/api/v1${fullPath}`;
+      return null;
+    }
+    const repos = `/repos/${repoKey}`;
+    if (!fullPath.startsWith(repos)) return null;
+    const rest = fullPath.slice(repos.length);
+    if (rest === "/pulls" || rest.startsWith("/pulls/")) {
+      if (rest.endsWith("/diff")) {
+        const n = rest.slice("/pulls/".length, -"/diff".length);
+        return `/api/v1/repos/${repoKey}/pulls/${n}.diff`;
+      }
+      return `/api/v1/repos/${repoKey}${rest}`;
+    }
+    if (rest === "/issues" || rest.startsWith("/issues/")) return `/api/v1/repos/${repoKey}${rest}`;
+    // #914: the commenter-permission lookup for the comment re-review
+    // command. The GitHub-shaped path is byte-identical on Forgejo's API v1
+    // (and its response carries the same `permission` field).
+    if (rest.startsWith("/collaborators/")) return `/api/v1/repos/${repoKey}${rest}`;
+    if (rest === "/compare" || rest.startsWith("/compare/")) {
+      return `/api/v1/repos/${repoKey}/compare/${rest.slice("/compare/".length)}`;
+    }
+    if (rest === "/releases/tags" || rest.startsWith("/releases/tags/")) return `/api/v1/repos/${repoKey}${rest}`;
+    if (rest === "/commits" || rest.startsWith("/commits/")) return `/api/v1/repos/${repoKey}${rest}`;
+    return null;
+  }
+}

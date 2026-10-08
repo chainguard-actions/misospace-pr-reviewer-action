@@ -1,0 +1,1302 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  runHttpRequest,
+  resolveEndpoint,
+  TransportFailure,
+  classifySocketError,
+  describeTransportFailure,
+  DEFAULT_MAX_RESPONSE_BYTES,
+  OVERSIZE_ERROR_BODY_PREFIX_BYTES,
+} from "../src/transport/http.js";
+import { KNOWN_SECRET_REDACTED, maskKnownSecrets, redactText } from "../src/context/redact.js";
+import { parseStatedTokenCap, runChatRequest } from "../src/transport/transport.js";
+import { startMockServer, sseResponse } from "./helpers.js";
+import type { TransportWirePayload } from "../src/model/types.js";
+
+function payload(body: Record<string, unknown>): TransportWirePayload {
+  return { endpointPath: "/chat/completions", body: body as unknown as TransportWirePayload["body"] };
+}
+
+test("endpoint join strips trailing slashes and picks the protocol path", () => {
+  assert.equal(resolveEndpoint("http://x:8080/v1", "openai").toString(), "http://x:8080/v1/chat/completions");
+  assert.equal(resolveEndpoint("http://x:8080/v1/", "openai").toString(), "http://x:8080/v1/chat/completions");
+  assert.equal(resolveEndpoint("http://x:8080", "anthropic").toString(), "http://x:8080/messages");
+});
+
+test("openai non-streamed success sends Bearer auth and the wire payload", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(JSON.stringify({ id: "1", choices: [{ message: { content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2 } }));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, messages: [] }),
+      apiKey: "sk-test",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    if (outcome.status !== "ok") return;
+    assert.equal(outcome.response.content, "hi");
+    assert.deepEqual(outcome.response.usage, { promptTokens: 3, completionTokens: 2, totalTokens: 5 });
+    assert.equal(server.requests.length, 1);
+    assert.equal(server.requests[0]!.headers.authorization, "Bearer sk-test");
+    assert.equal(server.requests[0]!.headers["content-type"], "application/json");
+    assert.equal(server.requests[0]!.headers["anthropic-version"], undefined);
+    assert.equal(JSON.parse(server.requests[0]!.body).model, "m");
+  } finally {
+    await server.close();
+  }
+});
+
+test("anthropic sends x-api-key and anthropic-version, never Bearer", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(JSON.stringify({ id: "m1", content: [{ type: "text", text: "ok" }], usage: { input_tokens: 4, output_tokens: 1 }, stop_reason: "end_turn" }));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: `${server.url}/v1/`,
+      apiFormat: "anthropic",
+      payload: { endpointPath: "/messages", body: { model: "m", stream: false, max_tokens: 8 } as unknown as TransportWirePayload["body"] },
+      apiKey: "ak-test",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    assert.equal(server.requests[0]!.headers["x-api-key"], "ak-test");
+    assert.equal(server.requests[0]!.headers["anthropic-version"], "2023-06-01");
+    assert.equal(server.requests[0]!.headers.authorization, undefined);
+    // Anthropic non-streamed bodies normalize into the shared shape too.
+    if (outcome.status === "ok") {
+      assert.equal(outcome.response.content, "ok");
+      assert.equal(outcome.response.finishReason, "end_turn");
+      assert.deepEqual(outcome.response.usage, { promptTokens: 4, completionTokens: 1, totalTokens: 5 });
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("empty api key sends no auth header", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end("{}");
+  });
+  try {
+    await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(server.requests[0]!.headers.authorization, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the api key rides only the auth headers — never the URL, body, or failure diagnostics", async () => {
+  // The durable secret-transport invariant (successor of the deleted v2
+  // argv guard, #706 wave 1): credentials travel exclusively in the auth
+  // header; they must not appear in the request URL, the serialized wire
+  // body, or any locally generated failure/diagnostic text.
+  const key = "sk-secret-7f4c9a1d-no-leak";
+  const seenUrls: string[] = [];
+
+  for (const apiFormat of ["openai", "anthropic"] as const) {
+    const server = await startMockServer((req, _body, res) => {
+      seenUrls.push(req.url ?? "");
+      res.statusCode = 200;
+      res.end(apiFormat === "openai"
+        ? '{"id":"1","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}'
+        : '{"id":"m1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}');
+    });
+    try {
+      const outcome = await runChatRequest({
+        baseUrl: server.url,
+        apiFormat,
+        payload: apiFormat === "openai"
+          ? payload({ model: "m", stream: false })
+          : ({ endpointPath: "/messages", body: { model: "m", stream: false, max_tokens: 8 } } as unknown as TransportWirePayload),
+        apiKey: key,
+        anthropicVersion: "2023-06-01",
+        requestTimeoutSec: 5,
+        connectTimeoutSec: 5,
+      });
+      assert.equal(outcome.status, "ok");
+      // Positive control: the key was sent, and only via the auth header.
+      const headers = server.requests.at(-1)!.headers;
+      assert.ok(
+        headers.authorization === `Bearer ${key}` || headers["x-api-key"] === key,
+        "the key must ride the provider's auth header",
+      );
+      assert.ok(!seenUrls.at(-1)!.includes(key), "the request URL must not carry the key");
+      assert.ok(!server.requests.at(-1)!.body.includes(key), "the wire body must not carry the key");
+    } finally {
+      await server.close();
+    }
+  }
+
+  // Typed failures are locally generated diagnostics: neither the message
+  // nor the preserved body may echo the credential.
+  const failServer = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
+    res.end(JSON.stringify({ error: { message: "bad request" } }));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: failServer.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: key,
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.ok(!outcome.failure.message.includes(key), "the failure message must not carry the key");
+    assert.ok(!String(outcome.failure.body ?? "").includes(key), "the preserved failure body must not carry the key");
+    assert.ok(!JSON.stringify(outcome.failure, ["kind", "status", "body"]).includes(key), "the serialized failure must not carry the key");
+  } finally {
+    await failServer.close();
+  }
+
+  const refused = await runChatRequest({
+    baseUrl: "http://127.0.0.1:1",
+    apiFormat: "anthropic",
+    payload: { endpointPath: "/messages", body: { model: "m", stream: false, max_tokens: 8 } } as unknown as TransportWirePayload,
+    apiKey: key,
+    anthropicVersion: "2023-06-01",
+    requestTimeoutSec: 5,
+    connectTimeoutSec: 5,
+  });
+  assert.equal(refused.status, "failure");
+  if (refused.status !== "failure") return;
+  assert.equal(refused.failure.kind, "network");
+  assert.ok(!refused.failure.message.includes(key), "the network-failure message must not carry the key");
+});
+
+test("streamed responses reassemble through the transport", async () => {
+  const server = await startMockServer(sseResponse([
+    'data: {"choices":[{"delta":{"content":"a"}}]}',
+    'data: {"choices":[{"delta":{"content":"b"},"finish_reason":null}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}',
+    "data: [DONE]",
+  ]));
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: true }),
+      apiKey: "k",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    if (outcome.status === "ok") assert.equal(outcome.response.content, "ab");
+  } finally {
+    await server.close();
+  }
+});
+
+test("HTTP error bodies are preserved on typed failures", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
+    res.end(JSON.stringify({ error: { message: "context length exceeded" } }));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "http_status");
+    assert.equal(outcome.failure.status, 400);
+    assert.equal(outcome.failure.body, '{"error":{"message":"context length exceeded"}}');
+    assert.equal(outcome.failure.message, "model endpoint returned HTTP 400");
+  } finally {
+    await server.close();
+  }
+});
+
+test("3xx redirects are typed http_status failures and are never followed", async () => {
+  let requests = 0;
+  const server = await startMockServer((_req, _body, res) => {
+    requests++;
+    res.statusCode = 302;
+    res.setHeader("Location", `${_req.headers.origin ?? "http://elsewhere.invalid"}/redirected`);
+    res.end("Moved: see the Location header");
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "http_status");
+    assert.equal(outcome.failure.status, 302);
+    assert.equal(outcome.failure.body, "Moved: see the Location header");
+    assert.equal(outcome.failure.message, "model endpoint returned HTTP 302");
+    // Deterministic proof the redirect was not followed: exactly one request
+    // hit the wire; the Location target was never requested.
+    assert.equal(requests, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("connection refused is a typed network failure", async () => {
+  const outcome = await runChatRequest({
+    baseUrl: "http://127.0.0.1:1",
+    apiFormat: "openai",
+    payload: payload({ model: "m", stream: false }),
+    apiKey: "",
+    anthropicVersion: "2023-06-01",
+    requestTimeoutSec: 5,
+    connectTimeoutSec: 5,
+  });
+  assert.equal(outcome.status, "failure");
+  if (outcome.status === "failure") assert.equal(outcome.failure.kind, "network");
+});
+
+test("a server that never responds trips the request deadline", async () => {
+  const server = await startMockServer(() => { /* never respond */ });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 0.3,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status === "failure") assert.equal(outcome.failure.kind, "request_timeout");
+  } finally {
+    await server.close();
+  }
+});
+
+test("connect-timeout classification maps socket codes to typed failures", () => {
+  assert.equal(classifySocketError(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })).kind, "network");
+  assert.equal(classifySocketError(Object.assign(new Error("dns"), { code: "ENOTFOUND" })).kind, "network");
+  assert.equal(classifySocketError(new Error("weird")).kind, "network");
+  const existing = new TransportFailure("connect_timeout", "x");
+  assert.equal(classifySocketError(existing), existing);
+});
+
+test("non-JSON 200 bodies are a typed failure, not a crash", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end("<html>gateway</html>");
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    if (outcome.status === "failure") assert.equal(outcome.failure.kind, "network");
+    else assert.fail("expected failure");
+  } finally {
+    await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Response-byte ceiling (#745). The cap is enforced during receipt at the
+// HTTP boundary, below the SSE reassembler, for successes, streams, and
+// error bodies alike. Tests drive the real receive path
+// (socket -> data chunks -> byte accounting -> abort -> typed failure)
+// against the mock server; small caps keep them fast.
+// ---------------------------------------------------------------------------
+
+const CAP = 64;
+
+function byteChunks(total: number, chunkSize: number, fill = 0x61): Buffer[] {
+  const chunks: Buffer[] = [];
+  for (let written = 0; written < total; written += chunkSize) {
+    chunks.push(Buffer.alloc(Math.min(chunkSize, total - written), fill));
+  }
+  return chunks;
+}
+
+/** Streams raw byte chunks back-to-back, tolerating client aborts. */
+function streamBytes(res: import("node:http").ServerResponse, chunks: Buffer[]): void {
+  res.statusCode = 200;
+  res.on("error", () => {});
+  let index = 0;
+  const writeNext = (): void => {
+    if (res.destroyed || index >= chunks.length) {
+      res.end();
+      return;
+    }
+    res.write(chunks[index++]);
+    setImmediate(writeNext);
+  };
+  writeNext();
+}
+
+test("within-limit non-streamed success succeeds under a small cap", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(JSON.stringify({ id: "1", choices: [{ message: { content: "hi" } }] }));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "ok");
+    if (outcome.status === "ok") assert.equal(outcome.response.content, "hi");
+  } finally {
+    await server.close();
+  }
+});
+
+test("within-limit SSE response succeeds under a small cap", async () => {
+  const server = await startMockServer(sseResponse([
+    'data: {"choices":[{"delta":{"content":"a"}}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "data: [DONE]",
+  ]));
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: true }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: 512,
+    });
+    assert.equal(outcome.status, "ok");
+    if (outcome.status === "ok") assert.equal(outcome.response.content, "a");
+  } finally {
+    await server.close();
+  }
+});
+
+test("within-limit HTTP error body is still fully preserved under a small cap", async () => {
+  const body = JSON.stringify({ error: { message: "context length exceeded" } });
+  assert.ok(Buffer.byteLength(body) <= CAP);
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
+    res.end(body);
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "http_status");
+    assert.equal(outcome.failure.body, body);
+  } finally {
+    await server.close();
+  }
+});
+
+test("oversized non-streamed success aborts mid-receipt with a typed failure", async () => {
+  // The server intends ~100x the cap; the client must bail out holding at
+  // most the cap plus the single chunk that crossed it.
+  const intended = CAP * 100;
+  const chunkSize = 32;
+  let sawClose: (() => void) | null = null;
+  const responseClosed = new Promise<void>((resolve) => { sawClose = resolve; });
+  const server = await startMockServer((_req, _body, res) => {
+    streamBytes(res, byteChunks(intended, chunkSize));
+    res.on("close", () => sawClose?.());
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "response_too_large");
+    assert.equal(outcome.failure.maxResponseBytes, CAP);
+    assert.ok(outcome.failure.bytesReceived !== undefined);
+    // The client never retained anywhere near the full body: at most the
+    // cap plus the one crossing chunk was ever accumulated.
+    assert.ok(outcome.failure.bytesReceived <= CAP + chunkSize);
+    assert.ok(outcome.failure.bytesReceived > CAP);
+    // The intentional abort tears the response down promptly; the server
+    // side sees the close rather than streaming the full body.
+    await Promise.race([responseClosed, new Promise<void>((r) => setTimeout(r, 1000))]);
+    // Settles exactly once: no later socket error or timeout overwrote the
+    // typed failure (an unhandled rejection or crash would fail the test).
+    await new Promise<void>((r) => setTimeout(r, 100));
+  } finally {
+    await server.close();
+  }
+});
+
+test("many small chunks collectively exceeding the cap abort mid-stream", async () => {
+  // Deliberately not one giant chunk: N small writes cross the cap
+  // cumulatively, exposing implementations that only check after concat.
+  const chunkSize = 8;
+  const intended = CAP * 20;
+  const server = await startMockServer((_req, _body, res) => {
+    streamBytes(res, byteChunks(intended, chunkSize));
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "response_too_large");
+    assert.ok(outcome.failure.bytesReceived !== undefined);
+    assert.ok(outcome.failure.bytesReceived <= CAP + chunkSize);
+    assert.ok(intended > CAP + chunkSize);
+  } finally {
+    await server.close();
+  }
+});
+
+test("oversized SSE stream fails at the HTTP boundary, before reassembly", async () => {
+  const event = 'data: {"choices":[{"delta":{"content":"aaaaaaaa"}}]}\n\n';
+  const chunks: Buffer[] = [];
+  for (let i = 0; i < CAP * 10; i += Buffer.byteLength(event)) chunks.push(Buffer.from(event));
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream");
+    streamBytes(res, chunks);
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: true }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    // Typed response-size failure, not a network/socket misclassification
+    // of the intentional abort, and the SSE reassembler never ran.
+    assert.equal(outcome.failure.kind, "response_too_large");
+    assert.equal(outcome.failure.maxResponseBytes, CAP);
+  } finally {
+    await server.close();
+  }
+});
+
+test("oversized HTTP error body is not retained; typed failure wins over http_status", async () => {
+  // Larger than both the cap and the diagnostic-prefix budget, so real
+  // truncation (not just cap-trip) is proven.
+  const oversized = "E".repeat(CAP * 100);
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 500;
+    res.end(oversized);
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "response_too_large");
+    assert.equal(outcome.failure.status, 500);
+    assert.equal(outcome.failure.maxResponseBytes, CAP);
+    assert.ok(outcome.failure.bytesReceived !== undefined && outcome.failure.bytesReceived > CAP);
+    // Bounded diagnostic prefix with explicit truncation, never the body.
+    assert.ok(outcome.failure.body !== undefined);
+    assert.ok(outcome.failure.body.startsWith("E"));
+    assert.ok(outcome.failure.body.endsWith("…[error body truncated: response exceeded the transport response-byte limit]"));
+    assert.ok(outcome.failure.body.length <= OVERSIZE_ERROR_BODY_PREFIX_BYTES + 100);
+    assert.ok(outcome.failure.body.length < oversized.length);  } finally {
+    await server.close();
+  }
+});
+
+test("a response of exactly the byte limit succeeds; one byte over fails", async () => {
+  const atLimit = Buffer.alloc(CAP, 0x61).toString("latin1");
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(Buffer.from(atLimit, "latin1"));
+  });
+  try {
+    const result = await runHttpRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      bodyText: "{}",
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      stream: false,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(result.body, atLimit);
+  } finally {
+    await server.close();
+  }
+
+  const server2 = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(Buffer.alloc(CAP + 1, 0x61));
+  });
+  try {
+    let caught: unknown = null;
+    try {
+      await runHttpRequest({
+        baseUrl: server2.url,
+        apiFormat: "openai",
+        bodyText: "{}",
+        apiKey: "",
+        anthropicVersion: "2023-06-01",
+        requestTimeoutSec: 5,
+        connectTimeoutSec: 5,
+        stream: false,
+        maxResponseBytes: CAP,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught instanceof TransportFailure);
+    assert.equal((caught as TransportFailure).kind, "response_too_large");
+    assert.equal((caught as TransportFailure).bytesReceived, CAP + 1);
+  } finally {
+    await server2.close();
+  }
+});
+
+test("UTF-8 multibyte content is counted in bytes, including chunks split mid-character", async () => {
+  // "😀αα" is 4 + 2 + 2 = 8 bytes; the first chunk deliberately splits the
+  // emoji after 3 bytes so byte accounting, not string length, decides.
+  const emoji = Buffer.from("😀", "utf8");
+  const alpha = Buffer.from("αα", "utf8");
+  const body = Buffer.concat([emoji, alpha]);
+  assert.equal(body.length, 8);
+
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.write(body.subarray(0, 3));
+    res.write(body.subarray(3));
+    res.end();
+  });
+  try {
+    const result = await runHttpRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      bodyText: "{}",
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      stream: false,
+      maxResponseBytes: 8,
+    });
+    assert.equal(result.body, "😀αα");
+  } finally {
+    await server.close();
+  }
+
+  const server2 = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.write(body);
+    res.end();
+  });
+  try {
+    let caught: unknown = null;
+    try {
+      await runHttpRequest({
+        baseUrl: server2.url,
+        apiFormat: "openai",
+        bodyText: "{}",
+        apiKey: "",
+        anthropicVersion: "2023-06-01",
+        requestTimeoutSec: 5,
+        connectTimeoutSec: 5,
+        stream: false,
+        maxResponseBytes: 7,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught instanceof TransportFailure);
+    assert.equal((caught as TransportFailure).kind, "response_too_large");
+    assert.equal((caught as TransportFailure).bytesReceived, 8);
+  } finally {
+    await server2.close();
+  }
+});
+
+test("the default response-byte ceiling is enforced without per-call configuration", async () => {
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.end(Buffer.alloc(DEFAULT_MAX_RESPONSE_BYTES + 1, 0x61));
+  });
+  try {
+    let caught: unknown = null;
+    try {
+      await runHttpRequest({
+        baseUrl: server.url,
+        apiFormat: "openai",
+        bodyText: "{}",
+        apiKey: "",
+        anthropicVersion: "2023-06-01",
+        requestTimeoutSec: 5,
+        connectTimeoutSec: 5,
+        stream: false,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert.ok(caught instanceof TransportFailure);
+    assert.equal((caught as TransportFailure).kind, "response_too_large");
+    assert.equal((caught as TransportFailure).maxResponseBytes, DEFAULT_MAX_RESPONSE_BYTES);
+  } finally {
+    await server.close();
+  }
+});
+
+test("an endless response is abandoned at the cap without unbounded buffering or crashes", async () => {
+  // Adversarial: the endpoint never stops writing. The transport must stop
+  // receiving, settle exactly once with the typed failure, and survive the
+  // server's post-abort writes (no unhandled socket errors, no
+  // request_timeout overwrite) — node:test fails the test otherwise.
+  let sawClose: (() => void) | null = null;
+  const responseClosed = new Promise<void>((resolve) => { sawClose = resolve; });
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 200;
+    res.on("error", () => {});
+    const chunk = Buffer.alloc(32, 0x61);
+    const timer = setInterval(() => {
+      if (res.destroyed) {
+        clearInterval(timer);
+        return;
+      }
+      res.write(chunk);
+    }, 1);
+    res.on("close", () => {
+      clearInterval(timer);
+      sawClose?.();
+    });
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 30,
+      connectTimeoutSec: 5,
+      maxResponseBytes: CAP,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "response_too_large");
+    // The abort closed the connection while the server was still writing.
+    await Promise.race([responseClosed, new Promise<void>((r) => setTimeout(r, 1000))]);
+    // Give any post-abort socket noise time to surface; settle-once means
+    // the original typed failure must stand and nothing may crash.
+    await new Promise<void>((r) => setTimeout(r, 100));
+    assert.equal(outcome.failure.kind, "response_too_large");
+  } finally {
+    await server.close();
+  }
+});
+
+test("a slow but within-limit stream still succeeds (byte cap does not alter timing behavior)", async () => {
+  const server = await startMockServer(sseResponse([
+    'data: {"choices":[{"delta":{"content":"a"}}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "data: [DONE]",
+  ], { delayMs: 20 }));
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: true }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      maxResponseBytes: 512,
+    });
+    assert.equal(outcome.status, "ok");
+  } finally {
+    await server.close();
+  }
+});
+
+// ── retry on transient statuses ─────────────────────────────────────────────
+
+function retryServer(statuses: number[], retryAfter?: string) {
+  let requests = 0;
+  return startMockServer((_req, _body, res) => {
+    const status = statuses[Math.min(requests, statuses.length - 1)]!;
+    requests++;
+    res.statusCode = status;
+    if (retryAfter !== undefined) res.setHeader("Retry-After", retryAfter);
+    res.end(status < 400
+      ? JSON.stringify({ id: "1", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] })
+      : JSON.stringify({ error: { message: "slow down" } }));
+  }).then((server) => ({ server, count: () => requests }));
+}
+
+function retryInput(baseUrl: string, slept: number[]) {
+  return {
+    baseUrl,
+    apiFormat: "openai" as const,
+    payload: payload({ model: "m", stream: false }),
+    apiKey: "",
+    anthropicVersion: "2023-06-01",
+    requestTimeoutSec: 5,
+    connectTimeoutSec: 5,
+    sleep: async (ms: number) => { slept.push(ms); },
+  };
+}
+
+test("429 with Retry-After 0 is retried once and then succeeds", async () => {
+  const { server, count } = await retryServer([429, 200], "0");
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest(retryInput(server.url, slept));
+    assert.equal(outcome.status, "ok");
+    assert.equal(count(), 2);
+    assert.deepEqual(slept, [0]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("5xx without Retry-After backs off 1s then 2s", async () => {
+  const { server, count } = await retryServer([503, 503, 200]);
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest(retryInput(server.url, slept));
+    assert.equal(outcome.status, "ok");
+    assert.equal(count(), 3);
+    assert.deepEqual(slept, [1000, 2000]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a persistent 429 gives up after three attempts with the status preserved", async () => {
+  const { server, count } = await retryServer([429], "0");
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest(retryInput(server.url, slept));
+    assert.equal(outcome.status, "failure");
+    if (outcome.status !== "failure") return;
+    assert.equal(outcome.failure.kind, "http_status");
+    assert.equal(outcome.failure.status, 429);
+    assert.equal(outcome.failure.retryAfterSec, 0);
+    assert.equal(count(), 3);
+  } finally {
+    await server.close();
+  }
+});
+
+test("client errors are never retried", async () => {
+  const { server, count } = await retryServer([400]);
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest(retryInput(server.url, slept));
+    assert.equal(outcome.status, "failure");
+    assert.equal(count(), 1);
+    assert.deepEqual(slept, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("Retry-After is capped at the maximum delay; HTTP-date forms are ignored", async () => {
+  const { server } = await retryServer([429, 200], "600");
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest(retryInput(server.url, slept));
+    assert.equal(outcome.status, "ok");
+    assert.deepEqual(slept, [30000]);
+  } finally {
+    await server.close();
+  }
+  const dated = await retryServer([429, 200], "Wed, 21 Oct 2026 07:28:00 GMT");
+  const slept2: number[] = [];
+  try {
+    await runChatRequest(retryInput(dated.server.url, slept2));
+    assert.deepEqual(slept2, [1000]);
+  } finally {
+    await dated.server.close();
+  }
+});
+
+// ── max_tokens clamp-and-retry on HTTP 400 (#824) ───────────────────────────
+// Some providers reject a max_tokens above the model's output cap with a 400
+// instead of truncating. The transport parses only an explicitly stated cap
+// and retries the same request once at that cap.
+
+/** Swallows and records stderr while a clamp log line is expected. */
+function captureStderr(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: unknown): boolean => {
+    lines.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  return { lines, restore: (): void => { process.stderr.write = original; } };
+}
+
+const okCompletion = JSON.stringify({ id: "1", choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+
+test("parseStatedTokenCap: the fixtured error shapes and the no-retry shapes", () => {
+  const anthropicText = "max_tokens: 16384 > 8192, which is the maximum allowed number of output tokens for <model>";
+  const openaiText = "max_tokens is too large: 16384. This model supports at most 4096 completion tokens, whereas you provided 16384.";
+  const contextText = "This model's maximum context length is 8192 tokens and your request has 6000 input tokens.";
+
+  assert.deepEqual(parseStatedTokenCap(anthropicText), { cap: 8192, reason: "provider limit" });
+  assert.deepEqual(parseStatedTokenCap(JSON.stringify({ error: { message: anthropicText } })), { cap: 8192, reason: "provider limit" });
+  assert.deepEqual(parseStatedTokenCap(openaiText), { cap: 4096, reason: "provider limit" });
+  assert.deepEqual(parseStatedTokenCap(JSON.stringify({ error: { message: openaiText, type: "invalid_request_error" } })), { cap: 4096, reason: "provider limit" });
+  assert.deepEqual(parseStatedTokenCap("max_completion_tokens: 16384 > 8192, which is the maximum allowed number of output tokens"), { cap: 8192, reason: "provider limit" });
+  assert.deepEqual(parseStatedTokenCap(contextText), { cap: 2192, reason: "context window" });
+  // Context-length without both numbers, or with no room left, never clamps.
+  assert.equal(parseStatedTokenCap("This model's maximum context length is 8192 tokens."), null);
+  assert.equal(parseStatedTokenCap("the maximum context length is 4096 tokens and your request has 4096 input tokens"), null);
+  // An unrelated "supports at most <N>" figure (tools, not tokens) in the
+  // same sentence is never taken as the output cap.
+  assert.equal(parseStatedTokenCap("max_tokens is too large: 16384. This model supports at most 128 tools and 4096 completion tokens."), null);
+  // Unparseable / unrelated / absent bodies never clamp.
+  assert.equal(parseStatedTokenCap("invalid_request_error"), null);
+  assert.equal(parseStatedTokenCap('{"error":{"message":"invalid api key"}}'), null);
+  assert.equal(parseStatedTokenCap('{"error":{"code":"context_too_large"}}'), null);
+  assert.equal(parseStatedTokenCap(""), null);
+  assert.equal(parseStatedTokenCap(undefined), null);
+});
+
+/** A mock endpoint that refuses every request whose token field exceeds the
+ * cap with a JSON 400 carrying `message(requested)`, and serves a minimal
+ * completion otherwise. Records each request's token field and value. */
+async function cappedServer(
+  cap: number,
+  message: (requested: number) => string,
+): Promise<{ server: Awaited<ReturnType<typeof startMockServer>>; requests: Array<{ requested: number | undefined; field: string }> }> {
+  const requests: Array<{ requested: number | undefined; field: string }> = [];
+  const server = await startMockServer((_req, body, res) => {
+    const sent = JSON.parse(body) as Record<string, unknown>;
+    const field = sent.max_completion_tokens !== undefined ? "max_completion_tokens" : "max_tokens";
+    const requested = sent[field] as number | undefined;
+    requests.push({ requested, field });
+    if (requested !== undefined && requested > cap) {
+      res.statusCode = 400;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: { message: message(requested) } }));
+      return;
+    }
+    res.end(okCompletion);
+  });
+  return { server, requests };
+}
+
+test("a 400 stating an output cap retries once with the token field at the cap", async () => {
+  const { server, requests } = await cappedServer(8192, (requested) =>
+    `max_tokens: ${requested} > 8192, which is the maximum allowed number of output tokens for <model>`);
+  const stderr = captureStderr();
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    if (outcome.status === "ok") assert.equal(outcome.response.content, "ok");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0]!.requested, 16384);
+    assert.equal(requests[1]!.requested, 8192);
+    // One log line, numbers and reason only — no body contents.
+    assert.deepEqual(stderr.lines.filter((line) => line.includes("clamped")),
+      ["clamped max_tokens 16384 -> 8192 (provider limit)\n"]);
+  } finally {
+    stderr.restore();
+    await server.close();
+  }
+});
+
+test("the OpenAI too-large shape clamps max_completion_tokens without introducing max_tokens", async () => {
+  const { server, requests } = await cappedServer(4096, (requested) =>
+    `max_completion_tokens is too large: ${requested}. This model supports at most 4096 completion tokens, whereas you provided ${requested}.`);
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_completion_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1]!.requested, 4096);
+    assert.equal(requests[1]!.field, "max_completion_tokens");
+    const secondBody = JSON.parse(server.requests[1]!.body) as Record<string, unknown>;
+    assert.equal(secondBody.max_completion_tokens, 4096);
+    assert.equal(secondBody.max_tokens, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a context-length 400 clamps to window minus input when both are stated", async () => {
+  const server = await startMockServer((_req, body, res) => {
+    const sent = JSON.parse(body) as { max_tokens?: number };
+    if ((sent.max_tokens ?? 0) > 8192) {
+      res.statusCode = 400;
+      res.end("the maximum context length is 8192 tokens and your request has 6000 input tokens");
+      return;
+    }
+    res.end(okCompletion);
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "ok");
+    assert.equal((JSON.parse(server.requests[1]!.body) as { max_tokens: number }).max_tokens, 2192);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a stated cap at or above the sent value does not retry", async () => {
+  // The body claims a cap larger than what was actually sent: not the error
+  // we are looking for, so the original failure stands untouched.
+  const server = await startMockServer((_req, _body, res) => {
+    res.statusCode = 400;
+    res.end("max_tokens: 4096 > 16384, which is the maximum allowed number of output tokens for <model>");
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 4096 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    assert.equal(server.requests.length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("an unrelated 'supports at most <N>' figure before the completion-token cap is never the output cap", async () => {
+  // Adversarial: the body does state a real completion-token cap (4096), but
+  // an unrelated 128 sits between "supports at most" and the unit. Parsing
+  // is conservative: no unambiguous cap, no retry.
+  let requests = 0;
+  const server = await startMockServer((_req, _body, res) => {
+    requests += 1;
+    res.statusCode = 400;
+    res.end("max_tokens is too large: 16384. This model supports at most 128 tools and 4096 completion tokens.");
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status === "failure") assert.equal(outcome.failure.status, 400);
+    assert.equal(requests, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("an unparseable or unrelated 400 is returned unchanged, with no retry", async () => {
+  for (const body of ["invalid_request_error", '{"error":{"message":"invalid api key"}}', '{"error":{"code":"bad"}}']) {
+    const server = await startMockServer((_req, _body, res) => {
+      res.statusCode = 400;
+      res.end(body);
+    });
+    try {
+      const outcome = await runChatRequest({
+        baseUrl: server.url,
+        apiFormat: "openai",
+        payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+        apiKey: "",
+        anthropicVersion: "2023-06-01",
+        requestTimeoutSec: 5,
+        connectTimeoutSec: 5,
+      });
+      assert.equal(outcome.status, "failure");
+      if (outcome.status === "failure") assert.equal(outcome.failure.body, body);
+      assert.equal(server.requests.length, 1);
+    } finally {
+      await server.close();
+    }
+  }
+});
+
+test("a clamped request that still fails returns the second failure, never a third attempt", async () => {
+  let requests = 0;
+  const server = await startMockServer((_req, _body, res) => {
+    requests += 1;
+    res.statusCode = 400;
+    res.end("max_tokens: 16384 > 8192, which is the maximum allowed number of output tokens for <model>");
+  });
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+    });
+    assert.equal(outcome.status, "failure");
+    if (outcome.status === "failure") {
+      assert.equal(outcome.failure.kind, "http_status");
+      assert.equal(outcome.failure.status, 400);
+      assert.match(outcome.failure.body ?? "", /8192/);
+    }
+    assert.equal(requests, 2);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the clamp sits before the 429/5xx decision and does not consume its attempts", async () => {
+  // First request: clampable 400. The clamped retry then hits a 429 (with
+  // Retry-After 0) and finally succeeds — so the clamped request re-enters
+  // the ordinary retry loop with its backoff intact.
+  let requests = 0;
+  const server = await startMockServer((_req, body, res) => {
+    requests += 1;
+    const sent = JSON.parse(body) as { max_tokens?: number };
+    if ((sent.max_tokens ?? 0) > 8192) {
+      res.statusCode = 400;
+      res.end("max_tokens: 16384 > 8192, which is the maximum allowed number of output tokens for <model>");
+      return;
+    }
+    if (requests === 2) {
+      res.statusCode = 429;
+      res.setHeader("Retry-After", "0");
+      res.end('{"error":{"message":"slow down"}}');
+      return;
+    }
+    res.end(okCompletion);
+  });
+  const slept: number[] = [];
+  try {
+    const outcome = await runChatRequest({
+      baseUrl: server.url,
+      apiFormat: "openai",
+      payload: payload({ model: "m", stream: false, max_tokens: 16384 }),
+      apiKey: "",
+      anthropicVersion: "2023-06-01",
+      requestTimeoutSec: 5,
+      connectTimeoutSec: 5,
+      sleep: async (ms: number) => { slept.push(ms); },
+    });
+    assert.equal(outcome.status, "ok");
+    assert.equal(requests, 3);
+    assert.deepEqual(slept, [0]);
+    assert.equal((JSON.parse(server.requests[2]!.body) as { max_tokens: number }).max_tokens, 8192);
+  } finally {
+    await server.close();
+  }
+});
+
+/** True when redactText's pattern heuristics alone would NOT catch `secret`
+ * in `body` — i.e. the gap `maskKnownSecrets` exists to close. */
+function redactTextLeaksTheSecret(body: string, secret: string): boolean {
+  return redactText(body).includes(secret);
+}
+
+test("maskKnownSecrets: exact, URL-encoded, and base64 forms of a known secret are all masked", () => {
+  const secret = "sk-primary-key-value";
+  assert.equal(maskKnownSecrets(`credential ${secret} rejected`, [secret]), `credential ${KNOWN_SECRET_REDACTED} rejected`);
+  assert.equal(
+    maskKnownSecrets(`token=${encodeURIComponent(secret)}`, [secret]),
+    `token=${KNOWN_SECRET_REDACTED}`,
+  );
+  assert.equal(
+    maskKnownSecrets(`b64:${Buffer.from(secret, "utf8").toString("base64")}`, [secret]),
+    `b64:${KNOWN_SECRET_REDACTED}`,
+  );
+  // Multiple secrets, only the relevant one present; empty/undefined entries are skipped safely.
+  assert.equal(maskKnownSecrets(`x=${secret}`, ["", undefined, secret]), `x=${KNOWN_SECRET_REDACTED}`);
+  // No known secret present: text passes through unchanged.
+  assert.equal(maskKnownSecrets("nothing sensitive here", [secret]), "nothing sensitive here");
+});
+
+test("maskKnownSecrets: a configured key of any length is masked — ai-api-key has no minimum", () => {
+  // A one-character key: every literal occurrence is masked. Chosen against
+  // surrounding words with no incidental match, so the exact-equality
+  // assertion is unambiguous; a separate case below shows over-redaction
+  // (an accepted cost) when the letter also appears elsewhere.
+  assert.equal(maskKnownSecrets("credential k rejected", ["k"]), `credential ${KNOWN_SECRET_REDACTED} rejected`);
+  assert.equal(maskKnownSecrets("token k rejected", ["k"]).includes("k"), false);
+  // A three-character key.
+  assert.equal(maskKnownSecrets("credential abc was rejected", ["abc"]), `credential ${KNOWN_SECRET_REDACTED} was rejected`);
+  // Only an empty string is skipped; a merely-short one is still masked.
+  assert.equal(maskKnownSecrets("abc stays abc", ["abc", ""]), `${KNOWN_SECRET_REDACTED} stays ${KNOWN_SECRET_REDACTED}`);
+});
+
+test("#882: configured keys 'E', 'R', 'A' and 'ED' — letters of the old '[REDACTED]' marker — are fully absent from the masked output", () => {
+  // Before #882, a one-character key equal to a letter inside the known-secret
+  // marker itself ('R', 'E', 'D', 'A', 'C', 'T') could never be fully masked:
+  // every replacement reintroduced the character via the marker text. The
+  // marker is now non-alphanumeric, so this no longer collides.
+  for (const key of ["E", "R", "A", "ED"]) {
+    const masked = maskKnownSecrets(`credential ${key} rejected`, [key]);
+    assert.ok(!masked.includes(key), `key ${JSON.stringify(key)} survived in: ${masked}`);
+    assert.ok(masked.includes(KNOWN_SECRET_REDACTED), `expected the marker in: ${masked}`);
+  }
+});
+
+test("#882: a configured key equal to a character IN the new marker itself is a documented, non-looping edge case", () => {
+  // Document the choice for the one edge #882 leaves open: a configured
+  // secret exactly equal to one of the marker's own literal characters
+  // ('⟦', '•', '⟧') is pathological — masking it necessarily reintroduces
+  // that character as part of the freshly-inserted marker, the same way a
+  // one-character key equal to a letter of the OLD '[REDACTED]' marker did.
+  // The fix doesn't special-case this (an extremely unlikely configured
+  // secret), it only removes the collision for any ALPHANUMERIC secret.
+  // What matters is that a single `maskKnownSecrets` call always finishes in
+  // one bounded pass over the input — it never loops trying to re-mask its
+  // own output — so repeated calls (as `maskDiagnostic`'s documented second
+  // whole-string pass does) nest the marker by exactly one level per call,
+  // rather than growing without bound.
+  const once = maskKnownSecrets("credential • rejected", ["•"]);
+  assert.equal(once, `credential ${KNOWN_SECRET_REDACTED} rejected`);
+  const twice = maskKnownSecrets(once, ["•"]);
+  assert.equal(twice, "credential ⟦⟦•⟧⟧ rejected", "a second pass nests by exactly one level — bounded, not unbounded");
+  // A third pass nests by exactly one more level (linear growth per call),
+  // never an unbounded/infinite loop within a single call.
+  assert.equal(maskKnownSecrets(twice, ["•"]), "credential ⟦⟦⟦•⟧⟧⟧ rejected");
+});
+
+test("describeTransportFailure: a known secret echoed bare in the body is masked even though it matches no redactText pattern", () => {
+  const secret = "specialist-secret-key-value";
+  const failure = new TransportFailure("http_status", "model endpoint returned HTTP 404", {
+    status: 404,
+    body: `{"error":{"message":"no route for this model; credential ${secret} was rejected"}}`,
+  });
+  const detail = describeTransportFailure(failure, { secrets: [secret] });
+  assert.match(detail, /HTTP 404/);
+  assert.match(detail, /check ai-api-format for this model \(openai vs anthropic\)/);
+  assert.ok(!detail.includes(secret), `expected the known secret to be masked, got: ${detail}`);
+  assert.ok(detail.includes(KNOWN_SECRET_REDACTED), `expected the known-secret marker in: ${detail}`);
+
+  // Without the plain-prose framing that redactText's heuristics look for
+  // (no "key="/"Bearer "/etc.), the SAME body leaks the secret if only
+  // redactText's heuristics run — this is exactly the gap `secrets` closes.
+  assert.ok(redactTextLeaksTheSecret(failure.body!, secret), "test sanity: redactText alone must not already catch this shape");
+
+  // The legacy (failure, maxBodyChars) call shape still works.
+  const legacy = describeTransportFailure(failure, 300);
+  assert.match(legacy, /HTTP 404/);
+  assert.ok(legacy.includes(secret), "the legacy call shape has no secrets to mask (regression guard on the old signature)");
+});
+
+test("describeTransportFailure: secrets are masked before truncation, so a secret split at the boundary is never partially exposed", () => {
+  const secret = "a-secret-that-is-quite-long-1234567890";
+  const failure = new TransportFailure("http_status", "model endpoint returned HTTP 500", {
+    status: 500,
+    body: `padding-${"x".repeat(280)}-${secret}`,
+  });
+  const detail = describeTransportFailure(failure, { maxBodyChars: 300, secrets: [secret] });
+  assert.ok(!detail.includes(secret));
+  // The masked marker survives even though the raw secret would have
+  // straddled the 300-char truncation boundary.
+  assert.ok(detail.includes(KNOWN_SECRET_REDACTED), `expected the known-secret marker in: ${detail}`);
+});
+
+test("describeTransportFailure: a secret in a status-less failure's bare message is also masked", () => {
+  const secret = "fallback-tier-secret";
+  const failure = new TransportFailure("network", `model request failed: proxy rejected ${secret}`);
+  const detail = describeTransportFailure(failure, { secrets: [secret] });
+  assert.ok(!detail.includes(secret));
+});

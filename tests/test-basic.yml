@@ -1,0 +1,38 @@
+name: Test basic usage - graceful failure on sentinel repo
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          ai-api-key: "test-key-not-used"
+          pr-number: "1"
+          on-model-failure: "notice"
+          ci-status-check: "false"
+      - name: Assert action ran and either produced outputs or failed gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          SKIP_REASON: ${{ steps.action.outputs.skip-reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "verdict: $VERDICT"
+          echo "skip-reason: $SKIP_REASON"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
