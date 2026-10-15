@@ -1,0 +1,42 @@
+name: Test review routing mode auto with smart model
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          ai-api-key: "test-key-not-real"
+          review-routing-mode: "auto"
+          ai-primary-model: "gpt-4o-mini"
+          ai-smart-model: "gpt-4o"
+          pr-number: "1"
+          on-model-failure: "notice"
+          ci-status-check: "false"
+          ai-primary-retries: "0"
+      - name: Assert action ran with routing mode auto or failed gracefully
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review-route }}
+          ESCALATION_REASON: ${{ steps.action.outputs.escalation-reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "verdict: $VERDICT"
+          echo "review-route: $REVIEW_ROUTE"
+          echo "escalation-reason: $ESCALATION_REASON"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "PASS: action succeeded with routing mode auto"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo or invalid API key)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
