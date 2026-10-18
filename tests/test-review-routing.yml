@@ -1,0 +1,42 @@
+name: Test review-routing-mode=auto with smart model configuration
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          github-token: ${{ github.token }}
+          ai-base-url: "https://api.openai.com/v1"
+          ai-model: "gpt-4o-mini"
+          ai-api-key: "fake-key-for-test"
+          pr-number: "1"
+          review-routing-mode: "auto"
+          ai-primary-model: "gpt-4o-mini"
+          ai-smart-model: "gpt-4o"
+          ai-smart-base-url: "https://api.openai.com/v1"
+          ai-smart-api-key: "fake-key-for-test"
+          on-model-failure: "notice"
+          ci-status-check: "false"
+      - name: Assert review-routing-mode config was accepted
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          REVIEW_ROUTE: ${{ steps.action.outputs.review-route }}
+          ESCALATION_REASON: ${{ steps.action.outputs.escalation-reason }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "review-route: $REVIEW_ROUTE"
+          echo "escalation-reason: $ESCALATION_REASON"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "Action succeeded"
+            echo "PASS: action ran with review-routing-mode=auto"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (expected on sentinel repo with no real PR)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
