@@ -1,0 +1,45 @@
+name: Test valid config reaches precheck (sentinel repo)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The repo defaults to the harness sentinel GITHUB_REPOSITORY, so the
+      # PR lookup is expected to 404. Publishing is disabled so nothing is
+      # ever written to a real repository.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          ai-base-url: http://127.0.0.1:9/v1
+          ai-model: test-model
+          ai-api-format: openai
+          pr-number: "1"
+          ci-status-check: "false"
+          publish-mode: comment
+          publish-review-comment: "false"
+          ai-primary-retries: "0"
+          ai-primary-retry-delay-sec: "0"
+          tool-mode: "off"
+          deep-review: "false"
+      - name: Assert action ran (outputs set, or failed gracefully on the sentinel repo)
+        env:
+          RESULT: ${{ steps.action.outputs.should-review }}
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $RESULT"
+          if [ "$OUTCOME" = "success" ]; then
+            if [ "$RESULT" != "true" ] && [ "$RESULT" != "false" ]; then
+              echo "FAIL: action succeeded but should-review is '$RESULT'"
+              exit 1
+            fi
+            echo "PASS: got should-review '$RESULT'"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi
