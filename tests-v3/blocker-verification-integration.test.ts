@@ -1,0 +1,1163 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import {
+  applyBlockerVerification,
+  type SourceReader,
+  type SourceReadResult,
+} from "../src/enforcement/blocker-verification.js";
+import { createActionSourceReader } from "../src/enforcement/action-source.js";
+import { readWorkflowInputNamesByFile } from "../src/enforcement/workflow-inputs.js";
+import {
+  applyStrictVerdictPolicy,
+  applyVerdictPolicy,
+  relaxUnverifiedBlockerVerdict,
+} from "../src/enforcement/verdict-policy.js";
+import {
+  committedSourceProvenance,
+  sanitizedSourceProvenance,
+} from "../src/context/evidence-provenance.js";
+import type { ReviewArtifact, ArtifactFinding } from "../src/enforcement/artifact.js";
+import { applyReviewThreadEnforcement } from "../src/enforcement/threads.js";
+import { publishReview } from "../src/publish/publish.js";
+import type { NativeReviewRequest, PublishPlatformApi } from "../src/platform/publish-api.js";
+
+const REVISION = "a".repeat(40);
+
+/** #1240: the executing action's own source root — the repository root in
+* this checkout (in production: the action's install directory). The
+* witness bytes are embedded in the bundle, so the root only carries the
+* `uses: ./` provenance: a root inside the reviewed workspace is refused. */
+const ACTION_ROOT = resolve(__dirname, "..", "..");
+
+function artifact(overrides: Partial<ReviewArtifact> = {}): ReviewArtifact {
+  return {
+    verdict: "request_changes",
+    review_markdown: "review",
+    findings: [],
+    ...overrides,
+  } as ReviewArtifact;
+}
+
+function finding(overrides: Partial<ArtifactFinding> = {}): ArtifactFinding {
+  return {
+    severity: "blocker",
+    category: "bug",
+    file: "src/a.ts",
+    line: 1,
+    message: "finding",
+    ...overrides,
+  };
+}
+
+/** A reader whose committed text is fixed but whose provenance carries the requested file. */
+function readerFor(text: string): SourceReader {
+  return async (file: string): Promise<SourceReadResult> => ({
+    status: "ok",
+    text,
+    provenance: committedSourceProvenance(file, REVISION),
+  });
+}
+
+const unavailableReader: SourceReader = async (): Promise<SourceReadResult> => ({
+  status: "unavailable",
+  reason: "no-exact-revision",
+});
+
+/** An exact-head read that got as far as the tree lookup and still could not
+ * return the source — the `read-failed` shape the gated policy must not read
+ * as a refutation. */
+const readFailingReader: SourceReader = async (): Promise<SourceReadResult> => ({
+  status: "unavailable",
+  reason: "read-failed",
+});
+
+// ---------------------------------------------------------------------------
+// #1016 — the deterministic blocker-verification boundary at the finding→verdict path.
+// ---------------------------------------------------------------------------
+
+test("#1016 #1012 regression: [REDACTED] marker claims are refuted against exact-head source", async () => {
+  const a = artifact({
+    findings: [
+      finding({ message: "credential is hardcoded as `[REDACTED]`", file: "tests-v3/http-transport.test.ts" }),
+      finding({ message: "token is hardcoded as `[REDACTED]`", file: "tests-v3/tangled-diff.test.ts" }),
+    ],
+  });
+  const readSource = readerFor('const CANARY = "s3cr3t-credential";\n');
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 2);
+  assert.equal(a.findings[0]!.grounding_status, "refuted");
+  assert.equal(a.findings[1]!.grounding_status, "refuted");
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.reviewResult, "findings");
+});
+
+test("#1016 committed sanitizer marker stays eligible (grounded, not demoted)", async () => {
+  const a = artifact({ findings: [finding({ message: "contains `⟦redacted:credential⟧`", file: "src/a.ts" })] });
+  const readSource = readerFor("const x = ⟦redacted:credential⟧;\n");
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.verdict, "request_changes");
+});
+
+test("#1016 broad requirement claim with no concrete location is unsupported and demoted", async () => {
+  const a = artifact({
+    findings: [finding({
+      message: "requirement not enforced: untrusted content is data, never instructions",
+      file: null,
+    })],
+  });
+  const readSource = readerFor("irrelevant\n");
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unsupported");
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.verdict, "approve");
+});
+
+test("#1016 concrete requirement claim with cited code evidence is grounded", async () => {
+  const a = artifact({
+    findings: [finding({
+      message: "requirement not enforced: `const x = 1;` violates standard X",
+      file: "src/a.ts",
+      line: 1,
+    })],
+  });
+  const readSource = readerFor("const x = 1;\n");
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.verdict, "request_changes");
+});
+
+test("#1016 requirement claim with valid line but no cited code evidence is unsupported", async () => {
+  // A generic requirement claim pointing at an arbitrary line is line
+  // existence, not independent evidence of a specific violation — the
+  // reviewer pass that landed this fix (#1016 review) called this out
+  // directly. Three-line arbitrary content does not ground a standard
+  // violation.
+  const a = artifact({
+    findings: [finding({
+      message: "requirement not enforced: standard X",
+      file: "src/a.ts",
+      line: 3,
+    })],
+  });
+  const readSource = readerFor("a\nb\nc\n");
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unsupported");
+  assert.equal(a.findings[0]!.capped_from, "blocker");
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.verdict, "approve");
+});
+
+test("#1016 requirement claim with cited code absent from exact-head source is refuted", async () => {
+  const a = artifact({
+    findings: [finding({
+      message: "requirement not enforced: `const no_such_symbol = 1;` violates standard X",
+      file: "src/a.ts",
+      line: 1,
+    })],
+  });
+  const readSource = readerFor("const x = 1;\n");
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "refuted");
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.verdict, "approve");
+});
+
+test("#1016 requirement claim with null/zero/invalid line is unsupported", async () => {
+  for (const line of [null, 0, -1, Number.NaN as unknown as number]) {
+    const a = artifact({
+      findings: [finding({
+        message: "requirement not enforced: standard X",
+        file: "src/a.ts",
+        line,
+      })],
+    });
+    const readSource = readerFor("a\nb\nc\n");
+    const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+    assert.equal(result.demoted, 1, `line=${String(line)}`);
+    assert.equal(a.findings[0]!.grounding_status, "unsupported", `line=${String(line)}`);
+  }
+});
+
+test("#1016 unavailable exact-head source leaves the claim unverified and keeps request_changes", async () => {
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  const result = await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  // #1016 (review pass): unknown evidence must NOT silently become
+  // approve — the strict mapping forces request_changes when any demoted
+  // finding is "unverified" rather than "refuted" or "unsupported".
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.verdict, "request_changes");
+});
+
+test("#1016 stale-revision unverified finding keeps request_changes", async () => {
+  // A stale revision produces a reader that returns unavailable/non-
+  // authoritative; the boundary must mark it unverified and the strict
+  // mapping must keep request_changes rather than flipping to approve.
+  const staleReader: SourceReader = async (): Promise<SourceReadResult> => ({
+    status: "ok",
+    text: "marker text",
+    provenance: committedSourceProvenance("src/a.ts", "f".repeat(40)),
+  });
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  const result = await applyBlockerVerification(a.findings, { readSource: staleReader, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.verdict, "request_changes");
+});
+
+test("#1016 read-budget-exhausted unverified finding keeps request_changes", async () => {
+  // Past MAX_VERIFICATION_READS the boundary stops reading and demotes the
+  // remaining candidates as unverified. The strict mapping must keep
+  // request_changes for any unverified demotion.
+  const markerArray = Array.from({ length: 21 }, () => finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" }));
+  const a = artifact({ findings: markerArray });
+  const readSource: SourceReader = async (): Promise<SourceReadResult> => ({
+    status: "ok", text: "no marker here", provenance: committedSourceProvenance("src/a.ts", REVISION),
+  });
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  // 20 reads succeed (all refuted) + 1 demoted to unverified for the
+  // budget-exhausted tail.
+  const unverified = result.findings.filter((entry) => entry.status === "unverified" && entry.reason === "read-budget-exhausted");
+  assert.equal(unverified.length, 1);
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.verdict, "request_changes");
+});
+
+test("#1016 model-policy relaxation fires only for a refuted-only request_changes", async () => {
+  // Refuted (source proves the claim is wrong) is the only demotion the
+  // relaxer accepts. Use a marker that the source text does NOT contain,
+  // so the boundary returns refuted and the verdict can relax.
+  const refutedReader: SourceReader = async (): Promise<SourceReadResult> => ({
+    status: "ok",
+    text: "const CANARY = 'plain';",
+    provenance: committedSourceProvenance("src/a.ts", REVISION),
+  });
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  await applyBlockerVerification(a.findings, { readSource: refutedReader, expectedRevision: REVISION });
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), true);
+  assert.equal(a.verdict, "approve");
+
+  const mixed = artifact({
+    findings: [
+      finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" }),
+      finding({ severity: "major", message: "off by one", file: "src/b.ts" }),
+    ],
+  });
+  const mixedResult = await applyBlockerVerification(mixed.findings, { readSource: refutedReader, expectedRevision: REVISION });
+  assert.equal(mixedResult.demoted, 1);
+  assert.equal(relaxUnverifiedBlockerVerdict(mixed, { forced: false }), false);
+  assert.equal(mixed.verdict, "request_changes");
+});
+
+test("#1016 model-policy relaxation refuses to relax when any demotion is unverified", async () => {
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  // Unknown evidence: relaxer refuses; verdict stays request_changes.
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+  assert.equal(a.verdict, "request_changes");
+});
+
+test("#1016 mixed refuted + unverified finding refuses relaxation on unverified", async () => {
+  // Two findings, one refuted (good) and one unverified (unknown). The
+  // relaxer must refuse because at least one demotion is unverified.
+  const refutedReader: SourceReader = async (file: string): Promise<SourceReadResult> => {
+    if (file === "src/refuted.ts") {
+      return { status: "ok", text: "const CANARY = 'plain';", provenance: committedSourceProvenance(file, REVISION) };
+    }
+    return { status: "unavailable", reason: "no-exact-revision" };
+  };
+  const a = artifact({
+    findings: [
+      finding({ message: "the file commits the literal `[REDACTED]`", file: "src/refuted.ts" }),
+      finding({ message: "the file commits the literal `[REDACTED]`", file: "src/unknown.ts" }),
+    ],
+  });
+  await applyBlockerVerification(a.findings, { readSource: refutedReader, expectedRevision: REVISION });
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+  assert.equal(a.verdict, "request_changes");
+});
+
+test("#1016 relaxation is refused while a deterministic gate (incomplete checks) is in play", async () => {
+  const a = artifact({
+    required_checks: "incomplete",
+    findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })],
+  });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+  assert.equal(a.verdict, "request_changes");
+});
+
+// `sanitizedSourceProvenance` documents the other non-authoritative representation
+// the boundary rejects: a sanitized read never authorizes a literal claim.
+test("#1016 sanitized (non-authoritative) provenance cannot ground a marker claim", async () => {
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  const readSource: SourceReader = async (): Promise<SourceReadResult> => ({
+    status: "ok",
+    text: "value is [REDACTED]",
+    provenance: sanitizedSourceProvenance(1, "src/a.ts", REVISION),
+  });
+  const result = await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+});
+
+test("#1016 synthesized thread re-emissions added after the boundary are not demoted", async () => {
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  applyReviewThreadEnforcement(a, [{
+    thread_id: "t", path: "src/b.ts", line: 4, severity: "blocker",
+    message: "unresolved thread mentioning [REDACTED]", category: "bug", own_finding: false, replies: 1,
+  }], "strict");
+  const reemitted = a.findings.find((item) => item.thread_id === "t");
+  assert.ok(reemitted, "expected the thread to re-emit as a finding");
+  assert.equal(reemitted!.grounding_status, undefined);
+});
+
+test("#1016 native review is not REQUEST_CHANGES once marker claims are refuted", async () => {
+  class RecordingApi {
+    readonly head = "head-123";
+    // #588: the native review surface is declared explicitly, so the publish
+    // step's untyped-caller fallback is never taken in this suite.
+    readonly nativeReviewSurface = { supported: true };
+    readonly submitted: NativeReviewRequest[] = [];
+    async getHeadSha(): Promise<string | null> { return this.head; }
+    async createReview(request: NativeReviewRequest): Promise<{ ok: boolean }> {
+      this.submitted.push(request);
+      return { ok: true };
+    }
+  }
+  const publishInput = (overrides: Record<string, unknown>): Parameters<typeof publishReview>[0] => ({
+    mode: "review_verdict", reviewMarkdown: "review", verdict: "approve", analysisEngine: "test-engine",
+    baseSha: "base-1", headSha: "head-123", prNumber: "42", commentMarker: "<!-- ai-pr-review -->",
+    requiredChecks: "complete", verdictPolicy: "strict", reviewRoute: "primary", escalationReason: "",
+    cacheHitRatio: "-", inlineFindings: false, inlineFindingsMax: 10, findings: [],
+    cleanupPreviousNativeReviews: "false", allowApprove: true, approveForks: false, isForkPr: false,
+    upstreamLinkMode: "inert", forgejoPositions: false,
+    conditionalPresence: { linkedIssue: true, evidenceProvider: true, standards: true, toolHarnessFindings: true, toolHarnessResults: true },
+    ...overrides,
+  }) as Parameters<typeof publishReview>[0];
+
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "tests-v3/http-transport.test.ts" })] });
+  const readSource = readerFor('const CANARY = "s3cr3t-credential";\n');
+  await applyBlockerVerification(a.findings, { readSource, expectedRevision: REVISION });
+  applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+
+  const control = new RecordingApi();
+  await publishReview(
+    publishInput({ verdict: "request_changes", findings: [finding({ message: "the file commits the literal `[REDACTED]`" })] }),
+    control as unknown as PublishPlatformApi,
+    { diffText: "" },
+  );
+  assert.equal(control.submitted[0]?.event, "REQUEST_CHANGES");
+
+  const api = new RecordingApi();
+  await publishReview(
+    publishInput({ verdict: a.verdict, reviewMarkdown: a.review_markdown, findings: a.findings }),
+    api as unknown as PublishPlatformApi,
+    { diffText: "" },
+  );
+  assert.equal(api.submitted.length, 1);
+  assert.notEqual(api.submitted[0]?.event, "REQUEST_CHANGES");
+});
+
+test("#1016 native review stays REQUEST_CHANGES once marker claims are unverified", async () => {
+  // #1016 (review pass): an unavailable / ambiguous source check must NOT
+  // silently become APPROVE. The strict mapping forces request_changes
+  // whenever any demoted finding has grounding_status="unverified", and
+  // publish therefore submits REQUEST_CHANGES — the same event the
+  // control call (un-demoted artifact) emits.
+  class RecordingApi {
+    readonly head = "head-123";
+    // #588: the native review surface is declared explicitly, so the publish
+    // step's untyped-caller fallback is never taken in this suite.
+    readonly nativeReviewSurface = { supported: true };
+    readonly submitted: NativeReviewRequest[] = [];
+    async getHeadSha(): Promise<string | null> { return this.head; }
+    async createReview(request: NativeReviewRequest): Promise<{ ok: boolean }> {
+      this.submitted.push(request);
+      return { ok: true };
+    }
+  }
+  const publishInput = (overrides: Record<string, unknown>): Parameters<typeof publishReview>[0] => ({
+    mode: "review_verdict", reviewMarkdown: "review", verdict: "approve", analysisEngine: "test-engine",
+    baseSha: "base-1", headSha: "head-123", prNumber: "42", commentMarker: "<!-- ai-pr-review -->",
+    requiredChecks: "complete", verdictPolicy: "strict", reviewRoute: "primary", escalationReason: "",
+    cacheHitRatio: "-", inlineFindings: false, inlineFindingsMax: 10, findings: [],
+    cleanupPreviousNativeReviews: "false", allowApprove: true, approveForks: false, isForkPr: false,
+    upstreamLinkMode: "inert", forgejoPositions: false,
+    conditionalPresence: { linkedIssue: true, evidenceProvider: true, standards: true, toolHarnessFindings: true, toolHarnessResults: true },
+    ...overrides,
+  }) as Parameters<typeof publishReview>[0];
+
+  const a = artifact({ findings: [finding({ message: "the file commits the literal `[REDACTED]`", file: "src/a.ts" })] });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+
+  const api = new RecordingApi();
+  await publishReview(
+    publishInput({ verdict: a.verdict, reviewMarkdown: a.review_markdown, findings: a.findings }),
+    api as unknown as PublishPlatformApi,
+    { diffText: "" },
+  );
+  assert.equal(api.submitted.length, 1);
+  assert.equal(api.submitted[0]?.event, "REQUEST_CHANGES");
+});
+
+test("#1016 attribution note discloses unverified co-existence with a blocker", async () => {
+  // #1016 (review pass, attribution defect): when an unverified demotion
+  // co-exists with a blocking finding, the override note previously named
+  // only the blocker count and silently hid the #1016 unknown-evidence
+  // contribution. Now the note composes both signals with `;`, so a
+  // reader sees that BOTH the blocker count AND the unknown-evidence
+  // boundary contributed to the request_changes — the safety defense
+  // is disclosed, not just the count.
+  const groundedButBlocking = finding({
+    severity: "blocker",
+    category: "bug",
+    file: "src/open.ts",
+    line: 4,
+    message: "real committed bug",
+  });
+  const a = artifact({
+    findings: [
+      groundedButBlocking,
+      finding({ message: "the file commits the literal `[REDACTED]`", file: "src/unknown.ts" }),
+    ],
+  });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+  // The first finding stayed blocker (un-demoted, classification-skip),
+  // the second was demoted to minor with grounding_status="unverified".
+  // The strict mapping's blocker count (>0) drives the verdict; the
+  // unverified co-existence drives the attribution disclosure.
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  assert.equal(a.findings[0]!.severity, "blocker");
+  assert.equal(a.findings[1]!.grounding_status, "unverified");
+  assert.equal(a.findings[1]!.severity, "minor");
+
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.overridden, true);
+  assert.equal(outcome.source, "findings");
+  assert.ok(
+    a.review_markdown.includes("1 blocker/major finding(s) out of 2 open"),
+    `expected blocker-count disclosure in note, got: ${a.review_markdown}`,
+  );
+  assert.ok(
+    a.review_markdown.includes("blocker-verification boundary could not confirm a demoted source claim"),
+    `expected #1016 attribution disclosure in note, got: ${a.review_markdown}`,
+  );
+  assert.ok(
+    a.review_markdown.includes("#1016"),
+    `expected #1016 reference in note, got: ${a.review_markdown}`,
+  );
+});
+
+test("#1016 attribution note discloses enforcement-forced co-existence with a blocker", async () => {
+  // #1016 (review pass, attribution defect, dual signal): when both an
+  // unverified demotion and a forced enforcement layer fire alongside a
+  // blocker count, the note names all three. The dominant decision is
+  // still the blocker count (verdict_source = "findings"), but the
+  // #1016 unknown-evidence contribution and the enforcement-forced
+  // contribution are both disclosed so the review markdown does not
+  // mislead about which signals fired.
+  const groundedButBlocking = finding({
+    severity: "blocker",
+    category: "bug",
+    file: "src/open.ts",
+    line: 4,
+    message: "real committed bug",
+  });
+  const a = artifact({
+    findings: [
+      groundedButBlocking,
+      finding({ message: "the file commits the literal `[REDACTED]`", file: "src/unknown.ts" }),
+    ],
+  });
+  await applyBlockerVerification(a.findings, { readSource: unavailableReader, expectedRevision: null });
+
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: true });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.overridden, true);
+  assert.equal(outcome.source, "findings");
+  assert.ok(a.review_markdown.includes("1 blocker/major finding(s) out of 2 open"));
+  assert.ok(a.review_markdown.includes("blocker-verification boundary could not confirm a demoted source claim"));
+  assert.ok(a.review_markdown.includes("a fail-closed enforcement layer forced request_changes"));
+});
+
+test("#1016 prose mention of the redaction token as expected output is never refuted", async () => {
+  // #1016 (review pass, blocker 1): a legitimate security finding that only
+  // *mentions* the redaction token as expected output (absent masking) is
+  // not a claim about committed bytes. It must stay untouched — never
+  // demoted, never refuted — and keep blocking under both verdict policies.
+  const mentionMessage = "Sensitive request headers are logged verbatim; they should be replaced with [REDACTED], but the logging path never calls the masker.";
+  const a = artifact({ findings: [finding({ file: "src/logger.ts", line: 3, message: mentionMessage })] });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: readerFor("export function log(message: string): void {\n  process.stdout.write(message);\n}\n"),
+    expectedRevision: REVISION,
+  });
+  assert.equal(result.findings.length, 0);
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.severity, "blocker");
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+
+  // Strict policy: the untouched blocker still drives request_changes, and
+  // the attribution does not invoke the #1016 unknown-evidence signal.
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(outcome.source, "findings");
+  assert.ok(!a.review_markdown.includes("unknown evidence, not refuted"), `unexpected unknown-evidence attribution: ${a.review_markdown}`);
+
+  // Model policy: relaxation applies only to grounding-demoted findings; an
+  // untouched blocker keeps request_changes.
+  const model = artifact({ findings: [finding({ file: "src/logger.ts", line: 3, message: mentionMessage })] });
+  assert.equal(relaxUnverifiedBlockerVerdict(model, { forced: false }), false);
+  assert.equal(model.verdict, "request_changes");
+});
+
+test("#1016 requirement claim with the cited snippet only away from the cited line is unverified", async () => {
+  // #1016 (review pass, blocker 2): the quoted snippet existing somewhere in
+  // the file is not evidence the cited requirement is violated at the cited
+  // location. Line 3 here is a harmless import; `console.log(value)` appears
+  // only in the legacy helper near the end of the file.
+  const text = [
+    "import { mask } from \"./mask.js\";",
+    "",
+    "export function log(message: string): void {",
+    "  process.stdout.write(mask(message));",
+    "}",
+    "const pad = (s: string): string => s.trim();",
+    "",
+    "export function summarize(values: string[]): string {",
+    "  return values.map(pad).join(\", \");",
+    "}",
+    "",
+    "function legacy(value: string): string { console.log(value); return value; }",
+  ].join("\n");
+  const a = artifact({
+    findings: [finding({
+      severity: "major",
+      file: "src/logger.ts",
+      line: 3,
+      message: "requirement not enforced: secret masking; the implementation contains `console.log(value)`",
+    })],
+  });
+  const result = await applyBlockerVerification(a.findings, { readSource: readerFor(text), expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.severity, "minor");
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+
+  // Model policy: the relaxer refuses unknown evidence; strict policy: an
+  // approve model verdict is forced back to request_changes with the #1016
+  // unknown-evidence attribution.
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+  assert.equal(a.verdict, "request_changes");
+  applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.ok(a.review_markdown.includes("blocker-verification boundary could not confirm a demoted source claim"));
+  assert.ok(a.review_markdown.includes("#1016"));
+});
+
+test("#1016 findings_severity_gated: a model approve cannot survive an unverified blocker demotion", async () => {
+  // End-to-end shape of the gated policy path (#1016 review pass): the
+  // boundary demotes an originally-blocker finding because the exact-head
+  // read came back `read-failed`, and the model verdict was `approve`. With
+  // the demotion counted only by severity the gate sees zero blockers and the
+  // approve publishes — unknown evidence silently becoming approval. The
+  // gated policy must fail closed on it, exactly as `strict` does, and the
+  // attribution note must name the unknown-evidence signal instead of
+  // implying a live blocker that no longer exists.
+  const gated = { nonBlockingCategories: new Set<string>(), securityFlagged: false };
+  const a = artifact({
+    verdict: "approve",
+    findings: [finding({ file: "src/logger.ts", message: "the file commits the literal `[REDACTED]`" })],
+  });
+  const result = await applyBlockerVerification(a.findings, { readSource: readFailingReader, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  assert.equal(a.findings[0]!.capped_from, "blocker");
+  assert.equal(a.findings[0]!.severity, "minor");
+
+  applyVerdictPolicy(a, "findings_severity_gated", gated);
+  assert.equal(a.verdict, "request_changes");
+  assert.equal(a.verdict_source, "findings");
+  assert.ok(
+    a.review_markdown.includes("1 blocker finding(s) whose source claim could not be verified against exact-head source (unknown evidence, not refuted; #1016)"),
+    `expected the #1016 unknown-evidence attribution, got: ${a.review_markdown}`,
+  );
+  assert.ok(!a.review_markdown.includes("1 blocker finding(s) out of 1"), `note must not claim a live blocker: ${a.review_markdown}`);
+  // The relaxer downstream still refuses: the boundary never certifies a
+  // clean review from evidence it could not read.
+  assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+  assert.equal(a.verdict, "request_changes");
+});
+
+test("#1016 findings_severity_gated: a positively refuted blocker demotion still ends approve", async () => {
+  // The control for the case above: the reader answered, and the exact-head
+  // source positively disproved the claim. Refutation is proof, so the gated
+  // policy leaves the model's approve alone — the fail-closed rule must not
+  // fire on evidence that was actually checked.
+  const gated = { nonBlockingCategories: new Set<string>(), securityFlagged: false };
+  const refutedReader: SourceReader = async (file: string): Promise<SourceReadResult> => ({
+    status: "ok",
+    text: "const CANARY = 'plain';",
+    provenance: committedSourceProvenance(file, REVISION),
+  });
+  const a = artifact({
+    verdict: "approve",
+    findings: [finding({ file: "src/logger.ts", message: "the file commits the literal `[REDACTED]`" })],
+  });
+  const result = await applyBlockerVerification(a.findings, { readSource: refutedReader, expectedRevision: REVISION });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "refuted");
+  assert.equal(a.findings[0]!.capped_from, "blocker");
+  assert.equal(a.findings[0]!.severity, "minor");
+
+  applyVerdictPolicy(a, "findings_severity_gated", gated);
+  assert.equal(a.verdict, "approve");
+  assert.equal(a.verdict_source, "model");
+  assert.ok(!a.review_markdown.includes("escalated from structured findings"), `unexpected escalation: ${a.review_markdown}`);
+
+  // Same artifact shape with the model's own request_changes: the relaxer
+  // accepts the refutation, so a proven-false blocker cannot hold a PR.
+  const blocked = artifact({
+    verdict: "request_changes",
+    findings: [finding({ file: "src/logger.ts", message: "the file commits the literal `[REDACTED]`" })],
+  });
+  await applyBlockerVerification(blocked.findings, { readSource: refutedReader, expectedRevision: REVISION });
+  applyVerdictPolicy(blocked, "findings_severity_gated", gated);
+  assert.equal(relaxUnverifiedBlockerVerdict(blocked, { forced: false }), true);
+  assert.equal(blocked.verdict, "approve");
+});
+
+// ---------------------------------------------------------------------------
+// #1238 — input-declaration and gate-absence claims at the finding→verdict path.
+// ---------------------------------------------------------------------------
+
+test("#1238 the incident shape: fabricated input claim refuted, gate claim refuted, verdict approves", async () => {
+  // Sanitized replay of the production failure: a major finding fabricated
+  // the action's declared input name and a minor finding derived gate
+  // absence from the metadata. The registry witness (the executing action's
+  // embedded contract) positively contradicts the input claim, and the
+  // action's own implementation positively contradicts the gate claim (the
+  // draft and label gates ARE implemented), so the strict mapping derives
+  // an approve — no claim can expand the blocking surface.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 36,
+        message: "The pinned action declares its API-key input as `ai-key` (action.yml at v3.7.0), so `ai-api-key` is an unexpected input that GitHub ignores and the action runs without the endpoint credential.",
+      }),
+      finding({
+        severity: "minor",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 20,
+        message: "The comment says the action itself skips drafts and non-matching labels, but that filtering is done by this workflow's own `if` (the action metadata declares no `if:` or label input).",
+      }),
+      finding({
+        severity: "info",
+        category: "verification",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 36,
+        message: "Please confirm the workflow's configured secret is present in the CI environment.",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+    readActionSource: createActionSourceReader(),
+  });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "refuted");
+  assert.equal(a.findings[0]!.severity, "minor");
+  assert.equal(a.findings[1]!.grounding_status, "refuted");
+  assert.equal(a.findings[1]!.severity, "minor");
+  assert.equal(a.findings[1]!.capped_from, undefined);
+  assert.equal(a.findings[2]!.grounding_status, undefined);
+  const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "approve");
+  assert.equal(outcome.verdict, "approve");
+  assert.ok(a.review_markdown.includes("no blocker or major finding out of 3 open"));
+});
+
+test("#1238 the incident gate claim stays unverified when the action source is unavailable", async () => {
+  // Fail-safe control: without the action's own implementation the gate
+  // claim cannot be checked, so it stays unknown evidence (unverified) —
+  // never refuted. The minor stays minor and cannot expand the blocking
+  // surface.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "minor",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 20,
+        message: "The comment says the action itself skips drafts and non-matching labels, but that filtering is done by this workflow's own `if` (the action metadata declares no `if:` or label input).",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+    // #1240: the witness is unavailable when the executing bytes could be
+    // the reviewed repository's own (the `uses: ./` shape), so the gate
+    // claim cannot be checked and stays unknown evidence.
+    readActionSource: createActionSourceReader({ root: ACTION_ROOT, workspaceRoot: ACTION_ROOT }),
+  });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  assert.equal(a.findings[0]!.severity, "minor");
+  assert.equal(a.findings[0]!.capped_from, undefined);
+});
+
+test("#1238 an unverified major input claim still fails closed to request_changes", async () => {
+  // Fail-safe control: without the registry witness the boundary cannot
+  // check the claim. An originally-major demotion is unknown evidence, so
+  // the strict mapping keeps request_changes with the #1016 attribution.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 36,
+        message: "The pinned action declares input `ai-key`, so the workflow's credential never reaches the action.",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: null,
+  });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  assert.equal(a.findings[0]!.capped_from, "major");
+  // The model approved; the strict mapping refuses to certify an approve
+  // from evidence it could not check, and attributes the unknown evidence.
+  applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.ok(a.review_markdown.includes("blocker-verification boundary could not confirm a demoted source claim"));
+});
+
+test("#1238 a genuine missing-input claim is retained as substantiated and keeps blocking", async () => {
+  // The preservation control the issue pins: an input the registry truly
+  // lacks grounds the claim — the finding keeps its major severity, mutates
+  // nothing, and the strict mapping keeps request_changes from the open
+  // blocking finding.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 30,
+        message: "the pinned action's metadata declares no `unicorn-mode` input, so the workflow's setting is silently dropped",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-api-key", "rereview-label"]),
+  });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.severity, "major");
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+});
+
+test("#1238 a mixed finding keeps its confirmed missing-input claim and stays blocking", async () => {
+  // One finding can carry two claims about the action's declared inputs:
+  // `ai-api-key` IS declared, so that absence claim is positively
+  // contradicted, and `model-input` is NOT declared, so that absence claim
+  // is a genuine defect the witness confirms. The confirmed claim keeps the
+  // finding substantiated — it must not be demoted whole because a sibling
+  // claim in the same finding was refuted (#1238: preserve true findings).
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 30,
+        message: "The action does not declare `ai-api-key` input. The action does not declare `model-input` input.",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-api-key", "rereview-label"]),
+  });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.severity, "major");
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  // The model approved; the confirmed defect is still an open blocking
+  // finding, so the strict mapping keeps request_changes.
+  applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+});
+
+test("#1240 a claim about another revision is unverified and still fails closed", async () => {
+  // The declared-input registry speaks for the EXECUTING revision only: a
+  // claim that names a different revision is unverified — never refuted,
+  // never grounded. Unverified must not demote a TRUE finding out of the
+  // blocking set: the finding keeps `capped_from: "major"`, and the strict
+  // mapping counts an unverified blocker/major as blocking, so the verdict
+  // stays request_changes instead of relaxing to approve.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 36,
+        message: "The pinned action declares its API-key input as `ai-key` (action.yml at v3.6.1), so `ai-api-key` is an unexpected input that GitHub ignores.",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+    executingActionVersion: "v3.7.0",
+  });
+  assert.equal(result.demoted, 1);
+  assert.equal(a.findings[0]!.grounding_status, "unverified");
+  assert.equal(a.findings[0]!.capped_from, "major");
+  assert.equal(a.findings[0]!.severity, "minor");
+  // The model approved; the strict mapping refuses to certify an approve
+  // from a claim it could not check, and attributes the unknown evidence.
+  applyStrictVerdictPolicy(a, { modelVerdict: "approve", forced: false });
+  assert.equal(a.verdict, "request_changes");
+  assert.ok(a.review_markdown.includes("blocker-verification boundary could not confirm a demoted source claim"));
+});
+
+// ---------------------------------------------------------------------------
+// #1238: the workflow-side witness, end to end — the reviewed repository's
+// own workflow file is read at the exact reviewed head and decides the
+// workflow-to-action input mapping.
+// ---------------------------------------------------------------------------
+
+/** A reviewed repository whose workflow invokes the action under review. */
+function reviewedRepoWithWorkflow(): { dir: string; head: string; } {
+  const dir = mkdtempSync(join(tmpdir(), "workflow-witness-"));
+  execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: dir });
+  execFileSync("git", ["config", "user.email", "fixture@example.com"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", "fixture"], { cwd: dir });
+  const workflow = join(dir, ".github", "workflows", "ai_pr_review.yaml");
+  mkdirSync(dirname(workflow), { recursive: true });
+  writeFileSync(workflow, [
+    "name: AI PR Review",
+    "on: pull_request",
+    "jobs:",
+    "  ai-review:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+    "        with:",
+    "          fetch-depth: 0",
+    "      - uses: misospace/pr-reviewer-action@5b1839535748f3afd1bd3ef04e8009302cba9aa6",
+    "        with:",
+    "          github-token: ${{ secrets.GITHUB_TOKEN }}",
+    "          ai-api-key: ${{ secrets.AI_KEY }}",
+    "          ai-model: review-model",
+    "",
+  ].join("\n"), "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: dir });
+  execFileSync("git", ["commit", "-q", "-m", "reviewed head"], { cwd: dir });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir }).toString("utf8").trim();
+  return { dir, head };
+}
+
+test("#1238 the workflow witness corroborates a workflow-mapped input name end to end", async () => {
+  // The reviewed repository's own workflow passes `ai-api-key`, `ai-model`
+  // and `github-token`. The reviewed head's workflow file is a POSITIVE
+  // witness for the mapping: the cited file's direct action step passes
+  // `ai-api-key`, so a workflow-scoped claim about that name is grounded.
+  const repo = reviewedRepoWithWorkflow();
+  try {
+    const witness = await readWorkflowInputNamesByFile({
+      workspace: repo.dir,
+      revision: repo.head,
+      actionSlug: "misospace/pr-reviewer-action",
+    });
+    assert.ok(witness, "the reviewed workflow is a witness");
+    // The witness is PER FILE: the reviewed workflow file has its own
+    // entry, and the boundary anchors the claim to that file.
+    assert.deepEqual([...witness.keys()], [".github/workflows/ai_pr_review.yaml"]);
+    assert.deepEqual(
+      [...witness.get(".github/workflows/ai_pr_review.yaml")!].sort(),
+      ["ai-api-key", "ai-model", "github-token"],
+    );
+
+    const a = artifact({
+      verdict: "request_changes",
+      findings: [
+        finding({
+          severity: "major",
+          file: ".github/workflows/ai_pr_review.yaml",
+          line: 36,
+          message: "the workflow passes `ai-api-key` as the action's credential input",
+        }),
+      ],
+    });
+    const result = await applyBlockerVerification(a.findings, {
+      readSource: unavailableReader,
+      expectedRevision: REVISION,
+      declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+      workflowInputsByFile: witness,
+    });
+    assert.equal(result.demoted, 0);
+    assert.equal(a.findings[0]!.grounding_status, undefined);
+    assert.equal(a.findings[0]!.severity, "major");
+    const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+    assert.equal(a.verdict, "request_changes");
+    assert.equal(outcome.verdict, "request_changes");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("#1238 a workflow-mapped name the witness cannot corroborate keeps the review fail-closed", async () => {
+  // The reviewed workflow does NOT pass `ai-key` — but the reader sees only
+  // the DIRECT action steps of the cited file, so "this file does not pass
+  // `ai-key`" is NOT an absence the witness can establish (a composite
+  // action, a reusable workflow or a remote composite can pass a name
+  // through a surface the reader never sees). The witness therefore never
+  // refutes: the claim stays unknown evidence, and the strict mapping must
+  // NOT derive an approve from a claim the witness did not corroborate.
+  const repo = reviewedRepoWithWorkflow();
+  try {
+    const witness = await readWorkflowInputNamesByFile({
+      workspace: repo.dir,
+      revision: repo.head,
+      actionSlug: "misospace/pr-reviewer-action",
+    });
+    assert.ok(witness, "the reviewed workflow is a witness");
+
+    const a = artifact({
+      verdict: "request_changes",
+      findings: [
+        finding({
+          severity: "major",
+          file: ".github/workflows/ai_pr_review.yaml",
+          line: 36,
+          message: "the workflow's credential input is named `ai-key`, so the action drops the credential",
+        }),
+      ],
+    });
+    const result = await applyBlockerVerification(a.findings, {
+      readSource: unavailableReader,
+      expectedRevision: REVISION,
+      declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+      workflowInputsByFile: witness,
+    });
+    // Unknown evidence, not a refutation.
+    assert.equal(result.demoted, 1);
+    assert.equal(a.findings[0]!.grounding_status, "unverified");
+    assert.equal(a.findings[0]!.severity, "minor");
+    assert.equal(a.findings[0]!.capped_from, "major");
+    // The strict mapping sees the unverified blocker-level demotion as a
+    // fail-closed forcing signal: no approve is derived from a claim the
+    // witness did not corroborate.
+    const outcome = applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+    assert.equal(a.verdict, "request_changes");
+    assert.equal(outcome.verdict, "request_changes");
+    // The relaxer refuses too: unknown evidence never certifies a clean
+    // review.
+    assert.equal(relaxUnverifiedBlockerVerdict(a, { forced: false }), false);
+    assert.equal(a.verdict, "request_changes");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("#1238 without the workflow witness the same claim keeps today's behavior and fails closed", async () => {
+  // The fail-safe control: the reviewed repository's workflows could not be
+  // read, so the mapping claim is not decided by them. The sibling
+  // presence claim about the DECLARED `ai-api-key` still grounds the
+  // finding exactly as it did before the witness existed, so the finding
+  // stays major and the strict mapping keeps request_changes — no approve
+  // is derived from a claim nobody checked.
+  const a = artifact({
+    verdict: "request_changes",
+    findings: [
+      finding({
+        severity: "major",
+        file: ".github/workflows/ai_pr_review.yaml",
+        line: 36,
+        message: "the workflow's credential input is named `ai-key`, but the pinned action declares `ai-api-key`, so GitHub drops the workflow's credential",
+      }),
+    ],
+  });
+  const result = await applyBlockerVerification(a.findings, {
+    readSource: unavailableReader,
+    expectedRevision: REVISION,
+    declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+    workflowInputsByFile: null,
+  });
+  assert.equal(result.demoted, 0);
+  assert.equal(a.findings[0]!.grounding_status, undefined);
+  assert.equal(a.findings[0]!.severity, "major");
+  applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+  assert.equal(a.verdict, "request_changes");
+});
+
+/**
+ * A reviewed repository that reaches the action under review through a
+ * LOCAL COMPOSITE action: the workflow calls the composite, and the
+ * composite calls the action with an input name.
+ */
+function reviewedRepoWithComposite(): { dir: string; head: string; } {
+  const dir = mkdtempSync(join(tmpdir(), "workflow-composite-"));
+  execFileSync("git", ["init", "-q", "--initial-branch=main"], { cwd: dir });
+  execFileSync("git", ["config", "user.email", "fixture@example.com"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", "fixture"], { cwd: dir });
+  const composite = join(dir, ".github", "actions", "review", "action.yml");
+  mkdirSync(dirname(composite), { recursive: true });
+  writeFileSync(composite, [
+    "name: Local review composite",
+    "description: Runs the AI reviewer",
+    "runs:",
+    "  using: composite",
+    "  steps:",
+    "    - uses: misospace/pr-reviewer-action@5b1839535748f3afd1bd3ef04e8009302cba9aa6",
+    "      with:",
+    "        ai-api-key: ${{ secrets.AI_KEY }}",
+    "",
+  ].join("\n"), "utf8");
+  const workflow = join(dir, ".github", "workflows", "ci.yaml");
+  mkdirSync(dirname(workflow), { recursive: true });
+  writeFileSync(workflow, [
+    "name: CI",
+    "on: pull_request",
+    "jobs:",
+    "  review:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+    "      - uses: ./.github/actions/review",
+    "        with:",
+    "          ai-api-key: ${{ secrets.AI_KEY }}",
+    "",
+  ].join("\n"), "utf8");
+  execFileSync("git", ["add", "-A"], { cwd: dir });
+  execFileSync("git", ["commit", "-q", "-m", "reviewed head"], { cwd: dir });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir }).toString("utf8").trim();
+  return { dir, head };
+}
+
+test("#1238 a workflow that reaches the action through a local composite action is NOT refuted", async () => {
+  // The reviewed repository hides the invocation in a local composite
+  // action. The workflow file has NO direct action step, so the reader
+  // has no entry for it and the witness says NOTHING about that file: the
+  // claim is undecided, never refuted. A PR author must not be able to
+  // silence a true finding by moving the invocation into a composite.
+  const repo = reviewedRepoWithComposite();
+  try {
+    const witness = await readWorkflowInputNamesByFile({
+      workspace: repo.dir,
+      revision: repo.head,
+      actionSlug: "misospace/pr-reviewer-action",
+    });
+    assert.equal(witness, null, "the composite-calling workflow has no direct action step, so it has no entry");
+
+    const a = artifact({
+      verdict: "request_changes",
+      findings: [
+        finding({
+          severity: "major",
+          file: ".github/workflows/ci.yaml",
+          line: 12,
+          message: "the workflow passes `ai-key` as the action's credential input",
+        }),
+      ],
+    });
+    const result = await applyBlockerVerification(a.findings, {
+      readSource: unavailableReader,
+      expectedRevision: REVISION,
+      declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+      workflowInputsByFile: witness,
+    });
+    // Not refuted, not demoted: the finding stays blocking and the review
+    // fails closed.
+    assert.equal(result.demoted, 0);
+    assert.equal(a.findings[0]!.grounding_status, undefined);
+    assert.equal(a.findings[0]!.severity, "major");
+    applyStrictVerdictPolicy(a, { modelVerdict: "request_changes", forced: false });
+    assert.equal(a.verdict, "request_changes");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});
+
+test("#1238 a claim filed against another file is never decided by the workflow witness", async () => {
+  // The witness is anchored to the file the finding cited. A finding
+  // against a file with no entry (here: a source file) keeps today's
+  // behavior, whatever the workflows in the repository pass.
+  const repo = reviewedRepoWithWorkflow();
+  try {
+    const witness = await readWorkflowInputNamesByFile({
+      workspace: repo.dir,
+      revision: repo.head,
+      actionSlug: "misospace/pr-reviewer-action",
+    });
+    assert.ok(witness, "the reviewed workflow is a witness");
+    const a = artifact({
+      verdict: "request_changes",
+      findings: [
+        finding({
+          severity: "major",
+          file: "src/precheck/decide.ts",
+          line: 12,
+          message: "the workflow passes `ai-key` as the action's credential input",
+        }),
+      ],
+    });
+    const result = await applyBlockerVerification(a.findings, {
+      readSource: unavailableReader,
+      expectedRevision: REVISION,
+      declaredActionInputs: new Set(["github-token", "ai-base-url", "ai-api-key", "ai-model", "rereview-label"]),
+      workflowInputsByFile: witness,
+    });
+    assert.equal(result.demoted, 0);
+    assert.equal(a.findings[0]!.grounding_status, undefined);
+    assert.equal(a.findings[0]!.severity, "major");
+  } finally {
+    rmSync(repo.dir, { recursive: true, force: true });
+  }
+});

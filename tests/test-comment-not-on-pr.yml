@@ -1,0 +1,49 @@
+name: Test issue comment on a plain issue is a clean no-op
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Replace event payload with an issue_comment on a plain issue
+        run: |
+          echo "event path: $GITHUB_EVENT_PATH"
+          cat > "$GITHUB_EVENT_PATH" <<'EOF'
+          {
+            "name": "issue_comment",
+            "action": "created",
+            "issue": { "number": 5 },
+            "comment": { "id": 1, "body": "/ai-review", "user": { "login": "someone" } }
+          }
+          EOF
+          cat "$GITHUB_EVENT_PATH"
+      - id: action
+        uses: .
+        with:
+          ai-base-url: http://127.0.0.1:9/v1
+          ai-model: test-model
+          ci-status-check: "false"
+          ai-primary-retries: "0"
+      - name: Assert review skipped with comment-not-on-pr
+        env:
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          SKIP_REASON: ${{ steps.action.outputs.skip-reason }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+        run: |
+          echo "should-review: $SHOULD_REVIEW"
+          echo "skip-reason: $SKIP_REASON"
+          echo "verdict: $VERDICT"
+          if [ "$SHOULD_REVIEW" != "false" ]; then
+            echo "FAIL: expected should-review=false"
+            exit 1
+          fi
+          if [ "$SKIP_REASON" != "comment-not-on-pr" ]; then
+            echo "FAIL: expected skip-reason=comment-not-on-pr"
+            exit 1
+          fi
+          if [ -n "$VERDICT" ]; then
+            echo "FAIL: expected empty verdict"
+            exit 1
+          fi
+          echo "PASS"
