@@ -43,6 +43,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | v3.6.0 | [`v3.6.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.6.0) | [`e207a7d`](https://github.com/misospace/pr-reviewer-action/commit/e207a7d11d2ee41f77493b2314e30e7ca694da50) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.6.0/HARDENING.md) |
 | v3.7.0 | [`v3.7.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.7.0) | [`5b18395`](https://github.com/misospace/pr-reviewer-action/commit/5b1839535748f3afd1bd3ef04e8009302cba9aa6) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.7.0/HARDENING.md) |
 | v3.8.0 | [`v3.8.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.8.0) | [`0a2d273`](https://github.com/misospace/pr-reviewer-action/commit/0a2d2732f7358e509e6a85e11160eb25cc5b1b80) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.8.0/HARDENING.md) |
+| v3.9.0 | [`v3.9.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.9.0) | [`25dae60`](https://github.com/misospace/pr-reviewer-action/commit/25dae600b49c50c18d9b05cc8812943a1f5412ec) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.9.0/HARDENING.md) |
 
 ## Privacy
 
