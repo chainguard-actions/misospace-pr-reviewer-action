@@ -1,0 +1,151 @@
+# Tangled (experimental)
+
+Tangled support is experimental. The upstream hosting, appview and record interfaces still change, so this page states what the action does on Tangled today.
+
+Three rules hold on every Tangled run:
+
+1. Every forge read and every forge write of the pull goes through the configured forge capability. A Tangled run never calls a GitHub or a Forgejo forge API for the pull, and it never runs a forge command-line tool. The linked-source enrichment is not a pull read. It always targets github.com, so it serves GitHub repositories only.
+2. A capability that Tangled does not have fails closed. The runtime names the missing capability and stops. It never guesses a value and never falls back to another forge.
+3. A secret travels only in the request that needs it. The app password travels in the body of the AT-Proto session call, and the session tokens travel in the authentication header. Neither appears in a URL, in a process argument or in a log line.
+
+## Current status
+
+A Tangled run completes end-to-end on the stock adapter: precheck, review over the selected patch revision's diff, and managed-record publication ([#1690](https://github.com/misospace/pr-reviewer-action/issues/1690) wired the read path on the current record model).
+
+1. The review-identity resolution reads the repository account on its knot: one open `org.tangled.track.ticket` pull request (a ticket with `targetBranch` set) plus its newest immutable `org.tangled.review.patch` revision, through the knot's standard `com.atproto.repo.listRecords` (`src/platform/tangled-ticket.ts`, #1690). When several open pulls target the same branch, the unique candidate whose trusted patch history contains the launch-time reviewed head wins; anything else fails closed. The selected patch revision IS the review identity: its knot-written `base.oid`/`head.oid` (40 or 64 hex — SHA-1 migrated knots, SHA-256 new ones) drive everything downstream.
+2. The diff and changed-file reads derive the reviewable content from the selected revision's trusted base/head through the Git read surface — the checked-out round in the run workspace, read with fixed-argv bounded git commands (`src/platform/tangled-git.ts`, #1690). Before any content is derived, a bounded `git rev-parse HEAD` proves the checkout's committed HEAD equals the selected revision's trusted `head.oid` (and the launch-time `TANGLED_PR_SOURCE_SHA`, when present, must agree too): the shared reviewer also consumes checkout bytes directly, so a stale checkout that merely contains the newer commit object would otherwise produce a split-brain review. A checkout that is not at the selected head, or that cannot produce the diff, fails closed with the failing state named.
+3. The publication step's #451 exact-head re-check reads the trusted current head from the knot's `org.tangled.review.patch` records (`src/platform/tangled-head.ts`, #1165): the newest patch revision's `head.oid` for the ticket, bound to the repository account. Because the reviewed head IS the selected revision's `head.oid`, this fresh read is the same-revision check: a resubmission mid-run makes the newest revision disagree with the reviewed head and publication refuses. A review that cannot prove the pull did not advance is never published. That read needs `TANGLED_REPO_KNOT` and `TANGLED_REPO_REPO_DID`. Once the pull's metadata proves the pull is open and not a proven draft, the runner checks both before the review starts, so a missing one stops the run with an error naming the variable (#1692, #1696). A closed pull and a proven draft never reach that check. When the metadata cannot be read the check runs anyway: that metadata read needs the same knot host and repository account, so a missing variable can itself be why the read failed and the named configuration error must not be bypassed by that failure (#1696 review). Only with both variables set does an unreadable pull leave the decision to the existing failure path.
+
+The managed review record binds to the ticket AT-URI with the selected revision's `head.oid` as its reviewed head. The legacy `sh.tangled.repo.pull` model and its patch-blob chain (`src/platform/tangled-diff.ts`, `tangled-patch.ts`, `tangled-blob.ts`) are obsolete and have no production caller.
+
+The runner exits with code 1 whenever a step fails closed — an unreadable knot, an ambiguous ticket, or a checkout that cannot produce the reviewed diff. Read the [support matrix](#support-matrix) before you plan a Tangled rollout.
+
+## Runtime surface
+
+Tangled is not GitHub Actions. The `action.yml` manifest is the GitHub Actions entry point, and it is not the Tangled entry point.
+
+Tangled reviews run on the host-neutral runner:
+
+```bash
+node dist/index.js tangled
+```
+
+The runner runs precheck, review and publish in one Node process. It needs no `GITHUB_EVENT_PATH`, `GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY` or `RUNNER_TEMP`. It needs no `gh`, no Python and no shell.
+
+The runner pins the platform to `tangled` in the run environment and in the action configuration. A `github` or `forgejo` platform is refused with an error, not ignored. There is no fallback to another forge.
+
+## Setup
+
+The Spindle workflow example is the copyable starting point: [`examples/tangled-workflow.yml`](../examples/tangled-workflow.yml). Copy it to `.tangled/workflows/ai-review.yml` in the repository.
+
+1. Set the public runtime values in the workflow file. Spindle injects them into the runner process.
+2. Set the private values as Spindle repository environment variables. Never write a private value in the workflow file.
+3. Pin the reviewer release tag. A release tag carries the built `dist/`, so the workflow needs no install step and no build step.
+
+The example pins the `v3` tag, which floats to the latest v3 release. Pin an exact tag in production.
+
+## Configuration
+
+### Public values
+
+These values are identifiers. They are not secrets.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `TANGLED_REPO_DID` | Yes | The DID of the repository owner. The platform detection reads it first, so a set value selects Tangled. |
+| `TANGLED_REPO_REPO_DID` | Yes | The DID of the repository. The resolver lists the pulls of this repository. |
+| `TANGLED_BOBBIN_URL` | No | The absolute `https` URL of the Bobbin endpoint. Configuration only since #1690: review resolution reads the authoritative ticket/patch records from the repository account on the knot, not the Bobbin index. Plain `http` is accepted for loopback hosts only. |
+| `TANGLED_REPO_NAME` | No | The name of the repository. |
+| `TANGLED_REPO_KNOT` | Yes | The bare hostname of the repository's knot. It carries no scheme, no port and no path. The ticket and patch records live in the repository account on this knot; without it the run cannot resolve its review identity. A publish-mode run whose metadata proves an open, non-draft pull is refused before the review with an error naming the missing variable; because the metadata read itself needs the knot host too, a run missing this value gets the named error even when that very gap is what made the metadata unreadable (#1692, #1696). |
+| `TANGLED_PR_SOURCE_BRANCH` | No | The source branch of the pull. |
+| `TANGLED_PR_TARGET_BRANCH` | No | The target branch of the pull. |
+| `TANGLED_PR_SOURCE_SHA` | No | The launch-time source commit of the checkout. Advisory: the reviewed head comes from the selected patch revision's knot-written `head.oid`. It disambiguates the ticket only when several open pulls target the same branch. |
+| `ATPROTO_HOST` | No | The host of the account's repository server. The default is `https://bsky.social`. |
+| `ATPROTO_TIMEOUT` | No | The request timeout in seconds. The default is 30. |
+
+The resolver needs at least one of `TANGLED_PR_SOURCE_BRANCH` and `TANGLED_PR_TARGET_BRANCH`.
+
+### Private values
+
+These values are secrets. Store them as Spindle repository environment variables.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `ATPROTO_HANDLE` | Yes | The handle of the account that signs the review record. |
+| `ATPROTO_APP_PASSWORD` | Yes | The app password of that account. |
+| `INPUT_AI-API-KEY` | Yes | The key of the model endpoint. |
+
+The model endpoint and model name use the `ai-base-url` and `ai-model` inputs. The publish mode uses the `publish-mode` input.
+
+Spindle runs pipeline code for a fork pull request, so a fork pull request has no private values. The example skips the review step when a private value is missing, instead of failing the run.
+
+## Identity
+
+A Tangled pull has no number. Its identity is the ticket AT URI, the record key and the CID of the record, plus the selected patch revision's own CID (the record key of an `org.tangled.review.patch` IS its CID):
+
+```text
+at://<repo-did>/org.tangled.track.ticket/<tid>
+at://<repo-did>/org.tangled.review.patch/<cid>
+```
+
+Both records live in the repository DID's account on its knot — not in the author's PDS. The action never invents a numeric pull number. The `pr-number` input stays empty on a Tangled run, and the pull locator reaches the runtime through the DID context.
+
+The resolver picks the open ticket targeting the context's target branch. If two open pulls target it, the unique candidate whose trusted patch history contains the launch-time reviewed head wins; anything else fails closed as ambiguous.
+
+The repository owner DID is a public identifier. The app password is the secret. The runtime never writes the secret into a URL, an argument or a diagnostic message.
+
+## Support matrix
+
+The matrix uses three words:
+
+- **Supported** means the capability works today.
+- **Degraded** means the implementation exists, but the runtime does not reach it yet or reaches it with less function.
+- **Unsupported** means Tangled has no such capability. The runtime refuses it and never substitutes another forge.
+
+| Feature | Tangled | Notes |
+|---|---|---|
+| Platform detection | Supported | `auto` selects Tangled when `TANGLED_REPO_DID` is set. An explicit `tangled` requires it. |
+| Pull identity and metadata read | Supported | The knot answers the standard `com.atproto.repo.listRecords` for the repository account without a credential. |
+| Normal review engine | Supported | The same engine runs on GitHub and Forgejo; the stock adapter's wired diff read (#1690) lets a Tangled run reach a verdict. |
+| Verdict policy and required-check policy | Supported | The same deterministic policy runs on every platform. |
+| Selected-revision diff and changed files | Supported | The selected patch revision's trusted base/head drive a bounded local git read of the checked-out round (`src/platform/tangled-git.ts`, #1690) through `TangledAdapter.getPrDiff`/`listPrFiles`; a checkout that cannot produce the diff fails closed. |
+| Managed top-level review record | Supported | The record client writes one record per pull and updates it in place on a re-review. Publication creates with `putRecord` at a record key derived from the ticket AT URI, so two overlapping runs update the same record instead of making two. If a listing still shows more than one record for the pull, the run keeps the newest `createdAt`, updates it in place, deletes the others, and reports how many it removed (#1691). The publication head re-check reads the knot's `org.tangled.review.patch` records (`src/platform/tangled-head.ts`) and fails closed on an unknown, malformed, or ambiguous head. |
+| Inline findings on a diff line | Unsupported | Tangled has no inline review object. The findings stay in the review body. |
+| Native approve or request-changes objects | Unsupported | Tangled has no native review verdict object. The verdict stays in the review body. |
+| Review dismissal and minimization | Unsupported | The managed record is updated in place instead. |
+| Review thread resolution | Unsupported | Tangled has no thread API. |
+| GitHub GraphQL operations | Unsupported | The runtime never sends a GraphQL request on a Tangled run. |
+| The native loop `gh_api` tool | Unsupported | The tool returns an error. There is no XRPC translation for it. |
+| The native loop `repo_contents` tool | Unsupported | The file read fails. The checkout stays the source for file content. |
+| CI and pipeline status polling | Unsupported | The runner turns the CI gate off. Tangled has no status seam. |
+| Reviewer requests | Unsupported | The publish step logs a warning. |
+| Label cleanup and ack reactions | Unsupported | Those paths need a GitHub event. The runner has no event. |
+| Conversation comment replies | Unsupported | Tangled has no conversation comment surface. The managed review record is the only write. |
+| Linked-source enrichment | Degraded | The enrichment client always targets github.com, so it serves GitHub repositories only. |
+| Evidence providers | Degraded | The provider commands read the checkout. A provider that calls the GitHub API does not work on Tangled. |
+
+## Guardrails
+
+These guardrails hold on every Tangled run.
+
+- The platform capability decides which client runs. A Tangled run never builds a GitHub or a Forgejo client for the pull. The linked-source enrichment is the only exception, and it always targets github.com.
+- The runner refuses a `github` or `forgejo` platform input. A contradictory configuration stops the run.
+- The publish step refuses to publish when it cannot prove that the pull did not advance since the review. The launch-time source commit is not a trustworthy source for that proof.
+- A run that publishes must configure the proof: `TANGLED_REPO_KNOT` and `TANGLED_REPO_REPO_DID`. Without either, the run stops with an error naming the missing variable, before the review starts and before the diff read, so the named diagnostic comes first and the runner spends no model review on a publication that could only be refused (#1692, #1696). The check follows the pull's own metadata: it applies to a pull that is open and not a PROVEN draft — an unproven draft bit is not proof of a skip. A closed pull and a proven draft never reach the check and need neither variable. If the metadata cannot be read the runner still never treats the pull as publishable: the metadata read itself needs the knot host and the repository account, so a missing variable is reported by name before that failure can mask it (#1696 review), and an unreadable pull with both variables configured leaves the stop to the existing failure path. A run whose knot is configured but never answers fails closed on the review-identity resolution and publishes nothing (#1690).
+- The CI gate stays off. The runner does not start a status child that Tangled cannot serve.
+- The publish step never asks for a native approval. A missing native surface degrades to the managed record.
+- Managed review publication is idempotent under concurrent runs (#1691). The record key comes from the pull AT URI, so overlapping runs converge on one record. A duplicate set left by an older run heals on the next run by a fixed rule, and the run reports what it removed.
+- The diff is designed to come from the pull round, and the file content from the checkout. The runner does not trust a pull record for the commit that a review covers.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | The run skipped the review, the review published, or a newer head superseded the publication. |
+| 1 | The review failed, the publication failed, the run refused a contradictory configuration, or a carried `request_changes` verdict blocked the run. |
+
+## Related pages
+
+- [Inputs and outputs](inputs.md) lists every input and output.
+- [v2 to v3 migration](v3-migration.md) explains the platform seam and the removed runtime.
+- [Fork reviews](fork-review.md) explains the privilege separation for fork pull requests.

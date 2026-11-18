@@ -1,0 +1,674 @@
+import { constants as osConstants } from "node:os";
+import { runProcess } from "../runtime/subprocess.js";
+import { buildChildEnv, extendAllowlist } from "../runtime/env.js";
+import type { EnvAllowlist } from "../runtime/env.js";
+import { redactText } from "../context/redact.js";
+import {
+  PyFloat,
+  PyJsonDecodeError,
+  PyUncaughtError,
+  clampToNumber,
+  isPyDict,
+  pyIntOf,
+  pyJsonLoads,
+  pyReprStr,
+  pyRound3,
+  pyStr,
+  pyTruthy,
+} from "./pyjson.js";
+import { pyStrip } from "../platform/py.js";
+
+/**
+ * Evidence-provider execution (#679, #706 PR 5a) — the port of `run_provider`
+ * and `parse_findings` in `scripts/run_evidence_providers.py`. The
+ * orchestration around it (config, pool, SARIF, rendering, fork gate,
+ * fallback) lives in `orchestrate.ts`.
+ *
+ * Trust boundary preserved verbatim: a string `command` is trusted
+ * operator-supplied input and runs via `bash -lc` (the full shell-injection
+ * surface is intentional for that shape; argv lists are preferred), exactly
+ * like v2. Provenance constraint: provider specs come from operator-managed
+ * workflow configuration (the `evidence_providers_file` input), never from
+ * PR-controlled content — a future caller must not wire PR/issue-derived
+ * specs into this executor without adding its own allowlist layer. On the
+ * standard Action path that input resolves INSIDE the reviewed-head
+ * checkout, so the file's content is PR-writable there: the orchestration
+ * treats such a source as untrusted for NEGATIVE evidence (a PR must never
+ * mint its own clean-run authority) while ordinary positive evidence keeps
+ * its existing behavior (#1529 review). The
+ * executed child owns a process group, so a provider that outlives its
+ * deadline cannot leave transport children behind — the whole tree is
+ * terminated (the v2 `subprocess.run(timeout=)` path only killed the direct
+ * executed child owns a process group, so a provider that outlives its
+ * deadline cannot leave transport children behind — the whole tree is
+ * terminated (the v2 `subprocess.run(timeout=)` path only killed the direct
+ * child).
+ *
+ * Environment authority is narrower than v2 production: v2 passed
+ * `os.environ` minus five scrubbed keys; v3 passes an explicit allowlist
+ * (transport config, gh auth family, workspace/PR identity). `GH_TOKEN` stays
+ * — providers commonly use gh. Callers widen authority only through the
+ * explicit `allowEnv` extension, never through passthrough.
+ *
+ * Output handling is v2's: `redact_text` masks each stream before the byte
+ * cut (`mask_and_truncate`), stdout is masked a second time before the JSON
+ * parse, and parsing uses the CPython-faithful decoder so `output_format`
+ * and the stringified findings match byte-for-byte.
+ */
+
+/**
+ * Provider child environment allowlist. Deliberately narrower than the v2
+ * `os.environ` passthrough: no model/Linear/MCP credentials.
+ */
+export const EVIDENCE_ENV_ALLOWLIST: EnvAllowlist = [
+  // Process basics.
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  // Network transport (providers may talk to external services).
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "CURL_CA_BUNDLE",
+  // gh CLI auth + config (GH_TOKEN kept from v2 policy).
+  "GH_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+  "GH_HOST",
+  // Workspace / repository identity.
+  "GITHUB_WORKSPACE",
+  "GITHUB_REPOSITORY",
+  "GITHUB_API_URL",
+  "REPO",
+  "PR_NUMBER",
+  "PLATFORM",
+];
+
+export const DEFAULT_PROVIDER_TIMEOUT_SEC = 30;
+export const DEFAULT_PROVIDER_MAX_OUTPUT_BYTES = 20_000;
+/** v2 contract: at most 40 findings per provider. */
+export const MAX_PROVIDER_FINDINGS = 40;
+/** setTimeout's ceiling (a larger delay fires immediately in Node). */
+const MAX_TIMER_MS = 2_147_483_647;
+
+export type ProviderSeverity = "info" | "minor" | "warning" | "major" | "blocker";
+
+export interface ProviderFinding {
+  severity: ProviderSeverity;
+  message: string;
+  source: string;
+}
+
+/**
+ * Structured result for one provider execution. Snake_case: this is the
+ * persisted artifact shape consumed by the corpus builder (v2-identical,
+ * including key order). `duration_sec` is a Python float; `output_format` is
+ * absent on an invalid entry, exactly like v2's early return.
+ */
+export interface EvidenceProviderEntry {
+  id: string;
+  status: "ok" | "error" | "timeout" | "invalid";
+  command: string;
+  duration_sec: PyFloat;
+  exit_code: number | null;
+  provider_severity: ProviderSeverity;
+  findings: ProviderFinding[];
+  stdout: string;
+  stderr: string;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  output_format?: "json" | "text";
+}
+
+export interface ProviderSpec {
+  id?: unknown;
+  command?: unknown;
+  timeout_sec?: unknown;
+  max_output_bytes?: unknown;
+  [key: string]: unknown;
+}
+
+// ── #1517: the negative-evidence declaration ─────────────────────────────
+// A provider spec MAY carry a `negative_evidence` object declaring what a
+// CLEAN run of that provider is authoritative negative evidence for. The
+// declaration lives ONLY in the operator-managed providers config (the same
+// trust source as the command itself — see the module docblock: provider
+// specs come from operator-managed workflow configuration, never from
+// PR-controlled content), and nothing a provider PRINTS can create or widen
+// one: external/untrusted status text cannot self-declare negative-evidence
+// authority. Parsing is fail-closed — any shape that is not exactly the
+// declared schema yields null, and a null spec produces no rule.
+
+export type NegativeEvidenceDomain = "formatter" | "lint" | "schema";
+
+export const NEGATIVE_EVIDENCE_DOMAINS: ReadonlySet<string> = new Set(["formatter", "lint", "schema"]);
+
+/**
+ * The finding categories a negative-evidence rule may contradict: the model
+ * category allowlist (src/model/verdict.ts FINDING_CATEGORIES) MINUS
+ * `security` — a clean deterministic tool run is never evidence that
+ * security properties hold, so a security-capable rule is refused at parse
+ * time. `requirements` is not a model category (it is synthesized by the
+ * deterministic enforcement layer, see
+ * src/enforcement/blocker-verification.ts DETERMINISTIC_FINDING_CATEGORIES)
+ * and is refused for the same reason.
+ */
+export const NEGATIVE_EVIDENCE_CATEGORIES: ReadonlySet<string> = new Set([
+  "bug", "performance", "style", "docs", "tests", "question", "other", "verification",
+]);
+
+/** Severity ceilings a rule may declare; `blocker` is deliberately absent —
+ * blocker findings are never contradicted by negative evidence. */
+export const NEGATIVE_EVIDENCE_MAX_SEVERITIES: ReadonlySet<string> = new Set(["major", "minor", "info"]);
+
+/**
+ * #1517 (2026-11-06 corpus-calibration hardening): a tool identity or rule id
+ * must NAME the tool distinctively. A token that appears in ordinary review
+ * prose word-boundedly matches most finding texts and silently voids the
+ * lint/schema identity gate — the calibration measured a generic identity of
+ * "the" satisfying 71/74 real corpus findings. Refuse English function words
+ * and ultra-generic review nouns outright, plus any token shorter than three
+ * characters, at parse time AND when a persisted rule is revalidated.
+ * Fail-closed: a refused declaration is no declaration. An operator whose
+ * tool needs a colliding token declares a distinctive form instead (e.g.
+ * "go vet", not "go").
+ */
+export const MIN_NEGATIVE_EVIDENCE_TOKEN_CHARS = 3;
+
+const NEGATIVE_EVIDENCE_GENERIC_TOKENS: ReadonlySet<string> = new Set([
+  // English function words (articles, conjunctions, prepositions, pronouns,
+  // auxiliaries, common adverbs of degree/time).
+  "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "if", "then", "than", "that", "this",
+  "these", "those", "there", "here", "when", "where", "why", "how", "all", "any", "some", "none",
+  "each", "every", "both", "few", "many", "much", "more", "most", "such", "only", "own", "same",
+  "too", "very", "just", "also", "even", "ever", "never", "not", "no", "yes", "of", "to", "in",
+  "on", "at", "by", "for", "with", "from", "into", "onto", "over", "under", "about", "after",
+  "before", "between", "through", "during", "without", "within", "is", "are", "was", "were",
+  "be", "been", "being", "am", "do", "does", "did", "done", "doing", "has", "have", "had",
+  "having", "will", "would", "shall", "should", "can", "could", "may", "might", "must", "it",
+  "its", "itself", "they", "them", "their", "theirs", "we", "us", "our", "ours", "you", "your",
+  "yours", "he", "she", "him", "his", "her", "hers", "me", "my", "mine", "who", "whom", "whose",
+  "which", "what", "because", "while", "until", "since", "although", "though", "whether",
+  "either", "neither", "always", "often", "again", "almost", "enough", "instead", "rather",
+  "out", "off", "old", "new", "now", "get", "got", "put", "set", "use", "used", "using", "one",
+  "two", "six", "ten", "way", "end", "per", "via", "vs", "versus", "etc",
+  // Ultra-generic code-review nouns — ordinary finding prose contains them.
+  "code", "lint", "linter", "formatter", "style", "check", "checks", "test", "tests", "tool",
+  "tools", "rule", "rules", "file", "files", "line", "lines", "error", "errors", "warning",
+  "warnings", "issue", "issues", "name", "config", "script", "build", "ci", "run", "runs",
+  "step", "steps",
+]);
+
+/** True when the token is too short or too generic to distinctively name a
+ * tool (see the calibration note above). */
+export function isGenericNegativeEvidenceToken(token: string): boolean {
+  const text = token.trim().toLowerCase();
+  return text.length < MIN_NEGATIVE_EVIDENCE_TOKEN_CHARS || NEGATIVE_EVIDENCE_GENERIC_TOKENS.has(text);
+}
+
+export const MAX_NEGATIVE_EVIDENCE_PATHS = 64;
+export const MAX_NEGATIVE_EVIDENCE_PATH_CHARS = 256;
+export const MAX_NEGATIVE_EVIDENCE_RULES = 64;
+
+export interface NegativeEvidenceSpec {
+  domain: NegativeEvidenceDomain;
+  /** Repo-relative POSIX path patterns the clean run covers. A pattern with
+   * no `/`-metacharacter semantics covers the exact path and everything
+   * beneath it; `*`/`**` globs are honored (see
+   * src/enforcement/negative-evidence.ts). */
+  paths: string[];
+  /** Finding categories the rule may contradict (subset of
+   * NEGATIVE_EVIDENCE_CATEGORIES). */
+  categories: string[];
+  /** The most severe finding severity the rule may contradict. Omitted
+   * declarations default to the safe `minor` ceiling: a clean tool run
+   * contradicts a MAJOR model finding only when the operator explicitly
+   * says so (the 2026-11-06 corpus calibration — every adjudicated human
+   * finding was major/blocker, so a default of `major` admitted the whole
+   * corpus to the wrong-demotion surface). */
+  max_severity: "major" | "minor" | "info";
+  /** The tool identity a lint/schema claim must name; null means "the
+   * provider's own id". */
+  identity: string | null;
+  /** Exact rule ids (lint rule family / schema rule) a claim may cite. */
+  rules: string[];
+}
+
+/** A repo-relative POSIX path pattern: no absolute, drive, backslash, NUL,
+ * or traversal segments; bounded count and length. One trailing `/` is the
+ * directory form the matcher treats as the covered subtree. Exported for
+ * the persistence gate, which re-validates every rule path with the same
+ * rule the spec parser enforced at derivation. */
+export function validRulePath(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const path = raw.trim();
+  if (path === "" || path.length > MAX_NEGATIVE_EVIDENCE_PATH_CHARS) return null;
+  if (path.includes("\0") || path.includes("\\") || path.startsWith("/")) return null;
+  // Windows drive-absolute shapes (`C:/src`, `c:/src`, `C:`) are not
+  // repo-relative POSIX paths — refuse the drive-letter-colon prefix
+  // outright (anchored: a colon inside a deeper segment is an ordinary,
+  // if unusual, filename).
+  if (/^[A-Za-z]:/.test(path)) return null;
+  const trimmed = path.endsWith("/") && path.length > 1 ? path.slice(0, -1) : path;
+  if (trimmed === "") return null;
+  for (const segment of trimmed.split("/")) {
+    if (segment === "" || segment === "." || segment === "..") return null;
+  }
+  return path;
+}
+
+function stringListField(value: unknown, allowed: ReadonlySet<string> | null, max: number, maxChars: number): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string") return null;
+    const text = item.trim();
+    if (text === "" || text.length > maxChars) return null;
+    if (allowed !== null && !allowed.has(text)) return null;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+    if (out.length > max) return null;
+  }
+  return out;
+}
+
+/**
+ * Parse the `negative_evidence` key of a provider spec. Returns null when
+ * the key is absent or anything about the value is not exactly the declared
+ * schema — fail-closed: an unparsable declaration is no declaration, and the
+ * provider keeps its plain advisory-finding behavior. An omitted
+ * `max_severity` defaults to the safe `minor` ceiling (NOT `major`), and
+ * generic identity/rule-id tokens (see
+ * `isGenericNegativeEvidenceToken`) are refused outright.
+ */
+export function parseNegativeEvidenceSpec(raw: unknown): NegativeEvidenceSpec | null {
+  if (raw === null || raw === undefined) return null;
+  if (!isPyDict(raw)) return null;
+
+  const domainValue = dictGet(raw, "domain");
+  if (typeof domainValue !== "string" || !NEGATIVE_EVIDENCE_DOMAINS.has(domainValue)) return null;
+
+  const paths = stringListField(dictGet(raw, "paths"), null, MAX_NEGATIVE_EVIDENCE_PATHS, MAX_NEGATIVE_EVIDENCE_PATH_CHARS);
+  if (paths === null || paths.length === 0) return null;
+  const validPaths: string[] = [];
+  for (const path of paths) {
+    const valid = validRulePath(path);
+    if (valid === null) return null;
+    validPaths.push(valid);
+  }
+
+  const categories = stringListField(dictGet(raw, "categories"), NEGATIVE_EVIDENCE_CATEGORIES, NEGATIVE_EVIDENCE_CATEGORIES.size, 32);
+  if (categories === null || categories.length === 0) return null;
+  // #1529 review (structural formatter boundary): a formatter-clean run is
+  // authoritative negative evidence for STYLE-class claims only. A semantic
+  // bug is category `bug`, never `style`, so a formatter declaration that
+  // claims any other category is refused outright — the structural
+  // boundary that keeps formatter cues from ever reaching semantic
+  // findings, independent of the message's wording.
+  if (domainValue === "formatter" && categories.some((category) => category !== "style")) return null;
+
+  let maxSeverity: NegativeEvidenceSpec["max_severity"] = "minor";
+  const rawMaxSeverity = dictGet(raw, "max_severity");
+  if (rawMaxSeverity !== undefined && rawMaxSeverity !== null) {
+    if (typeof rawMaxSeverity !== "string" || !NEGATIVE_EVIDENCE_MAX_SEVERITIES.has(rawMaxSeverity)) return null;
+    maxSeverity = rawMaxSeverity as NegativeEvidenceSpec["max_severity"];
+  }
+
+  let identity: string | null = null;
+  const rawIdentity = dictGet(raw, "identity");
+  if (rawIdentity !== undefined && rawIdentity !== null) {
+    if (typeof rawIdentity !== "string") return null;
+    const identityText = rawIdentity.trim();
+    if (identityText === "" || identityText.length > 128) return null;
+    if (isGenericNegativeEvidenceToken(identityText)) return null;
+    identity = identityText;
+  }
+
+  const rawRules = dictGet(raw, "rules");
+  const ruleIds = rawRules === undefined || rawRules === null
+    ? []
+    : stringListField(rawRules, null, MAX_NEGATIVE_EVIDENCE_RULES, 128);
+  if (ruleIds === null) return null;
+  // A rule id carries the same distinctiveness duty as the identity: a
+  // generic token substring-matches ordinary prose and voids the gate.
+  for (const ruleId of ruleIds) {
+    if (isGenericNegativeEvidenceToken(ruleId)) return null;
+  }
+
+  const allowed = new Set(["domain", "paths", "categories", "max_severity", "identity", "rules"]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) return null;
+  }
+
+  return { domain: domainValue as NegativeEvidenceDomain, paths: validPaths, categories, max_severity: maxSeverity, identity, rules: ruleIds };
+}
+
+export interface RunEvidenceProviderOptions {
+  /** 1-based config position; names the entry `provider-<index>` when the
+   * spec carries no usable id. */
+  index?: number;
+  timeoutSec?: number;
+  maxOutputBytes?: number;
+  /** Explicit per-provider widening of the default allowlist. */
+  allowEnv?: EnvAllowlist;
+  /** Secret mask (default: the v2 `redact_text` port). */
+  redact?: (text: string) => string;
+  /** Ambient environment the allowlist draws from; defaults to process.env. */
+  ambientEnv?: NodeJS.ProcessEnv;
+  /** Working directory for the child (v2: the review workspace cwd). */
+  cwd?: string;
+  /** Monotonic clock in milliseconds (injected by tests). */
+  clock?: () => number;
+  /** Diagnostic sink (v2: the logging module's stderr fallback). */
+  log?: (line: string) => void;
+  /** #726 (engine cancellation): caller-owned abort bound to the provider
+   * subprocess — refused at launch after an abort, whole-tree terminated
+   * mid-flight, exactly like every other owned child. */
+  signal?: AbortSignal;
+}
+
+export function normalizeSeverity(value: unknown): ProviderSeverity {
+  if (value === null || value === undefined) return "info";
+  const text = pyStrip(pyStr(value)).toLowerCase();
+  if (text === "info" || text === "minor" || text === "warning" || text === "major" || text === "blocker") {
+    return text;
+  }
+  return "info";
+}
+
+export function severityRank(value: ProviderSeverity): number {
+  if (value === "blocker") return 3;
+  if (value === "major" || value === "warning") return 2;
+  return 1;
+}
+
+function dictGet(record: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+/** Faithful port of `parse_findings` in scripts/run_evidence_providers.py:
+ * Python truthiness for the `or` chains and `str()` for non-string values. */
+export function parseProviderFindings(payload: unknown): {
+  providerSeverity: ProviderSeverity;
+  findings: ProviderFinding[];
+} {
+  let providerSeverity: ProviderSeverity = "info";
+  const findings: ProviderFinding[] = [];
+
+  if (!isPyDict(payload)) {
+    return { providerSeverity, findings };
+  }
+
+  providerSeverity = normalizeSeverity(dictGet(payload, "severity"));
+  const rawFindings = dictGet(payload, "findings");
+
+  if (Array.isArray(rawFindings)) {
+    for (const item of rawFindings) {
+      if (typeof item === "string") {
+        findings.push({ severity: "info", message: item, source: "" });
+        continue;
+      }
+      if (!isPyDict(item)) continue;
+
+      let message = dictGet(item, "message");
+      if (!pyTruthy(message)) message = dictGet(item, "summary");
+      if (!pyTruthy(message)) message = dictGet(item, "title");
+      if (message === null || message === undefined) continue;
+
+      let source = dictGet(item, "source");
+      const sources = dictGet(item, "sources");
+      if ((source === null || source === undefined) && Array.isArray(sources)) {
+        source = sources.filter((part) => pyTruthy(part)).map((part) => pyStr(part)).join(", ");
+      }
+
+      findings.push({
+        severity: normalizeSeverity(dictGet(item, "severity")),
+        message: pyStr(message),
+        source: source === null || source === undefined ? "" : pyStr(source),
+      });
+    }
+  }
+
+  if (findings.length === 0) {
+    let fallback = dictGet(payload, "message");
+    if (!pyTruthy(fallback)) fallback = dictGet(payload, "summary");
+    if (fallback !== null && fallback !== undefined) {
+      findings.push({ severity: providerSeverity, message: pyStr(fallback), source: "" });
+    }
+  }
+
+  let highest = providerSeverity;
+  for (const finding of findings) {
+    if (severityRank(finding.severity) > severityRank(highest)) {
+      highest = finding.severity;
+    }
+  }
+
+  return { providerSeverity: highest, findings: findings.slice(0, MAX_PROVIDER_FINDINGS) };
+}
+
+function emptyEntry(id: string): EvidenceProviderEntry {
+  return {
+    id,
+    status: "invalid",
+    command: "",
+    duration_sec: new PyFloat(0),
+    exit_code: null,
+    provider_severity: "info",
+    findings: [],
+    stdout: "",
+    stderr: "",
+    stdout_truncated: false,
+    stderr_truncated: false,
+  };
+}
+
+/** `max(minimum, int(raw))` inside `try/except (TypeError, ValueError)`. */
+function coerceOverride(raw: unknown, fallback: number, minimum: number): number {
+  if (raw === null || raw === undefined) return fallback;
+  const parsed = pyIntOf(raw);
+  if (parsed === null) return fallback;
+  return clampToNumber(parsed, minimum);
+}
+
+/**
+ * Captured bytes → the v2 `mask_and_truncate` result. v2 captured the whole
+ * stream, masked it, then cut it to `maxOutput` bytes with a `\n[truncated]`
+ * marker. v3 bounds capture at `captureCap` bytes; when capture overflowed,
+ * the kept prefix is first cut back to its last ASCII whitespace byte so a
+ * credential split by the capture boundary can never survive unmasked as a
+ * pattern-defeating fragment, and the result is always marked truncated.
+ * Below the capture cap this is byte-identical to v2.
+ */
+function maskCaptured(
+  bytes: Buffer,
+  overflowed: boolean,
+  maxOutput: number,
+  mask: (text: string) => string,
+): { text: string; truncated: boolean } {
+  let kept = bytes;
+  if (overflowed) {
+    let cut = -1;
+    for (let i = kept.length - 1; i >= 0; i -= 1) {
+      const byte = kept[i] as number;
+      if (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d)) {
+        cut = i;
+        break;
+      }
+    }
+    kept = kept.subarray(0, Math.max(cut, 0));
+  }
+  const masked = mask(kept.toString("utf8"));
+  const raw = Buffer.from(masked, "utf8");
+  if (raw.length <= maxOutput) {
+    return overflowed ? { text: `${masked}\n[truncated]`, truncated: true } : { text: masked, truncated: false };
+  }
+  return { text: `${raw.subarray(0, maxOutput).toString("utf8")}\n[truncated]`, truncated: true };
+}
+
+/** Per-stream capture bound: `4 * max_output_bytes + 64 KiB` (v2 read the
+ * streams unbounded). */
+export function providerCaptureCap(maxOutput: number): number {
+  return Math.min(maxOutput * 4 + 65_536, Number.MAX_SAFE_INTEGER);
+}
+
+function signalExitCode(signal: NodeJS.Signals | null): number {
+  const number = signal === null ? undefined : (osConstants.signals as Record<string, number | undefined>)[signal];
+  return number === undefined ? -1 : -number;
+}
+
+/**
+ * Execute a single evidence provider and return its structured entry — the
+ * port of `run_provider`. Malformed specs, nonzero exits and timeouts all
+ * produce a typed entry (fail-soft, like v2). Where v2 itself raised past
+ * `run_provider` (an argv whose program cannot be spawned, `int(inf)` in an
+ * override, an over-long JSON integer) this rejects with `PyUncaughtError`,
+ * so the orchestrator reproduces the v2 phase failure and its fallback
+ * artifacts. v3-only launch refusals (no pgrep, non-POSIX) stay an error
+ * entry: they are fail-closed policy, not a v2 crash path.
+ */
+export async function runEvidenceProvider(
+  provider: unknown,
+  options: RunEvidenceProviderOptions = {},
+): Promise<EvidenceProviderEntry> {
+  const defaultTimeout = options.timeoutSec ?? DEFAULT_PROVIDER_TIMEOUT_SEC;
+  const defaultMaxOutput = options.maxOutputBytes ?? DEFAULT_PROVIDER_MAX_OUTPUT_BYTES;
+  const mask = options.redact ?? redactText;
+  const clock = options.clock ?? ((): number => performance.now());
+  const log = options.log ?? ((line: string): void => {
+    process.stderr.write(`${line}\n`);
+  });
+
+  const entry = emptyEntry(`provider-${options.index ?? 1}`);
+  const spec = isPyDict(provider) ? provider : null;
+  if (spec !== null && pyTruthy(dictGet(spec, "id"))) entry.id = pyStr(dictGet(spec, "id"));
+
+  let timeoutSec = defaultTimeout;
+  let maxOutput = defaultMaxOutput;
+  let command: unknown = undefined;
+  if (spec !== null) {
+    command = dictGet(spec, "command");
+    timeoutSec = coerceOverride(dictGet(spec, "timeout_sec"), defaultTimeout, 1);
+    maxOutput = coerceOverride(dictGet(spec, "max_output_bytes"), defaultMaxOutput, 256);
+  }
+
+  if (!pyTruthy(command)) {
+    entry.status = "invalid";
+    entry.stderr = "Missing required field: command";
+    return entry;
+  }
+
+  let file: string;
+  let args: readonly string[];
+  if (Array.isArray(command)) {
+    const argv = command.map((part) => pyStr(part));
+    file = argv[0] as string;
+    args = argv.slice(1);
+    entry.command = argv.map((part) => shellQuote(part)).join(" ");
+  } else {
+    const commandText = pyStr(command);
+    entry.command = commandText;
+    // Trusted operator input; the shell surface is deliberate (v2 parity).
+    log(
+      `evidence provider ${pyReprStr(entry.id)}: command is a shell string and will be executed via \`bash -lc\`.  ` +
+        "Prefer an argv list to avoid the bash trust boundary (see SECURITY.md).",
+    );
+    file = "bash";
+    args = ["-lc", commandText];
+  }
+
+  const env = buildChildEnv(
+    extendAllowlist(EVIDENCE_ENV_ALLOWLIST, options.allowEnv ?? []),
+    options.ambientEnv ?? process.env,
+  );
+
+  const captureCap = providerCaptureCap(maxOutput);
+  const start = clock();
+  let handle;
+  try {
+    handle = runProcess({
+      file,
+      args,
+      env,
+      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      timeoutMs: Math.min(timeoutSec * 1000, MAX_TIMER_MS),
+      maxOutputBytes: captureCap,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
+  } catch (error) {
+    throw new PyUncaughtError("OSError", error instanceof Error ? error.message : String(error));
+  }
+  const result = await handle.result;
+
+  if (result.status === "spawn_error") {
+    if (handle.launchRefusal === null) {
+      // v2's subprocess.run raised (FileNotFoundError / PermissionError /
+      // ValueError) straight out of run_provider.
+      throw new PyUncaughtError("OSError", result.launchError ?? "provider failed to launch");
+    }
+    entry.status = "error";
+    entry.stderr = mask(result.stderr.toString("utf8")) || result.launchError || "provider failed to launch";
+    entry.stdout = mask(result.stdout.toString("utf8"));
+    entry.output_format = "text";
+    return entry;
+  }
+
+  entry.duration_sec = pyRound3((clock() - start) / 1000);
+  if (result.status === "timeout" || result.status === "cancelled") {
+    entry.status = "timeout";
+    entry.exit_code = null;
+  } else {
+    entry.exit_code = result.status === "signalled" ? signalExitCode(result.signal) : result.exitCode ?? -1;
+    entry.status = entry.exit_code === 0 ? "ok" : "error";
+  }
+  const stdout = maskCaptured(result.stdout, result.stdoutTruncated, maxOutput, mask);
+  const stderr = maskCaptured(result.stderr, result.stderrTruncated, maxOutput, mask);
+  entry.stdout = stdout.text;
+  entry.stdout_truncated = stdout.truncated;
+  entry.stderr = stderr.text;
+  entry.stderr_truncated = stderr.truncated;
+
+  // v2 redacts the stored stdout a second time before the JSON parse.
+  entry.stdout = mask(entry.stdout);
+
+  let parsed: unknown = null;
+  if (pyStrip(entry.stdout).length > 0) {
+    try {
+      parsed = pyJsonLoads(entry.stdout);
+    } catch (error) {
+      if (!(error instanceof PyJsonDecodeError)) throw error;
+      parsed = null;
+    }
+  }
+
+  if (parsed !== null) {
+    entry.output_format = "json";
+    const { providerSeverity, findings } = parseProviderFindings(parsed);
+    entry.provider_severity = providerSeverity;
+    entry.findings = findings;
+  } else {
+    entry.output_format = "text";
+  }
+
+  return entry;
+}
+
+/** `shlex.quote`. */
+function shellQuote(part: string): string {
+  if (part !== "" && !/[^A-Za-z0-9_@%+=:,./-]/.test(part)) return part;
+  return `'${part.replaceAll("'", "'\\''")}'`;
+}

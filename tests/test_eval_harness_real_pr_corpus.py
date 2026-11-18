@@ -1,0 +1,1597 @@
+"""Tests for the real-PR evaluation corpus (#779).
+
+Covers: the scorer (score_vulnerable_run / score_clean_run — hit, miss,
+tolerance boundary, file-only hit, clean false positives), corpus loading
+and validation (evals/corpus-real-prs.json plus malformed-corpus rejection),
+the report aggregator's rates, and the pinned-commit checkout fallback.
+No network: the checkout tests use only local, filesystem-backed git repos.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from eval_harness import (
+    _main_real_pr_corpus,
+
+    CONTEXT_ONLY_ENV,
+    REPLAY_ENV,
+    RealPRCorpus,
+    RealPRDefect,
+    RealPRScenario,
+    ReviewRun,
+    _checkout_pinned_commit,
+    _files_from_pinned_diff,
+    _finding_file_matches_anchor,
+    _normalize_path_for_match,
+    _prepare_pinned_workspace,
+    _review_timeout_sec,
+    build_parser,
+    generate_context_report,
+    score_context,
+    generate_real_pr_report,
+    run_real_pr_corpus,
+    run_review_for_pr,
+    score_clean_run,
+    score_model_verdict,
+    score_vulnerable_run,
+    validate_real_pr_corpus,
+)
+from _anchor_matcher_cases import MATCHER_CASES
+
+CORPUS_PATH = Path(__file__).resolve().parent.parent / "evals" / "corpus-real-prs.json"
+
+
+def _finding(file: str, line: int | None = None, severity: str = "major", **extra):
+    d = {"severity": severity, "category": "correctness", "file": file, "message": "x"}
+    if line is not None:
+        d["line"] = line
+    d.update(extra)
+    return d
+
+
+def _run(findings=None, verdict="approve", error=None):
+    return ReviewRun(
+        mode="tools_off", pr_number=1, repo_full_name="acme/repo",
+        findings=findings or [], verdict=verdict, error=error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# score_vulnerable_run
+# ---------------------------------------------------------------------------
+
+class TestScoreVulnerableRun:
+    def test_dot_prefixed_paths_keep_their_dots(self):
+        defect = RealPRDefect("d", ".github/workflows/ci.yaml", None, "major")
+        assert score_vulnerable_run(_run([_finding("./.github/workflows/ci.yaml")]), defect)["hit"] is True
+        assert _normalize_path_for_match("../shared/lib.py") == "../shared/lib.py"
+
+    def test_hit_when_file_and_line_match(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/run_review.sh", line=900)], verdict="request_changes")
+        score = score_vulnerable_run(run, defect)
+        assert score["hit"] is True
+        assert score["file_only_hit"] is True
+        assert score["request_changes"] is True
+        assert score["errored"] is False
+
+    def test_miss_when_file_matches_but_line_far_outside_range(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/run_review.sh", line=10)])
+        score = score_vulnerable_run(run, defect)
+        assert score["hit"] is False
+        assert score["file_only_hit"] is True
+
+    def test_miss_when_file_does_not_match(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/other.sh", line=900)])
+        score = score_vulnerable_run(run, defect)
+        assert score["hit"] is False
+        assert score["file_only_hit"] is False
+
+    @pytest.mark.parametrize("line", [841, 851, 935, 945])
+    def test_tolerance_widens_range_inclusive(self, line):
+        """±10 tolerance: 851-10=841 and 935+10=945 both count as hits."""
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/run_review.sh", line=line)])
+        assert score_vulnerable_run(run, defect)["hit"] is True
+
+    @pytest.mark.parametrize("line", [840, 946])
+    def test_one_past_tolerance_boundary_misses(self, line):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/run_review.sh", line=line)])
+        assert score_vulnerable_run(run, defect)["hit"] is False
+
+    def test_custom_tolerance_is_respected(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (100, 100), "major")
+        run = _run([_finding("scripts/run_review.sh", line=105)])
+        assert score_vulnerable_run(run, defect, tolerance=2)["hit"] is False
+        assert score_vulnerable_run(run, defect, tolerance=5)["hit"] is True
+
+    def test_no_line_anchor_file_match_is_a_hit(self):
+        """When the defect has no line_range, file match alone is `hit`."""
+        defect = RealPRDefect("d", "action.yml", None, "major")
+        run = _run([_finding("action.yml", line=9999)])
+        score = score_vulnerable_run(run, defect)
+        assert score["has_line_anchor"] is False
+        assert score["hit"] is True
+        assert score["file_only_hit"] is True
+
+    def test_finding_missing_line_number_only_counts_as_file_only_hit(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([{"severity": "major", "category": "x", "file": "scripts/run_review.sh", "message": "m"}])
+        score = score_vulnerable_run(run, defect)
+        assert score["file_only_hit"] is True
+        assert score["hit"] is False
+
+    def test_path_suffix_match_on_boundary(self):
+        """A finding reporting a longer path is matched on a '/' boundary,
+        not merely as a substring (so run_review.sh doesn't match
+        other_run_review.sh)."""
+        defect = RealPRDefect("d", "run_review.sh", None, "major")
+        hit_run = _run([_finding("scripts/run_review.sh")])
+        assert score_vulnerable_run(hit_run, defect)["file_only_hit"] is True
+
+        no_hit_run = _run([_finding("scripts/other_run_review.sh")])
+        assert score_vulnerable_run(no_hit_run, defect)["file_only_hit"] is False
+
+    def test_errored_run_is_always_a_miss(self):
+        defect = RealPRDefect("d", "scripts/run_review.sh", (851, 935), "major")
+        run = _run([_finding("scripts/run_review.sh", line=900)], error="boom")
+        score = score_vulnerable_run(run, defect)
+        assert score["errored"] is True
+        assert score["hit"] is False
+        assert score["file_only_hit"] is False
+
+    def test_directory_anchor_scores_file_only_hit(self):
+        """#877: a directory anchor (trailing '/') matches a finding nested
+        under it, but only ever as a file-level hit — there's no single
+        line to check a finding against a directory."""
+        defect = RealPRDefect("d", "kubernetes/apps/base/llm/litellm/virtualkeys/", None, "major")
+        run = _run([_finding("kubernetes/apps/base/llm/litellm/virtualkeys/foreman.yaml")])
+        score = score_vulnerable_run(run, defect)
+        assert score["file_only_hit"] is True
+        assert score["hit"] is True  # no line_range: file-only hit promotes to hit, same as a file anchor
+
+    def test_directory_anchor_with_a_line_range_still_scores_a_file_level_hit(self):
+        """A directory has no single line to check a finding's line
+        against, so even if a directory anchor carried a line_range (not
+        expected in practice), a matching finding still scores `hit` on
+        the file-level match alone rather than silently missing."""
+        defect = RealPRDefect("d", "kubernetes/apps/base/llm/litellm/virtualkeys/", (1, 5), "major")
+        run = _run([_finding("kubernetes/apps/base/llm/litellm/virtualkeys/foreman.yaml", line=9999)])
+        score = score_vulnerable_run(run, defect)
+        assert score["file_only_hit"] is True
+        assert score["hit"] is True
+
+    def test_directory_anchor_does_not_match_a_sibling_directory(self):
+        defect = RealPRDefect("d", "kubernetes/apps/base/llm/litellm/virtualkeys/", None, "major")
+        run = _run([_finding("kubernetes/apps/base/llm/litellm/virtualkeys-other/foreman.yaml")])
+        assert score_vulnerable_run(run, defect)["file_only_hit"] is False
+
+
+class TestFindingFileMatchesAnchorSharedCases:
+    """The exact matcher check_corpus_anchor_in_diff.py delegates to for
+    the corpus anchor-in-diff check runs the same table — see
+    tests/_anchor_matcher_cases.py and
+    test_check_corpus_anchor_in_diff.py::TestDefectFileInChangedFilesSharedCases
+    — so the scorer and the checker can never silently disagree (#877)."""
+
+    @pytest.mark.parametrize("finding_file,anchor_file,expected", MATCHER_CASES)
+    def test_shared_matcher_cases(self, finding_file, anchor_file, expected):
+        assert _finding_file_matches_anchor(finding_file, anchor_file) is expected
+
+
+# ---------------------------------------------------------------------------
+# score_clean_run
+# ---------------------------------------------------------------------------
+
+class TestScoreCleanRun:
+    def test_no_findings_no_false_positive(self):
+        run = _run([], verdict="approve")
+        score = score_clean_run(run)
+        assert score["false_positive"] is False
+        assert score["blocker_major_false_positive"] is False
+        assert score["request_changes"] is False
+
+    def test_minor_finding_is_fp_but_not_blocker_major(self):
+        run = _run([_finding("x.py", severity="minor")])
+        score = score_clean_run(run)
+        assert score["false_positive"] is True
+        assert score["blocker_major_false_positive"] is False
+
+    def test_blocker_finding_is_blocker_major_fp(self):
+        run = _run([_finding("x.py", severity="blocker")], verdict="request_changes")
+        score = score_clean_run(run)
+        assert score["false_positive"] is True
+        assert score["blocker_major_false_positive"] is True
+        assert score["request_changes"] is True
+
+    def test_errored_clean_run_scores_no_false_positive_but_is_flagged_errored(self):
+        run = _run([], error="timeout")
+        score = score_clean_run(run)
+        assert score["errored"] is True
+        assert score["false_positive"] is False
+        assert score["blocker_major_false_positive"] is False
+
+
+# ---------------------------------------------------------------------------
+# Corpus validation
+# ---------------------------------------------------------------------------
+
+GOOD_SHA = "a" * 40
+
+
+def _scenario(**kwargs):
+    base = dict(
+        id="s1", repo_full_name="acme/repo", number=1, head_sha=GOOD_SHA,
+        expected_clean=False, defect=RealPRDefect("d", "f.py", None, "major"),
+    )
+    base.update(kwargs)
+    return RealPRScenario(**base)
+
+
+class TestValidateRealPRCorpus:
+    def test_valid_corpus_raises_nothing(self):
+        vuln = [_scenario()]
+        clean = [_scenario(id="c1", expected_clean=True, defect=None)]
+        validate_real_pr_corpus(vuln, clean)  # no raise
+
+    def test_bad_sha_is_rejected(self):
+        vuln = [_scenario(head_sha="not-a-sha")]
+        with pytest.raises(ValueError, match="not-a-sha"):
+            validate_real_pr_corpus(vuln, [])
+
+    def test_short_sha_is_rejected(self):
+        vuln = [_scenario(head_sha="abc123")]
+        with pytest.raises(ValueError, match="s1"):
+            validate_real_pr_corpus(vuln, [])
+
+    def test_vulnerable_without_defect_is_rejected(self):
+        vuln = [_scenario(defect=None)]
+        with pytest.raises(ValueError, match="defect"):
+            validate_real_pr_corpus(vuln, [])
+
+    def test_vulnerable_defect_missing_file_is_rejected(self):
+        vuln = [_scenario(defect=RealPRDefect("d", None, None, "major"))]
+        with pytest.raises(ValueError, match="defect"):
+            validate_real_pr_corpus(vuln, [])
+
+    def test_descending_line_range_is_rejected(self):
+        vuln = [_scenario(defect=RealPRDefect("d", "f.py", (100, 50), "major"))]
+        with pytest.raises(ValueError, match="line_range"):
+            validate_real_pr_corpus(vuln, [])
+
+    def test_clean_without_expected_clean_flag_is_rejected(self):
+        clean = [_scenario(id="c1", expected_clean=False, defect=None)]
+        with pytest.raises(ValueError, match="expected_clean"):
+            validate_real_pr_corpus([], clean)
+
+    def test_all_errors_are_reported_together(self):
+        vuln = [_scenario(id="bad1", head_sha="x"), _scenario(id="bad2", defect=None)]
+        with pytest.raises(ValueError) as excinfo:
+            validate_real_pr_corpus(vuln, [])
+        msg = str(excinfo.value)
+        assert "bad1" in msg and "bad2" in msg
+
+
+class TestRealPRCorpusFromFile:
+    def test_missing_top_level_key_raises(self, tmp_path):
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"benchmark_corpus": []}), encoding="utf-8")
+        with pytest.raises(ValueError, match="real_pr_corpus"):
+            RealPRCorpus.from_file(path)
+
+    def test_loads_the_shipped_real_pr_corpus(self):
+        corpus = RealPRCorpus.from_file(CORPUS_PATH)
+        assert len(corpus.vulnerable) >= 1
+        assert len(corpus.clean) >= 1
+        for scenario in corpus.vulnerable:
+            assert len(scenario.head_sha) == 40
+            assert scenario.defect is not None
+            assert scenario.defect.file
+        for scenario in corpus.clean:
+            assert len(scenario.head_sha) == 40
+            assert scenario.expected_clean is True
+
+    def test_rejects_bad_arity_side_and_identity(self, tmp_path):
+        base = {"repo_full_name": "acme/repo", "number": 1, "head_sha": "a" * 40}
+        vulnerable = [
+            {**base, "defect": {"description": "d", "file": "a.py", "line_range": [5]}},
+            {**base, "expected_clean": True, "defect": {"description": "d", "file": "a.py"}},
+            {**base, "number": 0, "repo_full_name": "bad", "defect": {"description": "d", "file": "a.py"}},
+        ]
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"real_pr_corpus": {"vulnerable": vulnerable, "clean": []}}), encoding="utf-8")
+        with pytest.raises(ValueError) as exc:
+            RealPRCorpus.from_file(path)
+        message = str(exc.value)
+        for expected in ("line_range", "must not set expected_clean", "positive int", "owner/repo"):
+            assert expected in message
+
+    def test_malformed_values_fail_as_aggregated_value_error(self, tmp_path):
+        base = {"repo_full_name": "acme/repo", "number": 1, "head_sha": "a" * 40}
+        vulnerable = [
+            {**base, "defect": {"description": "d", "file": "a.py", "line_range": 5}},
+            {**base, "defect": {"description": "d", "file": ["a.py"]}},
+        ]
+        clean = [{**base, "expected_clean": "false"}]
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"real_pr_corpus": {"vulnerable": vulnerable, "clean": clean}}), encoding="utf-8")
+        with pytest.raises(ValueError) as exc:
+            RealPRCorpus.from_file(path)
+        message = str(exc.value)
+        assert "line_range" in message
+        assert "a description and a file" in message
+        assert "a JSON boolean" in message
+
+    def test_rejects_non_object_entries(self, tmp_path):
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"real_pr_corpus": {"vulnerable": ["x"], "clean": []}}), encoding="utf-8")
+        with pytest.raises(ValueError, match="must be an object"):
+            RealPRCorpus.from_file(path)
+
+    def test_max_entries_caps_vulnerable_and_clean_independently(self, tmp_path, capsys):
+        corpus = RealPRCorpus.from_file(CORPUS_PATH)
+        run_real_pr_corpus(corpus, ["tools_off"], tmp_path, {}, max_entries=1, dry_run=True)
+        planned = [line for line in capsys.readouterr().out.splitlines() if "Would run:" in line]
+        assert len(planned) == 2
+        assert "[vulnerable]" in planned[0]
+        assert "[clean]" in planned[1]
+
+    def test_every_vulnerable_entry_has_a_distinct_id(self):
+        corpus = RealPRCorpus.from_file(CORPUS_PATH)
+        ids = [s.id for s in corpus.vulnerable] + [s.id for s in corpus.clean]
+        assert len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------
+# generate_real_pr_report
+# ---------------------------------------------------------------------------
+
+class TestGenerateRealPRReport:
+    def test_rates_and_verdict_agreement(self):
+        defect = RealPRDefect("d", "a.py", (10, 20), "major")
+        vuln_hit = _scenario(id="v1", defect=defect)
+        vuln_miss = _scenario(id="v2", defect=defect)
+        clean_ok = _scenario(id="c1", expected_clean=True, defect=None)
+        clean_fp = _scenario(id="c2", expected_clean=True, defect=None)
+
+        scenario_runs = [
+            (vuln_hit, {"tools_off": _run([_finding("a.py", line=15)], verdict="request_changes")}),
+            (vuln_miss, {"tools_off": _run([], verdict="approve")}),
+            (clean_ok, {"tools_off": _run([], verdict="approve")}),
+            (clean_fp, {"tools_off": _run([_finding("b.py", severity="blocker")], verdict="request_changes")}),
+        ]
+        report = generate_real_pr_report(scenario_runs, corpus_source="test.json")
+        mm = report["mode_summary"]["tools_off"]
+
+        assert mm["vulnerable_total"] == 2
+        assert mm["hits"] == 1
+        assert mm["recall_strict"] == 0.5
+        assert mm["clean_total"] == 2
+        assert mm["any_finding_false_positives"] == 1
+        assert mm["false_positive_rate"] == 0.5
+        assert mm["blocker_major_false_positives"] == 1
+        # verdict_agreement: v1 correctly request_changes (agree), v2
+        # incorrectly approve (disagree), c1 correctly approve (agree), c2
+        # incorrectly request_changes (disagree) -> 2/4.
+        assert mm["verdict_agreement_rate"] == 0.5
+
+        assert report["metadata"]["vulnerable_scenarios"] == 2
+        assert report["metadata"]["clean_scenarios"] == 2
+        assert report["metadata"]["corpus_source"] == "test.json"
+        assert report["metadata"]["total_runs"] == 4
+        assert report["metadata"]["completed_runs"] == 4
+
+    def test_errored_runs_count_as_misses_not_exclusions(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        vuln = _scenario(id="v1", defect=defect)
+        scenario_runs = [(vuln, {"tools_off": _run([], error="timeout")})]
+        report = generate_real_pr_report(scenario_runs)
+        mm = report["mode_summary"]["tools_off"]
+        assert mm["vulnerable_total"] == 1
+        assert mm["vulnerable_errors"] == 1
+        assert mm["recall_strict"] == 0.0
+        assert report["metadata"]["errored_runs"] == 1
+
+    def test_empty_denominator_yields_none_rate_not_zero_division(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        vuln = _scenario(id="v1", defect=defect)
+        scenario_runs = [(vuln, {"tools_off": _run([], verdict="request_changes")})]
+        report = generate_real_pr_report(scenario_runs)
+        mm = report["mode_summary"]["tools_off"]
+        assert mm["clean_total"] == 0
+        assert mm["false_positive_rate"] is None
+
+
+# ---------------------------------------------------------------------------
+# _checkout_pinned_commit (local-git-only, no network)
+# ---------------------------------------------------------------------------
+
+def _git(*args, cwd):
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True, env=env)
+
+
+def _make_origin(tmp_path: Path) -> tuple[Path, str, str]:
+    """A local (non-bare) repo with two commits, usable as a `git fetch` origin
+    via its filesystem path — no network involved."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git("init", cwd=origin)
+    _git("config", "user.email", "eval@test", cwd=origin)
+    _git("config", "user.name", "eval", cwd=origin)
+    (origin / "f.txt").write_text("one", encoding="utf-8")
+    _git("add", ".", cwd=origin)
+    _git("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-m", "first", cwd=origin)
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    sha1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(origin), capture_output=True, text=True, check=True, env=env,
+    ).stdout.strip()
+
+    (origin / "f.txt").write_text("two", encoding="utf-8")
+    _git("add", ".", cwd=origin)
+    _git("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-m", "second", cwd=origin)
+    sha2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(origin), capture_output=True, text=True, check=True, env=env,
+    ).stdout.strip()
+    return origin, sha1, sha2
+
+
+def _clone_local(origin: Path, dest: Path) -> None:
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(
+        ["git", "clone", str(origin), str(dest)], check=True, capture_output=True, text=True, env=env,
+    )
+
+
+class TestCheckoutPinnedCommit:
+    def test_falls_back_to_direct_sha_when_no_pr_ref_exists(self, tmp_path):
+        origin, sha1, _sha2 = _make_origin(tmp_path)
+        repo_path = tmp_path / "clone"
+        _clone_local(origin, repo_path)
+
+        # No refs/pull/999/head exists in this plain repo, so the cheap
+        # PR-ref path must fail and the function must fall back to a direct
+        # commit-sha fetch and land exactly on sha1.
+        ok, sha, err = _checkout_pinned_commit(repo_path, sha1, pr_number=999)
+        assert ok is True, err
+        assert sha == sha1
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        head = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True, env=env,
+        ).stdout.strip()
+        assert head == sha1
+
+    def test_mismatched_pr_ref_is_detected_and_corrected(self, tmp_path):
+        origin, sha1, sha2 = _make_origin(tmp_path)
+        # Simulate a PR ref that (incorrectly, or from PR-number reuse)
+        # resolves to sha2, while the corpus pins sha1.
+        _git("update-ref", "refs/pull/42/head", sha2, cwd=origin)
+
+        repo_path = tmp_path / "clone"
+        _clone_local(origin, repo_path)
+
+        ok, sha, err = _checkout_pinned_commit(repo_path, sha1, pr_number=42)
+        assert ok is True, err
+        assert sha == sha1  # not sha2, despite the PR ref pointing there
+
+    def test_matching_pr_ref_is_accepted_via_the_fast_path(self, tmp_path):
+        origin, sha1, _sha2 = _make_origin(tmp_path)
+        _git("update-ref", "refs/pull/42/head", sha1, cwd=origin)
+
+        repo_path = tmp_path / "clone"
+        _clone_local(origin, repo_path)
+
+        ok, sha, err = _checkout_pinned_commit(repo_path, sha1, pr_number=42)
+        assert ok is True, err
+        assert sha == sha1
+
+    def test_unknown_commit_fails_closed(self, tmp_path):
+        origin, _sha1, _sha2 = _make_origin(tmp_path)
+        repo_path = tmp_path / "clone"
+        _clone_local(origin, repo_path)
+
+        bogus_sha = "f" * 40
+        ok, sha, err = _checkout_pinned_commit(repo_path, bogus_sha, pr_number=None)
+        assert ok is False
+        assert sha is None
+        assert err
+
+
+def _git_in(repo, *args):
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=env)
+
+
+class TestPreparePinnedWorkspace:
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_in(repo, "init", "-q", "-b", "main")
+        _git_in(repo, "-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, env=env).stdout.strip()
+        (repo / "a.py").write_text("x = 1\n")
+        _git_in(repo, "add", "a.py")
+        _git_in(repo, "-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "head")
+        head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, env=env).stdout.strip()
+        return repo, base, head
+
+    def test_removes_a_previous_scenarios_artifacts(self, tmp_path):
+        repo, _base, head = self._repo(tmp_path)
+        artifacts = tmp_path / "artifacts"
+        (repo / "pr.diff").write_text("diff of some other PR\n")
+        (repo / "ai-output.json").write_text("{}")
+        ok, err = _prepare_pinned_workspace(repo, artifacts, head)
+        assert ok, err
+        # git clean still wipes stray untracked files in the checkout,
+        # though pr.diff/ai-output.json no longer land there in the first place.
+        assert not (repo / "pr.diff").exists()
+        assert not (repo / "ai-output.json").exists()
+        assert (repo / "a.py").exists()
+
+    def test_base_sha_writes_the_diff_outside_the_checkout(self, tmp_path):
+        repo, base, head = self._repo(tmp_path)
+        artifacts = tmp_path / "artifacts"
+        ok, err = _prepare_pinned_workspace(repo, artifacts, head, base)
+        assert ok, err
+        diff = (artifacts / "pr.diff").read_text()
+        assert "+x = 1" in diff
+        assert not (repo / "pr.diff").exists()
+
+    def test_base_sha_seeds_the_file_manifest_outside_the_checkout(self, tmp_path):
+        repo, base, head = self._repo(tmp_path)
+        artifacts = tmp_path / "artifacts"
+        ok, err = _prepare_pinned_workspace(repo, artifacts, head, base)
+        assert ok, err
+        seed = json.loads((artifacts / "pr-files.seed.json").read_text())
+        assert seed == [{
+            "filename": "a.py", "status": "added",
+            "additions": 1, "deletions": 0, "changes": 1,
+            "previous_filename": None,
+        }]
+        assert not (repo / "pr-files.seed.json").exists()
+
+    def test_no_base_sha_writes_no_seed(self, tmp_path):
+        repo, _base, head = self._repo(tmp_path)
+        artifacts = tmp_path / "artifacts"
+        ok, err = _prepare_pinned_workspace(repo, artifacts, head)
+        assert ok, err
+        assert not (artifacts / "pr-files.seed.json").exists()
+
+    def test_manifest_derivation_failure_fails_the_prepare(self, tmp_path, monkeypatch):
+        repo, base, head = self._repo(tmp_path)
+        artifacts = tmp_path / "artifacts"
+        monkeypatch.setattr("eval_harness._files_from_pinned_diff", lambda *_a, **_k: None)
+        ok, err = _prepare_pinned_workspace(repo, artifacts, head, base)
+        assert not ok
+        assert "manifest" in err
+        assert (artifacts / "pr.diff").exists()
+        assert not (artifacts / "pr-files.seed.json").exists()
+
+    def test_bad_base_sha_is_rejected_by_validation(self, tmp_path):
+        base = {"repo_full_name": "acme/repo", "number": 1, "head_sha": "a" * 40, "base_sha": "abc"}
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps({"real_pr_corpus": {"vulnerable": [], "clean": [{**base, "expected_clean": True}]}}), encoding="utf-8")
+        with pytest.raises(ValueError, match="base_sha"):
+            RealPRCorpus.from_file(path)
+
+
+class TestFilesFromPinnedDiff:
+    def test_renamed_file_carries_previous_filename(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_in(repo, "init", "-q", "-b", "main")
+        (repo / "b.txt").write_text("b\nb\nb\nb\nb\n")
+        _git_in(repo, "add", "b.txt")
+        _git_in(repo, "-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, env=env).stdout.strip()
+        _git_in(repo, "mv", "b.txt", "c.txt")
+        (repo / "c.txt").write_text("b\nb\nb\nb\nb\nextra\n")
+        _git_in(repo, "add", "-A")
+        _git_in(repo, "-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "head")
+        head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, env=env).stdout.strip()
+
+        files = json.loads(_files_from_pinned_diff(repo, base, head))
+        assert files == [{
+            "filename": "c.txt", "status": "renamed",
+            "additions": 1, "deletions": 0, "changes": 1,
+            "previous_filename": "b.txt",
+        }]
+
+
+class TestContextOnly:
+    def _repo(self, tmp_path, corpus_text):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_in(repo, "init", "-q", "-b", "main")
+        (repo / "a.py").write_text("def f():\n    return compute_the_value(1)\n")
+        _git_in(repo, "add", "a.py")
+        _git_in(repo, "-c", "user.name=t", "-c", "user.email=t@e", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c")
+        run_dir = tmp_path / "artifacts"
+        run_dir.mkdir()
+        (run_dir / "pr.diff").write_text("diff --git a/a.py b/a.py\n+++ b/a.py\n")
+        (run_dir / "review-corpus.md").write_text(corpus_text)
+        return repo, run_dir
+
+    def test_scores_defect_presence_and_position(self, tmp_path):
+        repo, run_dir = self._repo(tmp_path, "x" * 90 + "\n    return compute_the_value(1)\n")
+        scenario = RealPRScenario.from_dict({"repo_full_name": "a/b", "number": 1, "head_sha": "a" * 40,
+                                             "defect": {"description": "d", "file": "a.py", "line_range": [2, 2]}})
+        row = score_context(repo, run_dir, scenario)
+        assert row["context_built"] and row["defect_file_in_diff"]
+        assert (row["defect_lines"], row["defect_lines_in_context"]) == (1, 1)
+        assert row["defect_position_pct"] == 77  # 95 of 123 bytes
+
+    def test_missing_corpus_is_reported_not_raised(self, tmp_path):
+        scenario = RealPRScenario.from_dict({"repo_full_name": "a/b", "number": 1, "head_sha": "a" * 40,
+                                             "defect": {"description": "d", "file": "a.py"}})
+        assert score_context(tmp_path, tmp_path, scenario) == {"context_built": False}
+
+    def test_corpus_and_diff_read_from_run_dir_not_the_checkout(self, tmp_path):
+        """#838: a checkout that itself carries pr.diff/review-corpus.md must
+        never be mistaken for the run's own artifacts."""
+        repo, run_dir = self._repo(tmp_path, "real corpus content\n")
+        (repo / "pr.diff").write_text("diff --git a/forged b/forged\n+++ b/forged\n")
+        (repo / "review-corpus.md").write_text("forged corpus the checkout planted\n")
+        scenario = RealPRScenario.from_dict({"repo_full_name": "a/b", "number": 1, "head_sha": "a" * 40,
+                                             "defect": {"description": "d", "file": "a.py"}})
+        row = score_context(repo, run_dir, scenario)
+        assert row["context_built"]
+        # The run_dir's own (legitimate) diff mentions a.py: the checkout's
+        # forged pr.diff (which does not) was never consulted.
+        assert row["defect_file_in_diff"] is True
+
+    def test_report_summary(self):
+        rows = [
+            {"id": "1", "kind": "vulnerable", "context_built": True, "corpus_bytes": 100, "defect_file_in_diff": True,
+             "defect_lines": 2, "defect_lines_in_context": 2, "defect_position_pct": 40},
+            {"id": "2", "kind": "vulnerable", "context_built": True, "corpus_bytes": 300, "defect_file_in_diff": False,
+             "defect_lines": 1, "defect_lines_in_context": 0},
+            {"id": "3", "kind": "vulnerable", "context_built": False},
+        ]
+        s = generate_context_report(rows)["summary"]
+        assert (s["vulnerable_built"], s["defect_file_in_diff"], s["with_line_range"]) == (2, 1, 2)
+        assert (s["defect_lines_all_in_context"], s["defect_lines_none_in_context"]) == (1, 1)
+        assert (s["corpus_bytes_median"], s["defect_position_pct_median"]) == (300, 40)
+
+    def test_the_context_only_environment_stays_offline_safe(self):
+        """The context-only mode must never reach a live model endpoint.
+
+        The mode's whole proof rests on the transport's connect attempt
+        being refused at a closed loopback port with every lane's retries
+        at 0, so a drifting base URL or a live retry count would turn an
+        offline replay into a real (paid) model call. The fallback and
+        smart base URLs must stay empty so no second lane can dial out.
+        """
+        base_url = CONTEXT_ONLY_ENV["AI_BASE_URL"]
+        assert base_url.startswith("http://127.0.0.1:"), (
+            f"the context-only base URL must be a closed loopback address: {base_url}"
+        )
+        for lane in ("primary", "fallback", "smart"):
+            retries = CONTEXT_ONLY_ENV[f"AI_{lane.upper()}_RETRIES"]
+            assert retries == "0", (
+                f"the {lane} lane must not retry in context-only mode: {retries}"
+            )
+        assert CONTEXT_ONLY_ENV["AI_FALLBACK_BASE_URL"] == "", (
+            "the fallback lane must not have a base URL in context-only mode"
+        )
+        assert CONTEXT_ONLY_ENV["AI_SMART_BASE_URL"] == "", (
+            "the smart lane must not have a base URL in context-only mode"
+        )
+        # The refused connect must fail the run, not turn into the
+        # runtime's default "model unavailable" notice: that notice is
+        # written to ai-output.json, and the verdict artifact's absence is
+        # the row's proof that no model answered.
+        assert CONTEXT_ONLY_ENV["ON_MODEL_FAILURE"] == "fail", (
+            "the context-only mode must fail on the refused connect, or the "
+            "runtime writes a notice verdict and the artifact proves nothing"
+        )
+
+    def test_the_model_verdict_field_follows_the_verdict_artifact(self, tmp_path):
+        """The row's model_verdict field is the proof that no model answered.
+
+        The runtime writes ai-output.json only when it parsed a model
+        verdict (the context-only mode pins on-model-failure=fail, so a
+        refused connect writes no artifact), so the artifact's presence is
+        the verdict and its absence is the evidence that none was
+        produced. A transport failure still leaves a redacted error record
+        in ai-response.primary.json, so that artifact is never the proof.
+        """
+        run_dir = tmp_path / "artifacts"
+        run_dir.mkdir()
+        assert score_model_verdict(run_dir) is False
+        (run_dir / "ai-response.primary.json").write_text(
+            json.dumps({"error": "connection refused"}), encoding="utf-8"
+        )
+        assert score_model_verdict(run_dir) is False
+        (run_dir / "ai-output.json").write_text(
+            json.dumps({"verdict": "approve"}), encoding="utf-8"
+        )
+        assert score_model_verdict(run_dir) is True
+
+    def test_shipped_human_findings_corpus_is_valid(self):
+        corpus = RealPRCorpus.from_file(CORPUS_PATH.parent / "corpus-human-findings.json")
+        assert len(corpus.vulnerable) >= 50
+        assert all(s.defect and s.defect.file for s in corpus.vulnerable)
+        # #1601: curated vulnerable entries carry paired clean-list negative
+        # controls, so flagging every similar file cannot pass as detection.
+        assert corpus.clean
+        assert all(s.expected_clean is True for s in corpus.clean)
+
+    def test_854_entry_pins_the_equivalent_path_resolver_shape(self):
+        """#875: the pr-reviewer-action#854 entry pins the canonical pull
+        resolver head whose two TangledPullIdentity construction sites copy
+        sourceSha without comparing it — the equivalent-paths A/B's expected
+        catch, recorded explicitly so the measurement cannot devolve into
+        'paths were grouped' while the reviewer still misses the
+        uncompared field."""
+        corpus = RealPRCorpus.from_file(CORPUS_PATH.parent / "corpus-human-findings.json")
+        entry = next(s for s in corpus.vulnerable if s.number == 854 and s.repo_full_name == "misospace/pr-reviewer-action")
+        assert entry.head_sha == "84119b04c21378474f39c67fea8a9346cd4f24f9"
+        assert entry.defect is not None
+        assert "sourceSha" in entry.defect.description
+        assert "buildIdentity" in entry.defect.description
+
+    def test_9075_entry_pins_the_pre_fix_head(self):
+        """#842: the joryirving/home-ops#9075 entry used to pin b3d77613,
+        the commit that already added mmproj-F16.gguf to `files:` — the
+        defect the human flagged. It must now pin the commit before that
+        fix (935d0f80), which still has mmproj set without a matching
+        files: entry."""
+        corpus = RealPRCorpus.from_file(CORPUS_PATH.parent / "corpus-human-findings.json")
+        entry = next(s for s in corpus.vulnerable if s.number == 9075 and s.repo_full_name == "joryirving/home-ops")
+        assert entry.head_sha == "935d0f80ae4f151c0cfbb87c85712b064f2547ad"
+        assert entry.head_sha != "b3d77613f68eff88127d014a5c5aa59a4dd38a84"
+
+
+# ---------------------------------------------------------------------------
+# --runs-per-mode for real-PR corpora (#839)
+# ---------------------------------------------------------------------------
+
+
+class TestRunsPerModeRealPRCorpus:
+    def _corpus(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        vuln = RealPRScenario(
+            id="v1", repo_full_name="acme/repo", number=1, head_sha=GOOD_SHA,
+            expected_clean=False, defect=defect,
+        )
+        clean = RealPRScenario(
+            id="c1", repo_full_name="acme/repo", number=2, head_sha=GOOD_SHA,
+            expected_clean=True, defect=None,
+        )
+        return RealPRCorpus(vulnerable=[vuln], clean=[clean])
+
+    def test_dry_run_shows_the_repeat_suffix(self, capsys):
+        run_real_pr_corpus(self._corpus(), ["tools_off"], Path("/tmp"), {}, dry_run=True, runs_per_mode=3)
+        out = capsys.readouterr().out
+        assert "x3" in out
+
+    def test_default_dry_run_has_no_repeat_suffix(self, capsys):
+        run_real_pr_corpus(self._corpus(), ["tools_off"], Path("/tmp"), {}, dry_run=True)
+        out = capsys.readouterr().out
+        assert out.strip().splitlines()[0].endswith("[tools_off]")
+
+    def test_runs_each_scenario_mode_n_times(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, **kwargs):
+            calls.append(f"{pr_entry['repo_full_name']}#{pr_entry['number']}:{mode}")
+            return ReviewRun(
+                mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"],
+                findings=[_finding("a.py")], verdict="request_changes",
+            )
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {}, runs_per_mode=3)
+
+        assert calls == ["acme/repo#1:tools_off"] * 3 + ["acme/repo#2:tools_off"] * 3
+        mm = report["mode_summary"]["tools_off"]
+        # 3 reps of the one vulnerable scenario, 3 reps of the one clean one.
+        assert mm["vulnerable_total"] == 3
+        assert mm["clean_total"] == 3
+        assert report["metadata"]["total_runs"] == 6
+
+    def test_per_scenario_runs_is_a_list_of_n_when_n_greater_than_one(self, monkeypatch, tmp_path):
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, **kwargs):
+            return ReviewRun(mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"])
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {}, runs_per_mode=2)
+        vuln_entry = next(e for e in report["per_scenario_results"] if e["id"] == "v1")
+        assert isinstance(vuln_entry["runs"]["tools_off"], list)
+        assert len(vuln_entry["runs"]["tools_off"]) == 2
+        assert vuln_entry["runs_aggregate"]["tools_off"]["runs"] == 2
+
+    def test_n_equals_1_keeps_the_pre_839_single_dict_shape(self, monkeypatch, tmp_path):
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, **kwargs):
+            return ReviewRun(mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"])
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {})  # runs_per_mode default = 1
+        vuln_entry = next(e for e in report["per_scenario_results"] if e["id"] == "v1")
+        assert isinstance(vuln_entry["runs"]["tools_off"], dict)
+        assert "runs_aggregate" not in vuln_entry
+
+    def test_context_only_ignores_runs_per_mode(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, **kwargs):
+            calls.append(mode)
+            return ReviewRun(mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"])
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+        run_real_pr_corpus(
+            self._corpus(), ["tools_off"], tmp_path, {}, context_only=True, runs_per_mode=5,
+        )
+        # 2 scenarios, 1 mode ("tools_off" is forced under context_only), no
+        # x5 repetition: context assembly for a pinned head is deterministic.
+        assert len(calls) == 2
+
+    def test_claim_falsification_threads_to_every_run_and_the_report_metadata(self, monkeypatch, tmp_path):
+        """#785 A/B knob: the flag reaches every run_review_for_pr call (real-PR
+        corpus path) and is recorded in the report metadata so a true-arm and
+        false-arm report over the same corpus are distinguishable."""
+        seen: list[bool] = []
+
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, claim_falsification=False, **kwargs):
+            seen.append(claim_falsification)
+            return ReviewRun(mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"])
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+
+        on_report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {}, claim_falsification=True)
+        assert seen == [True, True]
+        assert on_report["metadata"]["claim_falsification"] is True
+
+        seen.clear()
+        off_report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {})
+        assert seen == [False, False]
+        assert off_report["metadata"]["claim_falsification"] is False
+
+
+class TestEquivalentPathsArmRealPRPath:
+    """#875 maintainer follow-up: the --equivalent-paths A/B arm must reach
+    the real-PR corpus path. main() dispatches to _main_real_pr_corpus before
+    its fixture-path arm application runs, so the arm has to be applied (and
+    recorded as report provenance) on this path explicitly."""
+
+    def _corpus(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        vuln = RealPRScenario(
+            id="v1", repo_full_name="acme/repo", number=1, head_sha=GOOD_SHA,
+            expected_clean=False, defect=defect,
+        )
+        clean = RealPRScenario(
+            id="c1", repo_full_name="acme/repo", number=2, head_sha=GOOD_SHA,
+            expected_clean=True, defect=None,
+        )
+        return RealPRCorpus(vulnerable=[vuln], clean=[clean])
+
+    @staticmethod
+    def _capture_arm(monkeypatch):
+        captured: list[dict] = []
+
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, **kwargs):
+            captured.append(model_config)
+            return ReviewRun(
+                mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"],
+                findings=[], verdict="approve",
+            )
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+        return captured
+
+    def test_true_arm_reaches_run_review_for_pr(self, monkeypatch, tmp_path):
+        captured = self._capture_arm(monkeypatch)
+        report = run_real_pr_corpus(
+            self._corpus(), ["tools_off"], tmp_path,
+            {"extra_env": {"EQUIVALENT_PATHS": "true"}}, equivalent_paths="true",
+        )
+        assert captured, "the real-PR path must invoke run_review_for_pr"
+        assert all(mc.get("extra_env", {}).get("EQUIVALENT_PATHS") == "true" for mc in captured)
+        assert report["metadata"]["equivalent_paths"] == "true"
+
+    def test_false_arm_propagates_false_not_true(self, monkeypatch, tmp_path):
+        captured = self._capture_arm(monkeypatch)
+        report = run_real_pr_corpus(
+            self._corpus(), ["tools_off"], tmp_path,
+            {"extra_env": {"EQUIVALENT_PATHS": "false"}}, equivalent_paths="false",
+        )
+        assert captured
+        assert all(mc.get("extra_env", {}).get("EQUIVALENT_PATHS") == "false" for mc in captured)
+        assert report["metadata"]["equivalent_paths"] == "false"
+
+    def test_arm_omitted_records_none(self, monkeypatch, tmp_path):
+        captured = self._capture_arm(monkeypatch)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {})
+        assert captured
+        assert all("EQUIVALENT_PATHS" not in (mc.get("extra_env") or {}) for mc in captured)
+        assert report["metadata"]["equivalent_paths"] is None
+
+    def _corpus_file(self, tmp_path):
+        corpus = {
+            "real_pr_corpus": {
+                "vulnerable": [{
+                    "id": "v1", "repo_full_name": "acme/repo", "number": 1,
+                    "head_sha": GOOD_SHA, "expected_clean": False,
+                    "defect": {"description": "d", "file": "a.py", "severity": "major"},
+                }],
+                "clean": [],
+            }
+        }
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps(corpus), encoding="utf-8")
+        return path
+
+    def _main_args(self, tmp_path, arm):
+        return build_parser().parse_args([
+            "--corpus", str(self._corpus_file(tmp_path)),
+            "--modes", "tools_off",
+            "--equivalent-paths", arm,
+        ])
+
+    def test_main_real_pr_corpus_applies_the_true_arm(self, monkeypatch, tmp_path, capsys):
+        captured = self._capture_arm(monkeypatch)
+        rc = _main_real_pr_corpus(self._main_args(tmp_path, "true"))
+        assert rc == 0
+        assert captured
+        assert all(mc.get("extra_env", {}).get("EQUIVALENT_PATHS") == "true" for mc in captured)
+
+    def test_main_real_pr_corpus_applies_the_false_arm(self, monkeypatch, tmp_path, capsys):
+        captured = self._capture_arm(monkeypatch)
+        rc = _main_real_pr_corpus(self._main_args(tmp_path, "false"))
+        assert rc == 0
+        assert captured
+        assert all(mc.get("extra_env", {}).get("EQUIVALENT_PATHS") == "false" for mc in captured)
+class TestRequirementTraceMetadata:
+    """#874: metadata.requirement_trace distinguishes the A/B arm on every
+    report shape run_real_pr_corpus can produce, like corpus_source does for
+    the synthetic-benchmark path (main())."""
+
+    def _corpus(self):
+        vuln = RealPRScenario(
+            id="v1", repo_full_name="acme/repo", number=1, head_sha=GOOD_SHA,
+            expected_clean=False, defect=None,
+        )
+        return RealPRCorpus(vulnerable=[vuln], clean=[])
+
+    def _stub(self, monkeypatch):
+        monkeypatch.setattr(
+            "eval_harness.run_review_for_pr",
+            lambda pr_entry, mode, work_dir, model_config, **kwargs: ReviewRun(
+                mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"],
+            ),
+        )
+
+    def test_requirement_trace_threads_to_every_run_call(self, monkeypatch, tmp_path):
+        """Mirrors the claim-falsification threading test: the flag must reach
+        every run_review_for_pr call — true forwards True, default/false
+        forwards False."""
+        seen: list[bool] = []
+
+        def fake_run_review_for_pr(pr_entry, mode, work_dir, model_config, requirement_trace=False, **kwargs):
+            seen.append(requirement_trace)
+            return ReviewRun(mode=mode, pr_number=pr_entry["number"], repo_full_name=pr_entry["repo_full_name"])
+
+        monkeypatch.setattr("eval_harness.run_review_for_pr", fake_run_review_for_pr)
+
+        on_report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {}, requirement_trace=True)
+        assert seen == [True]
+        assert on_report["metadata"]["requirement_trace"] is True
+
+        seen.clear()
+        off_report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {})
+        assert seen == [False]
+        assert off_report["metadata"]["requirement_trace"] is False
+
+    def test_default_false(self, monkeypatch, tmp_path):
+        self._stub(monkeypatch)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {})
+        assert report["metadata"]["requirement_trace"] is False
+
+    def test_true_when_enabled(self, monkeypatch, tmp_path):
+        self._stub(monkeypatch)
+        report = run_real_pr_corpus(self._corpus(), ["tools_off"], tmp_path, {}, requirement_trace=True)
+        assert report["metadata"]["requirement_trace"] is True
+
+    def test_context_only_report_also_carries_it(self, monkeypatch, tmp_path):
+        self._stub(monkeypatch)
+        report = run_real_pr_corpus(
+            self._corpus(), ["tools_off"], tmp_path, {}, context_only=True, requirement_trace=True,
+        )
+        assert report["metadata"]["requirement_trace"] is True
+
+
+class TestGenerateRealPRReportRunsPerMode:
+    """generate_real_pr_report accepts either a single ReviewRun per mode
+    (pre-#839 shape) or a list[ReviewRun] (N repeats) interchangeably."""
+
+    def test_list_of_runs_aggregates_into_mode_summary(self):
+        defect = RealPRDefect("d", "a.py", (10, 20), "major")
+        vuln = _scenario(id="v1", defect=defect)
+        runs = [
+            _run([_finding("a.py", line=15)], verdict="request_changes"),
+            _run([], verdict="approve"),
+            _run([], error="boom"),
+        ]
+        scenario_runs = [(vuln, {"tools_off": runs})]
+        report = generate_real_pr_report(scenario_runs)
+        mm = report["mode_summary"]["tools_off"]
+        assert mm["vulnerable_total"] == 3
+        assert mm["hits"] == 1
+        assert mm["vulnerable_errors"] == 1
+        assert report["metadata"]["total_runs"] == 3
+        assert report["metadata"]["completed_runs"] == 2
+
+        entry = report["per_scenario_results"][0]
+        assert len(entry["runs"]["tools_off"]) == 3
+        assert entry["runs_aggregate"]["tools_off"] == {
+            "runs": 3, "errors": 1, "timeouts": 0,
+            "hits": 1, "file_only_hits": 1, "request_changes": 1,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Timeout accounting (#840)
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutAccounting:
+    def test_default_timeout_is_1200s(self, monkeypatch):
+        monkeypatch.delenv("EVAL_REVIEW_TIMEOUT_SEC", raising=False)
+        assert _review_timeout_sec() == 1200
+
+    def test_env_override_still_works(self, monkeypatch):
+        monkeypatch.setenv("EVAL_REVIEW_TIMEOUT_SEC", "45")
+        assert _review_timeout_sec() == 45
+
+    def test_score_vulnerable_run_carries_timed_out(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        run = ReviewRun(
+            mode="tools_off", pr_number=1, repo_full_name="acme/repo",
+            error="Review timed out after 1200s", timed_out=True,
+        )
+        score = score_vulnerable_run(run, defect)
+        assert score["errored"] is True
+        assert score["timed_out"] is True
+
+    def test_score_clean_run_carries_timed_out(self):
+        run = ReviewRun(
+            mode="tools_off", pr_number=1, repo_full_name="acme/repo",
+            error="Review timed out after 1200s", timed_out=True,
+        )
+        score = score_clean_run(run)
+        assert score["timed_out"] is True
+
+    def test_non_timeout_error_is_not_flagged_as_timeout(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        run = _run([], error="Review failed (exit 1): boom")
+        score = score_vulnerable_run(run, defect)
+        assert score["errored"] is True
+        assert score["timed_out"] is False
+
+    def test_mode_summary_counts_timeouts_separately_from_other_errors(self):
+        defect = RealPRDefect("d", "a.py", None, "major")
+        vuln_timeout = _scenario(id="v1", defect=defect)
+        vuln_other_error = _scenario(id="v2", defect=defect)
+        scenario_runs = [
+            (vuln_timeout, {"tools_off": _run([], error="timed out", verdict=None)}),
+            (vuln_other_error, {"tools_off": _run([], error="boom", verdict=None)}),
+        ]
+        # Mark only the first run as a genuine timeout.
+        scenario_runs[0][1]["tools_off"].timed_out = True
+
+        report = generate_real_pr_report(scenario_runs)
+        mm = report["mode_summary"]["tools_off"]
+        assert mm["vulnerable_errors"] == 2
+        assert mm["vulnerable_timeouts"] == 1
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DIST_ENTRYPOINT = _REPO_ROOT / "dist" / "index.js"
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None or not _DIST_ENTRYPOINT.is_file(),
+    reason="needs node and a built dist/index.js (npm run build)",
+)
+class TestRealRuntimeIgnoresCommittedDecoyArtifacts:
+    """#838 end-to-end regression: a PR that COMMITS a forged pr.diff /
+    pr-files.seed.json at its repo root (so `git clean` cannot remove them)
+    must never have those reused by the real runtime. Runs the actual built
+    `node dist/index.js run` (via run_review_for_pr's default RUNTIME_ENTRYPOINT
+    seam) in --context-only style: a closed local model port, no network, no
+    credentials — the run fails at the model call, but the context-assembly
+    artifacts (pr.diff, pr-files.json, review-corpus.md) are written to
+    PR_REVIEWER_RUN_DIR before that, which is all this test needs. The PR
+    identity admission needs (#726) is served offline through the
+    semantic-fixture seam: a crafted .semantic-fixture/pr.json (same-repo,
+    not-draft, pinned SHAs) plus SEMANTIC_FIXTURE_*/FORCE_REVIEW, so the
+    engine-owned admission stage passes without a forge. The fixture lives
+    OUTSIDE the reviewed checkout, because the harness's own pinned-workspace
+    prepare runs `git clean -ffdx` inside that checkout and would delete an
+    untracked fixture written there."""
+
+    def _origin_with_decoy_head(self, tmp_path: Path) -> tuple[Path, str, str]:
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+        def git(*args: str) -> str:
+            result = subprocess.run(
+                ["git", "-C", str(origin), *args],
+                check=True, capture_output=True, text=True, env=env,
+            )
+            return result.stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "eval@test")
+        git("config", "user.name", "eval")
+        (origin / "marker.txt").write_text("base\n", encoding="utf-8")
+        git("add", "marker.txt")
+        git("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-q", "-m", "base")
+        base_sha = git("rev-parse", "HEAD")
+
+        # The PR head: a real change (marker.txt) PLUS a tracked, forged
+        # pr.diff / pr-files.seed.json that lie about what changed — a
+        # committed file, unlike the harness's own untracked artifacts, so
+        # `git clean -ffdx` cannot remove it.
+        (origin / "marker.txt").write_text("pr-head\n", encoding="utf-8")
+        (origin / "pr.diff").write_text(
+            "diff --git a/hidden-backdoor.py b/hidden-backdoor.py\n"
+            "--- /dev/null\n+++ b/hidden-backdoor.py\n@@ -0,0 +1 @@\n+FORGED\n",
+            encoding="utf-8",
+        )
+        (origin / "pr-files.seed.json").write_text(
+            json.dumps([{
+                "filename": "hidden-backdoor.py", "status": "added",
+                "additions": 1, "deletions": 0, "changes": 1, "previous_filename": None,
+            }]),
+            encoding="utf-8",
+        )
+        git("add", "-A")
+        git("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "commit", "-q", "-m", "pr head")
+        head_sha = git("rev-parse", "HEAD")
+        git("update-ref", "refs/pull/1/head", head_sha)
+        # main stays parked at base: the PR commit is reachable only via
+        # refs/pull/1/head, matching the real corpus's checkout path.
+        git("update-ref", "refs/heads/main", base_sha)
+        return origin, base_sha, head_sha
+
+    def test_run_uses_the_computed_diff_and_seed_never_the_committed_forgeries(
+        self, tmp_path: Path
+    ) -> None:
+        origin, base_sha, head_sha = self._origin_with_decoy_head(tmp_path)
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        repo_full_name = "acme/repo"
+        repo_path = tmp_path / repo_full_name.replace("/", "-")
+        # Pre-populate repo_path from the LOCAL origin so run_review_for_pr's
+        # "clone from github.com" branch is skipped (repo_path already exists).
+        subprocess.run(
+            ["git", "clone", str(origin), str(repo_path)],
+            check=True, capture_output=True, text=True, env=env,
+        )
+
+        pr_entry = {
+            "number": 1, "repo_full_name": repo_full_name,
+            "head_sha": head_sha, "base_sha": base_sha,
+        }
+        # Engine-owned admission (#726): the runtime's first stage must
+        # prove the PR is reviewable before any context stage runs. Without
+        # fixture interception this offline run has no credentials, so the
+        # forge reads soft-fail: since #1312 a failed PR lookup is an
+        # operational failure that FAILS the run (it no longer green-skips
+        # through the #961 draft gate), so admission can never reach
+        # pr-files.json / review-corpus.md. Serve the pinned same-repo,
+        # open, not-draft PR identity through the same semantic-fixture seam
+        # the harness corpus uses, so admission passes offline; the #838
+        # invariant under test (run-dir seeds win over committed forgeries)
+        # is untouched.
+        #
+        # The fixture carries `state: "open"` for the same reason the harness
+        # corpus fixtures do (`_fixture_pr_object`): a real pulls payload
+        # always carries the state, and the #1301 gate fails closed on a
+        # state it cannot prove.
+        #
+        # The fixture directory is OUTSIDE repo_path on purpose: the harness
+        # resets the clone and seeds the pinned diff with
+        # `_prepare_pinned_workspace`, which runs `git clean -ffdx` IN the
+        # checkout. An untracked .semantic-fixture/ written there would be
+        # wiped before the runtime ever runs, the fixture adapter would then
+        # serve no PR at all, and admission would fail as an operational
+        # lookup failure (#1312) with no context artifacts written. The
+        # directory name must not collide with the harness's repo checkout
+        # naming
+        # (`<repo_full_name with "/" replaced by "-">`).
+        fixture_repo = tmp_path / "pr-identity-fixture"
+        (fixture_repo / ".semantic-fixture").mkdir(parents=True)
+        (fixture_repo / ".semantic-fixture" / "pr.json").write_text(
+            json.dumps({
+                "number": 1,
+                "state": "open",
+                "draft": False,
+                "head": {"sha": head_sha, "repo": {"full_name": repo_full_name}},
+                "base": {"sha": base_sha, "repo": {"full_name": repo_full_name}},
+            }),
+            encoding="utf-8",
+        )
+        model_config = {
+            "model": "context-only", "base_url": "http://127.0.0.1:9/v1",
+            "api_key": "none", "github_token": "dummy-token",
+            "extra_env": {
+                **REPLAY_ENV,
+                **CONTEXT_ONLY_ENV,
+                "SEMANTIC_FIXTURE_DIR": str(fixture_repo),
+                "SEMANTIC_FIXTURE_MODE": "true",
+                "FORCE_REVIEW": "true",
+                "SKIP_IF_DIFF_UNCHANGED": "false",
+            },
+        }
+
+        run = run_review_for_pr(pr_entry, "tools_off", tmp_path, model_config)
+
+        assert run.run_dir is not None
+        assert run.run_dir != repo_path
+
+        # The decoy really is committed and survives the checkout + reset.
+        assert "FORGED" in (repo_path / "pr.diff").read_text(encoding="utf-8")
+        assert "hidden-backdoor" in (repo_path / "pr-files.seed.json").read_text(encoding="utf-8")
+
+        # The runtime's own context-assembly artifacts, written to
+        # PR_REVIEWER_RUN_DIR before the (failing) model call, reflect the
+        # REAL change — never the committed lie, which would hide marker.txt
+        # entirely and claim only hidden-backdoor.py changed.
+        real_diff = (run.run_dir / "pr.diff").read_text(encoding="utf-8")
+        assert "marker.txt" in real_diff
+        real_files = (run.run_dir / "pr-files.json").read_text(encoding="utf-8")
+        assert "marker.txt" in real_files
+        # The forged manifest names a file the real change never touched, so
+        # a runtime that merged the committed lie into its file list would be
+        # caught here too. (The diff cannot carry the same negative check:
+        # the pinned diff legitimately CONTAINS the committed decoys, because
+        # the PR really did add those files.)
+        assert "hidden-backdoor.py" not in real_files
+        corpus = (run.run_dir / "review-corpus.md").read_text(encoding="utf-8")
+        assert "marker.txt" in corpus
+
+
+# ---------------------------------------------------------------------------
+# Entry-level retained fixtures on real-PR corpus entries (#1609)
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIFF = (
+    "diff --git a/a.py b/a.py\n"
+    "--- /dev/null\n"
+    "+++ b/a.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+import os\n"
+    '+DEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'
+)
+
+
+def _fixture_doc(number: int = 1) -> dict:
+    return {
+        "schema": 1,
+        "scenario": number,
+        "pr_json": {
+            "number": number,
+            "title": "fixture PR",
+            "body": "",
+            "head": {"sha": f"fixture-{number}-head", "ref": "pr"},
+            "base": {"sha": f"fixture-{number}-base", "ref": "main"},
+            "user": {"login": "fixture"},
+        },
+        "diff": _FIXTURE_DIFF,
+        "pr_files": [{
+            "filename": "a.py", "status": "added",
+            "additions": 2, "deletions": 0, "changes": 2,
+        }],
+        "files": [{"path": "a.py", "content": 'import os\nDEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'}],
+    }
+
+
+def _write_fixture(corpus_dir: Path, name: str, fixture: dict) -> str:
+    data = json.dumps(fixture, indent=2) + "\n"
+    (corpus_dir / name).write_text(data, encoding="utf-8")
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _fixture_corpus_file(tmp_path: Path, sha: str, name: str = "fixture.json") -> Path:
+    entry = {
+        "id": "v1", "repo_full_name": "acme/repo", "number": 1,
+        "head_sha": GOOD_SHA, "base_sha": "b" * 40,
+        "defect": {"description": "d", "file": "a.py", "line_range": [2, 2]},
+        "fixture": {"path": name, "sha256": sha},
+    }
+    path = tmp_path / "corpus.json"
+    path.write_text(
+        json.dumps({"real_pr_corpus": {"vulnerable": [entry], "clean": []}}),
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestRealPRCorpusFixtureRefs:
+    """#1609: RealPRCorpus entries may pin a retained fixture ref (path +
+    sha256 under the corpus directory), loaded eagerly like BenchmarkCorpus's
+    #712 refs so a corrupt ref fails at corpus load and every error names the
+    scenario that pinned it."""
+
+    def test_from_file_loads_a_pinned_fixture(self, tmp_path):
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        corpus = RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+        scenario = corpus.vulnerable[0]
+        assert scenario.semantic_fixture is not None
+        data, fixture_path = scenario.semantic_fixture
+        assert data["pr_json"]["number"] == 1
+        assert fixture_path == (tmp_path / "fixture.json").resolve()
+
+    def test_to_pr_entry_carries_the_fixture_tuple(self, tmp_path):
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        scenario = RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha)).vulnerable[0]
+        entry = scenario.to_pr_entry()
+        assert entry["_semantic_fixture"] is scenario.semantic_fixture
+        # The live-replay identity fields survive: a fixture entry still pins
+        # the real PR it documents.
+        assert entry["head_sha"] == GOOD_SHA
+        assert entry["base_sha"] == "b" * 40
+
+    def test_entry_without_fixture_has_no_semantic_fixture(self, tmp_path):
+        path = tmp_path / "corpus.json"
+        path.write_text(
+            json.dumps({"real_pr_corpus": {"vulnerable": [], "clean": [{
+                "repo_full_name": "acme/repo", "number": 2,
+                "head_sha": GOOD_SHA, "expected_clean": True,
+            }]}}),
+            encoding="utf-8",
+        )
+        scenario = RealPRCorpus.from_file(path).clean[0]
+        assert scenario.semantic_fixture is None
+        assert "_semantic_fixture" not in scenario.to_pr_entry()
+
+    def test_non_object_fixture_ref_is_refused(self, tmp_path):
+        _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        path = _fixture_corpus_file(tmp_path, "c" * 64)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["real_pr_corpus"]["vulnerable"][0]["fixture"] = "fixture.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ValueError, match="v1: fixture must be an object"):
+            RealPRCorpus.from_file(path)
+
+    def test_hash_mismatch_names_the_scenario(self, tmp_path):
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        path = _fixture_corpus_file(tmp_path, "c" * 64)
+        with pytest.raises(ValueError, match="v1: semantic fixture hash mismatch"):
+            RealPRCorpus.from_file(path)
+
+    def test_unsafe_fixture_path_is_refused(self, tmp_path):
+        _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        path = _fixture_corpus_file(tmp_path, "c" * 64, name="../escape.json")
+        with pytest.raises(ValueError, match="v1"):
+            RealPRCorpus.from_file(path)
+
+    def test_missing_fixture_file_is_refused(self, tmp_path):
+        path = _fixture_corpus_file(tmp_path, "c" * 64, name="absent.json")
+        with pytest.raises(ValueError, match="v1"):
+            RealPRCorpus.from_file(path)
+
+    def test_symlinked_fixture_path_is_refused(self, tmp_path):
+        """A symlink inside the corpus root that points outside it is the one
+        traversal vector the lexical path guard cannot see; the resolve()
+        containment re-check must catch it."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _write_fixture(outside, "real.json", _fixture_doc())
+        corpus_dir = tmp_path / "corpus"
+        corpus_dir.mkdir()
+        (corpus_dir / "link.json").symlink_to(outside / "real.json")
+        sha = hashlib.sha256((outside / "real.json").read_bytes()).hexdigest()
+        path = _fixture_corpus_file(corpus_dir, sha, name="link.json")
+        with pytest.raises(ValueError, match="v1"):
+            RealPRCorpus.from_file(path)
+
+    def test_fixture_payload_that_disagrees_with_its_diff_is_refused(self, tmp_path):
+        """#1609 review fix: a fixture whose tree does not carry the diff's
+        new side would otherwise pass the ref check and silently mis-score
+        the row (defect_file_in_diff reads the diff, defect_lines reads the
+        materialized tree). Integrity is checked at corpus load."""
+        fixture = _fixture_doc()
+        fixture["files"] = [{"path": "a.py", "content": "a different tree\nthe diff never produced\n"}]
+        sha = _write_fixture(tmp_path, "fixture.json", fixture)
+        with pytest.raises(ValueError, match="v1"):
+            RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+
+    def test_deletion_only_fixture_ref_loads(self, tmp_path):
+        """A PR diff that only removes files has an empty head tree: the
+        loader must accept it (an empty tree commits with --allow-empty)
+        instead of crashing on an unhandled git failure."""
+        fixture = _fixture_doc()
+        fixture["files"] = []
+        fixture["diff"] = (
+            "diff --git a/a.py b/a.py\n"
+            "deleted file mode 100644\n"
+            "index 1111111..0000000\n"
+            "--- a/a.py\n"
+            "+++ /dev/null\n"
+            "@@ -1,2 +0,0 @@\n"
+            "-import os\n"
+            '-DEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'
+        )
+        sha = _write_fixture(tmp_path, "fixture.json", fixture)
+        corpus = RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+        assert corpus.vulnerable[0].semantic_fixture is not None
+
+    def test_deletion_bearing_fixture_ref_loads(self, tmp_path):
+        """A diff that deletes one file and modifies another is accepted: the
+        deleted side exists only in the base tree the reverse-apply recreates."""
+        fixture = _fixture_doc()
+        fixture["files"] = [{"path": "a.py", "content": 'import os\nDEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'}]
+        fixture["diff"] = (
+            "diff --git a/gone.py b/gone.py\n"
+            "deleted file mode 100644\n"
+            "index 1111111..0000000\n"
+            "--- a/gone.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-gone()\n"
+            "diff --git a/a.py b/a.py\n"
+            "index 2222222..3333333 100644\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-import sys\n"
+            '-DEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'
+            "+import os\n"
+            '+DEFAULT_TIMEOUT = os.getenv("TIMEOUT")\n'
+        )
+        sha = _write_fixture(tmp_path, "fixture.json", fixture)
+        corpus = RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+        assert corpus.vulnerable[0].semantic_fixture is not None
+
+    def test_git_level_failure_inside_integrity_is_a_named_load_error(self, tmp_path, monkeypatch):
+        """A git-level crash inside the integrity check (subprocess error, not
+        ValueError) must surface as a corpus-load ValueError naming the
+        scenario, never as a raw harness traceback."""
+        import eval_harness
+
+        def explode(_fixture):
+            raise subprocess.CalledProcessError(128, "git commit")
+
+        monkeypatch.setattr(eval_harness, "validate_semantic_fixture_integrity", explode)
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        with pytest.raises(ValueError, match="v1"):
+            RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+
+    def test_shipped_corpora_retain_a_grounded_fixture_each(self):
+        """#1609: each shipped real-PR corpus retains at least one grounded
+        historical fixture, so the documented --context-only command builds
+        context for a real pinned case offline. Loading the shipped corpora
+        also re-runs the ref checks (path containment, sha256) and the
+        payload integrity check (reverse-applied diff) at corpus load."""
+        shipped = {
+            "corpus-real-prs.json": "pr-reviewer-action-99-135",
+            "corpus-human-findings.json": "misospace/pr-reviewer-action#233@25854c65",
+        }
+        for name, scenario_id in shipped.items():
+            corpus = RealPRCorpus.from_file(_REPO_ROOT / "evals" / name)
+            pinned = [
+                s for s in [*corpus.vulnerable, *corpus.clean]
+                if s.semantic_fixture is not None
+            ]
+            assert [s.id for s in pinned] == [scenario_id]
+            data, _fixture_path = pinned[0].semantic_fixture
+            # Grounding: the fixture documents which historical PR it retains.
+            assert data["provenance"]["historical_pr"] == pinned[0].number
+
+
+class TestRunReviewForPrFixturePath:
+    """A fixture-backed real-PR entry takes the semantic-fixture path: the
+    runtime is invoked against the materialized repository with the fixture
+    env (and FORCE_REVIEW) set, and never clones the merged PR."""
+
+    def _stub_script(self, tmp_path: Path) -> tuple[Path, Path]:
+        out_path = tmp_path / "stub-env.txt"
+        script = tmp_path / "stub-review.sh"
+        script.write_text(f"#!/bin/sh\nenv > {out_path}\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        return script, out_path
+
+    def _scenario_with_fixture(self, tmp_path: Path) -> RealPRScenario:
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        return RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha)).vulnerable[0]
+
+    def test_fixture_entry_runs_offline_against_the_materialized_repo(self, tmp_path, monkeypatch):
+        script, out_path = self._stub_script(tmp_path)
+        monkeypatch.setattr("eval_harness.RUNTIME_ENTRYPOINT", tmp_path / "unused")
+        scenario = self._scenario_with_fixture(tmp_path)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        run = run_review_for_pr(scenario.to_pr_entry(), "tools_off", work_dir, {}, review_script=script)
+
+        assert run.error is None
+        assert run.commit_sha  # the materialized fixture commit
+        env_text = out_path.read_text(encoding="utf-8")
+        assert "SEMANTIC_FIXTURE_MODE=true\n" in env_text
+        assert f"SEMANTIC_FIXTURE_DIR={run.repo_path}" in env_text
+        assert "FORCE_REVIEW=true" in env_text
+        assert "SKIP_IF_DIFF_UNCHANGED=false" in env_text
+        assert run.repo_path is not None
+        assert run.repo_path.exists()
+        # The materialized checkout carries the fixture's head tree.
+        assert (run.repo_path / "a.py").is_file()
+        assert (run.repo_path / ".semantic-fixture" / "pr.json").is_file()
+
+    def test_fixture_entry_never_clones_or_checkouts(self, tmp_path, monkeypatch):
+        script, _out = self._stub_script(tmp_path)
+        monkeypatch.setattr("eval_harness.RUNTIME_ENTRYPOINT", tmp_path / "unused")
+        scenario = self._scenario_with_fixture(tmp_path)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        run = run_review_for_pr(scenario.to_pr_entry(), "tools_off", work_dir, {}, review_script=script)
+
+        assert run.error is None
+        # The live-clone path would have created work_dir/acme-repo; a
+        # fixture entry materializes its own repository instead.
+        assert run.repo_path is not None
+        assert run.repo_path != work_dir / "acme-repo"
+        assert not (work_dir / "acme-repo").exists()
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None or not _DIST_ENTRYPOINT.is_file(),
+    reason="needs node and a built dist/index.js (npm run build)",
+)
+class TestContextOnlyFixtureEntryEndToEnd:
+    """#1609 regression: --context-only over a real-PR corpus entry that pins
+    a retained fixture builds full review context offline. Before the seam,
+    the #1301 closed/merged admission gate refused every historical entry
+    (all pin merged PRs) and every row reported context_built: false."""
+
+    def test_context_only_builds_context_for_a_fixture_entry(self, tmp_path):
+        sha = _write_fixture(tmp_path, "fixture.json", _fixture_doc())
+        corpus = RealPRCorpus.from_file(_fixture_corpus_file(tmp_path, sha))
+        model_config = {
+            "model": "context-only", "base_url": "http://127.0.0.1:9/v1",
+            "api_key": "none", "github_token": "dummy-token",
+            "extra_env": {**REPLAY_ENV, **CONTEXT_ONLY_ENV},
+        }
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        report = run_real_pr_corpus(corpus, ["tools_off"], work_dir, model_config, context_only=True)
+
+        assert report["metadata"]["context_built"] == 1
+        row = report["per_scenario"][0]
+        assert row["id"] == "v1"
+        assert row["fixture"] is True
+        assert row["context_built"] is True
+        assert row["defect_file_in_diff"] is True
+        assert row["defect_lines"] == 1
+        assert row["defect_lines_in_context"] == 1
+        # The context-only mode does not skip the model call: it drives the
+        # engine at a closed loopback port, so the connect attempt is
+        # refused and no verdict artifact is ever written. The row says so
+        # instead of the runbook asserting it.
+        assert row["model_verdict"] is False

@@ -1,0 +1,367 @@
+/**
+ * Tier-aware native tool-loop request budget (#701), scaled by PR size
+ * (#810).
+ *
+ * The request budget follows the review route instead of one global ceiling:
+ * the primary route keeps a conservative budget, the smart route gets more
+ * headroom, and the escalated (deep) path gets the most — never above the
+ * hard safety ceiling. Explicit user configuration always wins, bounded to
+ * 1..TOOL_REQUEST_HARD_MAX; an unparsable value falls through to the next
+ * source, never widening the budget.
+ *
+ * #810: when no explicit override wins, the default is derived from the PR's
+ * changed-file count, changed lines and specialist-lead count, floored at the
+ * route's tier default (so a small PR's budget matches the pre-#810 value
+ * exactly) and capped at the hard ceiling. The derivation needs workspace
+ * artifacts (pr.json / pr-files.json / specialist-*.json); when the caller
+ * supplies no size signal the tier default is used as-is, as tested in
+ * tests-v3/budget.test.ts.
+ *
+ * This module is the v3 port of `tool_budget_route` /
+ * `resolve_tool_max_requests` in scripts/run_tool_harness.py. The two stay
+ * in lockstep on the explicit/override precedence and the smart/escalated
+ * tier defaults, so the #678 migration cannot regress to a single
+ * undifferentiated request ceiling. They deliberately differ on the primary
+ * tier default (v3 40, v2 16), while the size-scaled default is v3-only (#810).
+ *
+ * The Python side reads os.environ; this side takes the environment as a
+ * plain record so the resolver is pure and tests can evaluate cases without
+ * process-global state. The production caller passes
+ * `process.env`.
+ */
+
+import { SPECIALIST_ROLES_ORDER } from "../specialists/types.js";
+
+export type ToolBudgetTier = "primary" | "smart" | "escalated";
+
+/**
+ * Where the effective ceiling came from (#702 budget provenance). The
+ * telemetry contract is primary-override / smart-override > explicit >
+ * tier-default, matching resolve_tool_budget in
+ * scripts/run_tool_harness.py. `size-scaled` (#810) replaces `tier-default`
+ * only when the PR-size derivation strictly exceeds the tier default; when
+ * the floor binds, the tier default is what won and the source says so.
+ */
+export type ToolBudgetSource = "primary-override" | "smart-override" | "explicit" | "tier-default" | "size-scaled";
+
+export const TOOL_REQUEST_HARD_MAX = 50;
+
+export const TOOL_REQUEST_TIER_DEFAULTS: Readonly<
+  Record<ToolBudgetTier, number>
+> = Object.freeze({ primary: 40, smart: 45, escalated: 50 });
+
+/**
+ * PR-size weights for the #810 scaled default. One request per few changed
+ * files, one per block of changed lines, and a fixed allowance per
+ * specialist lead (each lead is a hypothesis that needs its own
+ * verification calls). Provider-, model- and forge-agnostic by
+ * construction: the inputs are diff sizes and lead counts, nothing else.
+ */
+export const TOOL_BUDGET_FILES_PER_REQUEST = 4;
+export const TOOL_BUDGET_LINES_PER_REQUEST = 400;
+export const TOOL_BUDGET_REQUESTS_PER_LEAD = 2;
+
+/** PR-size signal for the #810 scaled default, in changed PR units. */
+export interface ToolBudgetSizeInput {
+  changedFiles: number;
+  changedLines: number;
+  specialistLeads: number;
+}
+
+function countOf(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+/**
+ * Load the #810 size signal from the harness workspace artifacts the loop
+ * can already see: pr.json (the PR-level totals, which survive the 100-file
+ * manifest cap) with pr-files.json as the fallback, plus the per-role
+ * specialist-*.json lead artifacts. Every read is tolerant: an absent or
+ * unparsable artifact contributes zero, so a workspace without size signals
+ * degrades to the tier default. Pure over the injected reader.
+ */
+export function toolBudgetSizeFromArtifacts(
+  read: (name: string) => string | null,
+): ToolBudgetSizeInput {
+  const parse = (name: string): unknown => {
+    const body = read(name);
+    if (body === null || body.trim() === "") return null;
+    try {
+      return JSON.parse(body) as unknown;
+    } catch {
+      return null;
+    }
+  };
+
+  let changedFiles = 0;
+  let changedLines = 0;
+  const pr = parse("pr.json");
+  if (pr !== null && typeof pr === "object" && !Array.isArray(pr)) {
+    const record = pr as Record<string, unknown>;
+    changedFiles = countOf(record.changedFiles);
+    const additions = Number(record.additions);
+    const deletions = Number(record.deletions);
+    if (Number.isFinite(additions) && Number.isFinite(deletions) && additions >= 0 && deletions >= 0) {
+      changedLines = Math.trunc(additions + deletions);
+    }
+  }
+  const manifest = parse("pr-files.json");
+  const entries =
+    Array.isArray(manifest)
+      ? manifest
+      : manifest !== null && typeof manifest === "object" && Array.isArray((manifest as Record<string, unknown>).files)
+        ? (manifest as Record<string, unknown>).files as unknown[]
+        : [];
+  let manifestFiles = 0;
+  let manifestLines = 0;
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.filename !== "string" || record.filename === "") continue;
+    manifestFiles += 1;
+    const additions = Number(record.additions);
+    const deletions = Number(record.deletions);
+    if (Number.isFinite(additions) && Number.isFinite(deletions) && additions >= 0 && deletions >= 0) {
+      manifestLines += Math.trunc(additions + deletions);
+    } else {
+      const changes = Number(record.changes);
+      if (Number.isFinite(changes) && changes >= 0) manifestLines += Math.trunc(changes);
+    }
+  }
+  if (changedFiles === 0) changedFiles = manifestFiles;
+  if (changedLines === 0) changedLines = manifestLines;
+
+  let specialistLeads = 0;
+  for (const role of SPECIALIST_ROLES_ORDER) {
+    const artifact = parse(`specialist-${role}.json`);
+    if (artifact === null || typeof artifact !== "object" || Array.isArray(artifact)) continue;
+    const leads = (artifact as Record<string, unknown>).leads;
+    if (Array.isArray(leads)) specialistLeads += leads.length;
+  }
+
+  return { changedFiles, changedLines, specialistLeads };
+}
+
+/**
+ * The #810 size-scaled default: enough requests to touch the diff at the
+ * weights above, floored at the route's tier default (a small PR keeps
+ * today's budget) and capped at the hard ceiling.
+ */
+export function sizeScaledToolBudget(size: ToolBudgetSizeInput, route: ToolBudgetTier): number {
+  const derived =
+    Math.ceil(countOf(size.changedFiles) / TOOL_BUDGET_FILES_PER_REQUEST) +
+    Math.ceil(countOf(size.changedLines) / TOOL_BUDGET_LINES_PER_REQUEST) +
+    countOf(size.specialistLeads) * TOOL_BUDGET_REQUESTS_PER_LEAD;
+  return Math.min(
+    TOOL_REQUEST_HARD_MAX,
+    Math.max(TOOL_REQUEST_TIER_DEFAULTS[route], derived),
+  );
+}
+
+export type EnvLike = Readonly<Record<string, string | undefined>>;
+
+function flagTrue(value: string | undefined): boolean {
+  return (value ?? "").trim().toLowerCase() === "true";
+}
+
+/**
+ * int()-shaped parse: optional sign, digits with Python-style between-digit
+ * underscores, then clamp to [1, TOOL_REQUEST_HARD_MAX]. Anything else
+ * returns null so the caller falls through to the next budget source.
+ */
+function clampedPositive(raw: string | undefined): number | null {
+  const text = (raw ?? "").trim();
+  if (!/^[+-]?[0-9]+(_[0-9]+)*$/.test(text)) return null;
+  const value = Number(text.replaceAll("_", ""));
+  return Math.max(1, Math.min(TOOL_REQUEST_HARD_MAX, value));
+}
+
+/**
+ * Classify a harness run's budget tier. Mirrors tool_budget_route:
+ *   primary   — the ordinary primary-tier harness run;
+ *   smart     — a harness run on the smart tier (TOOL_HARNESS_TIER=smart);
+ *   escalated — the smart-tier harness run under post-review escalation
+ *               (run_review.sh exports TOOL_ESCALATION=true around it).
+ *
+ * #1253: the tier argument is the only route signal. The historical
+ * REVIEW_CONTEXT_PROFILE=smart ambient override is gone — the stage env is
+ * a constructed record that never carries that key (src/run/env.ts), and the
+ * engine forced it to "primary" before any consumer ran, so the override
+ * branch was unreachable and has been removed.
+ */
+export function toolBudgetRoute(tier: string, env: EnvLike): ToolBudgetTier {
+  // #1598: the fallback-tier evidence loop rides the SAME tool-call budget as
+  // the primary lane — the fallback harness is availability recovery for the
+  // primary's failed investigation, not a second-class budget.
+  if (tier === "fallback") {
+    return "primary";
+  }
+  if (tier === "smart") {
+    return flagTrue(env.TOOL_ESCALATION) ? "escalated" : "smart";
+  }
+  return "primary";
+}
+
+/**
+ * Resolve the effective native-loop request budget for one harness run.
+ * Precedence: PRIMARY_TOOL_MAX_REQUESTS (primary only) or
+ * SMART_TOOL_MAX_REQUESTS (smart/escalated only) >
+ * TOOL_MAX_REQUESTS > the #810 size-scaled default (floored at the route's
+ * tier default; without a `size` signal this is exactly the tier default).
+ * The `source` reports which input won and `configured` echoes the winning
+ * explicit integer (null for the derived defaults) — the #702 provenance
+ * fields the loop telemetry carries, kept in lockstep with resolve_tool_budget.
+ */
+export function resolveToolMaxRequests(
+  tier: string,
+  env: EnvLike,
+  size?: ToolBudgetSizeInput | null,
+): { route: ToolBudgetTier; budget: number; source: ToolBudgetSource; configured: number | null } {
+  const route = toolBudgetRoute(tier, env);
+  const [tierVar, tierSource]: [string | undefined, ToolBudgetSource] = route === "primary"
+    ? [env.PRIMARY_TOOL_MAX_REQUESTS, "primary-override"]
+    : [env.SMART_TOOL_MAX_REQUESTS, "smart-override"];
+  const tierOverride = clampedPositive(tierVar);
+  if (tierOverride !== null) {
+    return { route, budget: tierOverride, source: tierSource, configured: tierOverride };
+  }
+  const explicit = clampedPositive(env.TOOL_MAX_REQUESTS);
+  if (explicit !== null) {
+    return { route, budget: explicit, source: "explicit", configured: explicit };
+  }
+  if (size !== undefined && size !== null) {
+    const scaled = sizeScaledToolBudget(size, route);
+    if (scaled > TOOL_REQUEST_TIER_DEFAULTS[route]) {
+      return { route, budget: scaled, source: "size-scaled", configured: null };
+    }
+  }
+  return {
+    route,
+    budget: TOOL_REQUEST_TIER_DEFAULTS[route],
+    source: "tier-default",
+    configured: null,
+  };
+}
+
+// ── #1629: the deterministic low-risk evidence envelope ─────────────────
+//
+// A digest-only refresh or a provably all-low-risk lockfile-only refresh
+// (#1595/#1618) carries a tiny mandatory obligation surface and no risk
+// flags, yet the derived request budget still starts at the tier default
+// (40 on the primary route): the #12074 evidence — a no-risk image-digest PR
+// that spent 5 rounds / 7 calls exploring — is what a budget sized for a
+// real diff allows when nothing in it is at stake. The envelope below is
+// the deterministic counterpart of the #1618 scoped review: the budget
+// DECREASES only when the classification positively proves the low-risk
+// shape, and it scales with the mandatory obligation surface the run
+// actually has (the enforced must_check/guidance rows), never with the PR
+// title, the file extension, or an unconditional round/clock cap.
+
+/** Base allowance: corpus/digest verification, the closing verdict prep, and
+ * one spare read. */
+export const LOW_RISK_BUDGET_BASE_REQUESTS = 4;
+/** Extra requests per enforced mandatory obligation row — the rows still get
+ * their evidence; the envelope bounds the OPTIONAL archaeology around them. */
+export const LOW_RISK_BUDGET_REQUESTS_PER_ROW = 2;
+/** Floor: the mandatory evidence must stay reachable even at zero rows. */
+export const LOW_RISK_BUDGET_MIN_REQUESTS = 6;
+/** Ceiling: hard bound on the envelope — no per-package archaeology rides
+ * under a low-risk classification. */
+export const LOW_RISK_BUDGET_MAX_REQUESTS = 12;
+
+/** The digest-only kinds whose checklist is a single local verification row
+ * (KIND_CHECKS: `verify only image digests changed` / `verify no functional
+ * changes beyond lockfile hashes`) — deliberately NOT the
+ * renovate_image_update / image_update / chart_update families, whose
+ * #1379 upstream-evidence obligations (provenance, release delta,
+ * advisories) need real investigation budget. Exported for the harness
+ * reader's fail-open basis ladder. */
+export const LOW_RISK_BUDGET_KINDS: ReadonlySet<string> = new Set([
+  "renovate_digest_only",
+  "image_digest_only",
+]);
+
+/** The classification-artifact signal the envelope derives from — every
+ * field is a number, a boolean, or a bounded enum token from the trusted
+ * deterministic classifier (`classification.json`); no untrusted text. */
+export interface LowRiskBudgetSignal {
+  /** The classifier's `pr_kind` — the harness reader only passes a shaped
+   * (string, non-empty after trim) value, mirroring the role-selection
+   * artifact contract; "" means unshaped and never matches a class. */
+  prKind: string;
+  /** `risk_flags` length — any risk flag retains the full envelope. The
+   * harness reader counts a shaped array or retains outright. */
+  riskFlagCount: number;
+  /** `linked_metadata_uncertain` — the classifier's honest statement that
+   * linked GitHub/Linear issue metadata could not be fully retrieved. True
+   * retains the full envelope: role-selection (`classificationFromArtifact`)
+   * selects every specialist role in exactly this situation, because
+   * missing metadata may conceal security, audit, or priority signals; the
+   * harness reader passes a strict boolean or retains outright. */
+  linkedMetadataUncertain: boolean;
+  /** `lockfile_only_refresh.material` when the #1595 triage ran, else null.
+   * The harness reader only passes an actual non-negative integer — a
+   * coercible value (null / false / "" / "0") is no triage, never a zero. */
+  lockfileOnlyMaterial: number | null;
+  /** `lockfile_only_refresh.parseable` — an unparseable triage fails closed
+   * to material, never opens the envelope. */
+  lockfileOnlyParseable: boolean;
+  /** The enforced mandatory MATERIAL obligation surface: the must_check rows
+   * (after the `VALIDATE_REQUIRED_CHECKS` gate) plus the material derived
+   * admission rows (#1449, `DERIVED_OBLIGATIONS=true`) — the rows the loop's
+   * admission window enforces as material under #1659's vocabulary. Trusted-
+   * base guidance rows stay OUT: they are advisory in #1659's settlement
+   * vocabulary and can never hold a material unknown, and the reservation
+   * window (half the effective budget over ALL admission rows, guidance
+   * included) keeps them attemptable whatever the envelope says. */
+  mandatoryRows: number;
+}
+
+export type LowRiskBudgetBasis = "digest-only" | "low-risk-lockfile";
+
+/**
+ * The low-risk envelope for one signal, or null when the signal does not
+ * PROVE the low-risk shape — fail open to the #810 derived budget. Proof
+ * means: no risk flags at all (a single flag — security, priority, auth —
+ * retains the full envelope: risk escalation outranks proportionality);
+ * linked-issue metadata NOT uncertain (the same uncertainty
+ * `classificationFromArtifact` answers by selecting every specialist role —
+ * missing metadata may conceal risk signals the flags do not carry); and
+ * one of the two positively-verified classes: a digest-only kind, or a
+ * lockfile-only refresh whose triage parsed and found zero material bumps
+ * (the exact #1595 `isLowRiskLockfileOnlyRefresh` semantics). The cap
+ * scales with the enforced MATERIAL rows actually admitted (must_check plus
+ * derived admission rows) and clamps to
+ * [LOW_RISK_BUDGET_MIN_REQUESTS, LOW_RISK_BUDGET_MAX_REQUESTS]; a surface
+ * the clamped envelope's reservation window (floor(cap / 2)) can no longer
+ * cover one-opportunity-per-row is NOT the low-risk shape either —
+ * proportionality must never underfund the mandatory surface, so an
+ * over-wide surface retains the full derived budget.
+ */
+export function lowRiskToolBudgetCap(
+  signal: LowRiskBudgetSignal,
+): { cap: number; basis: LowRiskBudgetBasis; mandatoryRows: number } | null {
+  if (!Number.isInteger(signal.riskFlagCount) || signal.riskFlagCount < 0) return null;
+  if (signal.riskFlagCount > 0) return null;
+  if (typeof signal.linkedMetadataUncertain !== "boolean") return null;
+  if (signal.linkedMetadataUncertain) return null;
+  if (!Number.isInteger(signal.mandatoryRows) || signal.mandatoryRows < 0) return null;
+  const digestOnly = LOW_RISK_BUDGET_KINDS.has(signal.prKind);
+  const lockfileOnly =
+    signal.lockfileOnlyMaterial === 0 && signal.lockfileOnlyParseable;
+  if (!digestOnly && !lockfileOnly) return null;
+  const cap = Math.min(
+    LOW_RISK_BUDGET_MAX_REQUESTS,
+    Math.max(
+      LOW_RISK_BUDGET_MIN_REQUESTS,
+      LOW_RISK_BUDGET_BASE_REQUESTS + signal.mandatoryRows * LOW_RISK_BUDGET_REQUESTS_PER_ROW,
+    ),
+  );
+  // The reservation window inside the envelope is floor(cap / 2) requests —
+  // below the 12-ceiling the 4 + 2n formula guarantees floor(cap / 2) >= n;
+  // at the ceiling a surface wider than 6 rows would leave mandatory rows
+  // without a protected opportunity, so retain instead of underfunding.
+  if (signal.mandatoryRows > Math.floor(cap / 2)) return null;
+  return { cap, basis: digestOnly ? "digest-only" : "low-risk-lockfile", mandatoryRows: signal.mandatoryRows };
+}

@@ -1,0 +1,831 @@
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { join } from "node:path";
+import { validateContract } from "../config/contract.js";
+import { loadConfig } from "../config/load-config.js";
+import { commentBodyTriggersCommentCommand, eventLabelName, type PrecheckEvent } from "../precheck/decide.js";
+import { resolvePlatform } from "../platform/resolve.js";
+import { bindForgejoToken } from "../platform/forgejo-auth.js";
+import { forgejoAncillaryWrite, forgejoApiBase } from "../platform/forgejo-ancillary.js";
+import { requireImplementedBackend } from "../platform/tangled.js";
+import { repoScopedUrl } from "../platform/repo-ref.js";
+import { V3_CONTRACT } from "../../.v3-generated/contract.generated.js";
+import { stageEnvFromConfig } from "./env.js";
+import { buildPublishApi, publishEnvFromReview, publishInputFromEnv, publishWithOutcome, readEvent, reviewDerivedPublishFields, type StepEvent } from "./entrypoints.js";
+import { runActionFollowUp } from "./followup-action.js";
+import { publishStepRuns } from "../publish/publish.js";
+import { buildReviewBundle, type ReviewBundleInput, type ReviewBundleState } from "../publish/bundle.js";
+import {
+  computeReviewAttestation,
+  serializeReviewAttestation,
+  type ReviewAttestation,
+  type ReviewAttestationSignals,
+} from "../publish/attestation.js";
+import { MODEL_UNAVAILABLE_ENGINE } from "../prompt/failure.js";
+import { ACTION_VERSION } from "../version.js";
+import { rawInputsFromEnv, runReview } from "./review.js";
+import { createRunDir } from "./run-dir.js";
+import { blockingGateSummary, escapeWorkflowData, renderBlockingAnnotations } from "./blocking-findings.js";
+
+export { createRunDir };
+
+/**
+ * The JavaScript action entry (`runs.using: node24`, #706): the whole review
+ * in one process — precheck, review, publish, re-review label cleanup and
+ * the fail-on-request-changes gate — with typed state passed between stages
+ * instead of composite step outputs. The runner exports the inputs as
+ * `INPUT_<ID>` with contract defaults already applied.
+ */
+
+type Env = Record<string, string | undefined>;
+
+export function writeOutputs(env: NodeJS.ProcessEnv, outputs: ReadonlyArray<[string, string | undefined]>): void {
+  const file = env.GITHUB_OUTPUT ?? "";
+  if (file === "" || file === "/dev/null") return;
+  let text = "";
+  for (const [key, value] of outputs) {
+    if (value === undefined) continue;
+    if (!value.includes("\n")) {
+      text += `${key}=${value}\n`;
+      continue;
+    }
+    // Random heredoc delimiter, re-drawn if the value contains it, so a
+    // multiline value can never forge another assignment.
+    let delimiter = `ghadelimiter_${randomBytes(16).toString("hex")}`;
+    while (value.includes(delimiter)) delimiter = `ghadelimiter_${randomBytes(16).toString("hex")}`;
+    text += `${key}<<${delimiter}\n${value}\n${delimiter}\n`;
+  }
+  if (text !== "") appendFileSync(file, text);
+}
+
+/** #903: append one already-rendered line to the job's step summary. Like
+ * `writeOutputs`, a no-op outside a runner (no path, or the /dev/null
+ * sentinel). */
+export function appendStepSummary(env: NodeJS.ProcessEnv, line: string): void {
+  const file = env.GITHUB_STEP_SUMMARY ?? "";
+  if (file === "" || file === "/dev/null") return;
+  appendFileSync(file, `${line}\n`);
+}
+
+/** #1425: the PR number as the bundle records it — a positive integer, or
+ * null when the run cannot prove one. Never a parsed-best-effort number: an
+ * unrecognized value is honestly "unknown". */
+function parseBundlePrNumber(value: string | undefined): number | null {
+  const raw = (value ?? "").trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/** #1425: emit the machine-readable review bundle for this run — the
+ * `review-bundle` step output plus a copy in the run directory (when one
+ * exists) for local/eval consumers. The builder redacts and bounds every
+ * field, and the document is a single-line `JSON.stringify` value, so the
+ * step-output writer cannot have its assignment forged by finding text.
+ * Exactly one call per run reaches an output boundary (skip, review, or
+ * failure); the file copy is best-effort and must never fail the run.
+ *
+ * #1576: every boundary additionally writes the `review-attestation` step
+ * output — the one unambiguous machine-readable conclusion
+ * (`approved | blocked | incomplete | unavailable | skipped` plus reason
+ * code and exact head) — and carries the same attestation object inside the
+ * bundle, so the two machine surfaces can never disagree about what this
+ * run concluded. */
+function emitReviewBundle(
+  env: NodeJS.ProcessEnv,
+  runDir: string,
+  reviewId: string,
+  input: Omit<ReviewBundleInput, "reviewId" | "generatedAt">,
+  attestationSignals: ReviewAttestationSignals,
+): void {
+  const attestation = computeReviewAttestation(attestationSignals);
+  const bundle = buildReviewBundle({
+    ...input,
+    attestation,
+    reviewId,
+    generatedAt: new Date().toISOString(),
+  });
+  writeOutputs(env, [
+    ["review-bundle", bundle],
+    ["review-attestation", serializeReviewAttestation(attestation)],
+  ]);
+  if (runDir !== "") {
+    try {
+      writeFileSync(join(runDir, "review-bundle.json"), `${bundle}\n`);
+    } catch {
+      // The run directory is a convenience copy; the step output is the
+      // contract, and neither a missing directory nor a failed write may
+      // change the run's outcome.
+    }
+  }
+}
+
+/** #1425: the bundle lifecycle state for a review-producing run, as a pure
+ * decision the tests pin directly. Precedence: a publication withheld at
+ * the exact-head boundary is `superseded` (the bundle pins the exact
+ * reviewed head so a consumer can prove staleness against the current PR
+ * head); a completed review with an execution or traceability coverage gap
+ * — the same signals the `incomplete-reason` / `review-result` outputs and
+ * the #810 partial-coverage notice carry — is `partial`; otherwise
+ * `complete`. The disposition always describes the review this run
+ * produced, whether or not it was published (same rule as the review-stage
+ * outputs, #1257). */
+export function reviewBundleState(
+  publishStatus: "published" | "superseded" | "failed" | undefined,
+  incompleteReason: string,
+  reviewResult: string,
+  hasPartialCoverage: boolean,
+): ReviewBundleState {
+  if (publishStatus === "superseded") return "superseded";
+  if (incompleteReason !== "none" || reviewResult === "partial" || hasPartialCoverage) return "partial";
+  return "complete";
+}
+
+/** Render untrusted inline text as an inert Markdown code span, following
+ * the repo-wide fence-safe strategy (e.g. `src/context/repo-map.ts`
+ * `codeSpan`): the delimiter is one backtick longer than the longest run in
+ * the content, so embedded backticks, link syntax, or emphasis characters
+ * can neither close the span nor render as Markdown. Padding spaces keep a
+ * boundary backtick from merging into the delimiter — a leading backtick
+ * plus the generated fence would otherwise form a longer opening run,
+ * leaving the span unterminated and the payload exposed as live Markdown.
+ * Control characters are flattened first: the step summary line must stay
+ * one line. */
+function inlineCodeValue(text: string): string {
+  const flat = text.replace(/[\u0000-\u001f\u007f]+/g, " ");
+  if (!flat.includes("`")) return `\`${flat}\``;
+  let maxRun = 0;
+  for (const run of flat.match(/`+/g) ?? []) maxRun = Math.max(maxRun, run.length);
+  const delim = "`".repeat(maxRun + 1);
+  return `${delim} ${flat} ${delim}`;
+}
+
+/** The raw parsed `GITHUB_EVENT_PATH` payload for the follow-up host (the
+ * only consumer that needs more than `readEvent`'s flat `StepEvent` view).
+ * #892 parity with `readEvent`: the runner payload carries NO top-level
+ * `name` — the event name lives only in `GITHUB_EVENT_NAME` — so the name is
+ * filled in here when the payload has none (a payload-provided string name
+ * always wins). Absent or unparseable is `null` — the follow-up host treats
+ * that as "not a follow-up" and the pipeline proceeds exactly as before. */
+function readRawEventPayload(env: NodeJS.ProcessEnv): unknown {
+  const path = env.GITHUB_EVENT_PATH ?? "";
+  if (path === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+  const name = env.GITHUB_EVENT_NAME ?? "";
+  if (name !== "" && parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.name !== "string" && typeof record.event !== "string") {
+      return { ...record, name };
+    }
+  }
+  return parsed;
+}
+
+/** The label a `labeled` event carries (GitHub sends `{ name }`). Moved to
+ * `precheck/decide.ts` (#892) so both `decide.ts`'s label gate and this
+ * cleanup path normalize the same way; re-exported here for callers (and
+ * tests) that already import it from this module. */
+export { eventLabelName };
+
+/** The stage environment every ported stage reads: the typed config
+ * projected to its SCREAMING_SNAKE ABI plus the derived runner context the
+ * composite used to compute in its env blocks. */
+export function actionStageEnv(env: NodeJS.ProcessEnv): Env {
+  const contract = validateContract(V3_CONTRACT);
+  const rawInputs = rawInputsFromEnv(contract, env);
+  // Forgejo Actions injects FORGEJO_TOKEN into the runner environment. It is
+  // not an explicit action input, so it must not reject integration mode.
+  rawInputs["forgejo-token"] = env["INPUT_FORGEJO-TOKEN"] ?? env.INPUT_FORGEJO_TOKEN;
+  const config = loadConfig(contract, rawInputs);
+  const stage: Env = { ...env, ...stageEnvFromConfig(config) };
+  // stageEnvFromConfig projects `github-token` (secret-revealed) as GITHUB_TOKEN.
+  const token = stage.GITHUB_TOKEN || env.GH_TOKEN || "";
+  stage.GH_TOKEN = token;
+  // #1678/#1683: the family's token is bound through the seam's ONE chain
+  // (`bindForgejoToken`), which the engine's admission stage env also calls —
+  // so the alias and the precedence cannot drift between the two lanes.
+  bindForgejoToken(stage, env, token);
+  stage.REPO = stage.REPO || env.GITHUB_REPOSITORY || "";
+  stage.PR_NUMBER = stage.PR_NUMBER || readEvent(env).prNumber || "";
+  const server = env.GITHUB_SERVER_URL ?? "";
+  stage.FORGEJO_API_URL = stage.FORGEJO_API_URL || (server !== "" && server !== "https://github.com" ? server : "");
+  stage.ACTION_REF = env.GITHUB_ACTION_REF ?? "";
+  stage.LINEAR_API_KEY_CONFIGURED = stage.LINEAR_API_KEY ? "true" : "false";
+  return stage;
+}
+
+function shouldPublish(stage: Env): boolean {
+  // The scorer's eligibility gate (src/engine/review.ts) mirrors THIS
+  // decision through the shared `publishStepRuns` predicate. Both sites read
+  // PUBLISH_MODE through the same stage config resolution (one process, per
+  // #726); that shared predicate is what keeps them equivalent — make
+  // publish-mode repo-configurable and the exposure narrows to one value
+  // they already share. #1158: the publish mode alone decides publication;
+  // the legacy publish-review-comment input is deprecated and inert here.
+  return publishStepRuns(stage.PUBLISH_MODE);
+}
+
+export async function actionMain(env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  // #1425: one review ID per process run, paired with the reviewed head SHA
+  // inside the machine-readable bundle to name THIS run's review across
+  // reruns. The wrapper exists solely so an uncaught crash still leaves a
+  // deterministic `failed` bundle behind; the pipeline body and the exit
+  // semantics are unchanged, and the original error always propagates.
+  const reviewId = randomBytes(8).toString("hex");
+  const runDirRef: { dir: string } = { dir: "" };
+  try {
+    return await runActionPipeline(env, reviewId, runDirRef);
+  } catch (error) {
+    try {
+      emitReviewBundle(env, runDirRef.dir, reviewId, {
+        state: "failed",
+        repository: env.GITHUB_REPOSITORY ?? "",
+        prNumber: parseBundlePrNumber(env.PR_NUMBER ?? env["INPUT_PR-NUMBER"]),
+        headSha: "",
+        baseSha: "",
+        identity: { diffFingerprint: "", analysisEngine: "", actionVersion: ACTION_VERSION },
+        failureReason: error instanceof Error && error.message !== "" ? error.message : "unknown error",
+        findings: [],
+      }, { crashed: true });
+    } catch {
+      // The failure bundle is best-effort: a bundle-write failure must
+      // never mask the original error the pipeline propagates. #1576: the
+      // append-based output writer is last-write-wins, so a crash AFTER a
+      // boundary already emitted an attestation overwrites it with
+      // `unavailable`/`run_crashed` — fail-closed on purpose: a consumer
+      // never sees a trusted approval from a run that ended in a crash.
+    }
+    throw error;
+  }
+}
+
+async function runActionPipeline(
+  env: NodeJS.ProcessEnv,
+  reviewId: string,
+  runDirRef: { dir: string },
+): Promise<number> {
+  const stage = actionStageEnv(env);
+  const { event, headSha: eventHeadSha } = readEvent(env);
+  stage.EVENT_HEAD_SHA = eventHeadSha ?? "";
+
+  // ── Comment on a plain issue: clean no-op ─────────────────────────────
+  // #914: a `created` `issue_comment` on a PLAIN issue (the payload's
+  // `issue` has no `pull_request`) is not a re-review request at all.
+  // `runPrecheck` REQUIRES a PR number (it throws without one), so this
+  // must be a clean green no-op HERE, before precheck, not a crash.
+  // `readEvent` only fills PR_NUMBER from `issue.number` when
+  // `issue.pull_request` is present, so an empty PR_NUMBER is the honest
+  // "this comment is not on a PR" signal. The reason is one of this
+  // action's fixed constants; no untrusted text is rendered.
+  if (
+    event?.name === "issue_comment"
+    && event.action === "created"
+    && (stage.PR_NUMBER ?? "") === ""
+  ) {
+    writeOutputs(env, [
+      ["should-review", "false"],
+      ["skip-reason", "comment-not-on-pr"],
+      ["verdict", ""],
+      ["verdict-source", ""],
+      ["review-result", ""],
+    ]);
+    // #1425: the machine surface mirrors the no-op — a deterministic
+    // `skipped` bundle with no disposition (nothing ran, nothing carried).
+    emitReviewBundle(env, "", reviewId, {
+      state: "skipped",
+      repository: stage.REPO ?? "",
+      prNumber: parseBundlePrNumber(stage.PR_NUMBER),
+      headSha: eventHeadSha ?? "",
+      baseSha: "",
+      identity: { diffFingerprint: "", analysisEngine: "", actionVersion: ACTION_VERSION },
+      skipReason: "comment-not-on-pr",
+      findings: [],
+    }, { reviewProduced: false, headSha: eventHeadSha ?? "" });
+    process.stderr.write("[v3] Review skipped: comment-not-on-pr\n");
+    appendStepSummary(env, "**AI PR Review skipped:** `comment-not-on-pr`");
+    return 0;
+  }
+
+  // ── Conversational follow-ups (#1294) ─────────────────────────────────
+  // A `created` `issue_comment` on a PR goes through the shared follow-up
+  // consumer BEFORE the review pipeline: an authorized question addressed to
+  // the reviewer gets a rendered reply (posted through the publish seam,
+  // verdict-free by construction) and consumes no review; an explicit
+  // re-review command falls through so the shipped pipeline below stays the
+  // single owner of review generations (its own admission, exact-head
+  // checks, enforcement, publication, dedup). An `ignored` plan also falls
+  // through — today's precheck skip wording ("unrelated-comment",
+  // "comment-unauthorized", …) is behavior-preserved, and the consumer
+  // performed no write and no model call for it.
+  if (
+    event?.name === "issue_comment"
+    && event.action === "created"
+    && (stage.PR_NUMBER ?? "") !== ""
+  ) {
+    const followUp = await runActionFollowUp(stage as NodeJS.ProcessEnv, readRawEventPayload(env));
+    if (followUp.route === "follow-up" && followUp.outcome.status !== "ignored") {
+      const answered = followUp.outcome.status === "answered" && followUp.outcome.posted;
+      const followUpReason = answered ? "follow-up-answered" : "follow-up-answer-failed";
+      writeOutputs(env, [
+        ["should-review", "false"],
+        ["skip-reason", followUpReason],
+        ["verdict", ""],
+        ["verdict-source", ""],
+        ["review-result", ""],
+      ]);
+      // #1425: the follow-up consumption is a deterministic `skipped`
+      // bundle — the fixed reason constant is the only new text.
+      emitReviewBundle(env, "", reviewId, {
+        state: "skipped",
+        repository: stage.REPO ?? "",
+        prNumber: parseBundlePrNumber(stage.PR_NUMBER),
+        headSha: eventHeadSha ?? "",
+        baseSha: "",
+        identity: { diffFingerprint: "", analysisEngine: "", actionVersion: ACTION_VERSION },
+        skipReason: followUpReason,
+        findings: [],
+      }, { reviewProduced: false, headSha: eventHeadSha ?? "" });
+      // Only fixed constants on both surfaces — no comment body, prompt, or
+      // answer text ever reaches the log or the step summary.
+      process.stderr.write(`[v3] Follow-up handled: ${followUpReason}\n`);
+      appendStepSummary(
+        env,
+        `**AI PR Review follow-up:** ${answered ? "answered the question in the PR conversation" : "could not post an answer"} (\`${followUpReason}\`).`,
+      );
+      return 0;
+    }
+  }
+
+  // ── Review ────────────────────────────────────────────────────────────
+  // #726: the precheck/fingerprint DECISION now runs inside the engine as
+  // its admission stage — this adapter passes the received event through and
+  // supplies the between-stage side effect (the #914 ack reaction) via
+  // `onAdmission`, invoked after a passing admission and before any review
+  // stage. Event reception (and the comment-not-on-pr no-op above) stays
+  // host-owned.
+  const temp = env.RUNNER_TEMP || env.TMPDIR || "/tmp";
+  stage.CI_CHECKS_FILE = join(temp, "ci-checks-context.md");
+  const runDir = createRunDir(temp);
+  stage.PR_REVIEWER_RUN_DIR = runDir;
+  runDirRef.dir = runDir;
+  const review = await runReview({
+    env: stage as NodeJS.ProcessEnv,
+    runDir,
+    workspace: env.GITHUB_WORKSPACE ?? process.cwd(),
+    ...(event !== undefined ? { event: event as PrecheckEvent } : {}),
+    ...(eventHeadSha !== undefined ? { eventHeadSha } : {}),
+    // #726 review: the three precheck outputs are written the moment
+    // admission passes — the old flow wrote them right after precheck, and a
+    // mid-review engine crash must still leave should-review behind for the
+    // gate consumers. The ack reaction follows; the skip path is unchanged
+    // (the host writes all outputs after the early return).
+    onAdmission: (admission) => {
+      writeOutputs(env, [
+        ["should-review", "true"],
+        ["skip-reason", ""],
+        ["diff-fingerprint", admission.diff_fingerprint],
+      ]);
+      return postAdmissionAckReaction(stage, event);
+    },
+  });
+  // #726: the admission decision arrives on the result (both paths).
+  const pre = review.admission;
+
+  writeOutputs(env, [
+    ["should-review", review.shouldReview ? "true" : "false"],
+    ["skip-reason", review.skipReason],
+    ["diff-fingerprint", review.diffFingerprint],
+  ]);
+  if (!review.shouldReview) {
+    writeOutputs(env, [["verdict", pre.verdict], ["verdict-source", pre.verdict_source], ["review-result", pre.review_result], ["incomplete-reason", pre.incomplete_reason]]);
+    // #1425: deterministic `skipped` machine state. The disposition carries
+    // whatever verdict the skip retained (`verdict_source` names its origin,
+    // e.g. `carry_forward`); the findings of a carried verdict live in that
+    // earlier run's bundle, exactly as the step summary points there.
+    emitReviewBundle(env, runDir, reviewId, {
+      state: "skipped",
+      repository: stage.REPO ?? "",
+      prNumber: parseBundlePrNumber(stage.PR_NUMBER),
+      headSha: review.reviewedHeadSha || pre.head_sha,
+      baseSha: pre.base_sha,
+      identity: { diffFingerprint: review.diffFingerprint, analysisEngine: "", actionVersion: ACTION_VERSION },
+      disposition: {
+        verdict: pre.verdict ?? "",
+        verdictSource: pre.verdict_source ?? "",
+        requiredChecks: "",
+        reviewResult: pre.review_result ?? "",
+        incompleteReason: pre.incomplete_reason ?? "",
+        degraded: pre.degradedGateBypass === true,
+      },
+      skipReason: pre.skip_reason ?? "",
+      findings: [],
+    }, {
+      // #1576: a skipped run attests NOTHING about approval — a carried
+      // verdict belongs to the earlier run's attestation, never this one.
+      reviewProduced: false,
+      headSha: review.reviewedHeadSha || pre.head_sha || "",
+    });
+    // #903: this branch used to exit silently — outputs written, no log
+    // line, no step summary — so a labeler-triggered skip showed the same
+    // green check as a run that crashed before doing anything. The event
+    // label is untrusted payload and the two surfaces are different fences:
+    // the stderr line quotes it as JSON (control characters become
+    // escapes, so no forged log lines), while the Markdown summary renders
+    // it as a fence-safe code span (JSON escaping does not neutralize
+    // backticks or link syntax). The reason is one of this action's fixed
+    // constants and is interpolated directly.
+    const skipLabel = eventLabelName(event?.label);
+    const carryLabel = pre.skip_reason === "unrelated-label" && skipLabel !== "";
+    const skipReason = pre.skip_reason || "<none>";
+    process.stderr.write(
+      `[v3] Review skipped: ${skipReason}${carryLabel ? ` (label: ${JSON.stringify(skipLabel)})` : ""}\n`,
+    );
+    appendStepSummary(
+      env,
+      `**AI PR Review skipped:** \`${skipReason}\`${carryLabel ? ` (label: ${inlineCodeValue(skipLabel)})` : ""}`,
+    );
+    // #914: a matching re-review command on a FORK PR is not reviewable with
+    // a repo token (fork PRs belong to the fork workflow — see
+    // docs/fork-review.md), so the run replies to the comment pointing the
+    // commenter there. The reply body is fixed wording plus the
+    // operator-configured command (never comment content) — and the reply is
+    // additionally gated on the
+    // comment-body trigger: `comment-fork-pr` is only reachable with a
+    // matched authorized comment, but the gate keeps that invariant honest
+    // at this seam. Best-effort: a failed reply never fails the run. No ack
+    // reaction on this path (no review started).
+    if (pre.skip_reason === "comment-fork-pr" && acceptedViaCommentCommand(stage, event)) {
+      process.stderr.write(`[v3] posting re-review fork reply on PR ${JSON.stringify(stage.PR_NUMBER ?? "")}\n`);
+      await postForkPrCommentReply(stage).catch(() => undefined);
+    }
+    await maybeClearRereviewLabel(stage, event);
+    // #975: a carried request_changes verdict means the last review — of
+    // `pre.head_sha`, trusted precheck metadata — already recorded the
+    // findings; this run has none of its own, so nothing is carried as
+    // findings, and the pointer names the run to look at.
+    const carriedPointer = pre.verdict === "request_changes"
+      ? `The verdict was carried from the review of ${pre.head_sha !== "" ? pre.head_sha : "<unknown>"}; its findings are in that run's step summary.`
+      : "";
+    return failOnRequestChanges(stage, pre.verdict ?? "", pre.degradedGateBypass === true, (stage.FAIL_ON_DEGRADED_REVIEW ?? "false").toLowerCase() === "true", "", carriedPointer);
+  }
+
+  // ── Publish ───────────────────────────────────────────────────────────
+  let publishFailed = false;
+  let publishStatus: "published" | "superseded" | "failed" | undefined;
+  // #1576: the verdict-bearing native submission record, relayed from the
+  // publish outcome — the ONLY proof that can certify `approved`. A
+  // `fellBack` record (the body-only plain-review fallback, #1249) landed
+  // without a `commit_id` and certifies no head — the attestation reads
+  // that flag and never attests `approved` from it.
+  let publishNative: { event: string; submitted: boolean; fellBack?: true } | undefined;
+  if (shouldPublish(stage)) {
+    // #590: the review→publish-environment mapping and the per-run evidence
+    // fields are shared with the host-neutral platform runner (entrypoints.ts),
+    // so a Tangled run publishes exactly the same record this Action would for
+    // the identical engine result — the two hosts can never drift.
+    const publishEnv: Env = publishEnvFromReview(stage, review, eventHeadSha);
+    const seam = buildPublishApi(publishEnv as NodeJS.ProcessEnv, runDir);
+    // The event-gated maybeClearRereviewLabel below owns label cleanup here;
+    // publish's own rerunLabel strip would fire on every run, not just
+    // label-triggered ones.
+    const { rerunLabel: _rerunLabel, ...publishInput } = publishInputFromEnv(publishEnv as NodeJS.ProcessEnv, seam.platform);
+    // #1518: the run's own review id rides the publish input, so the
+    // published handoff names the same review the `review-bundle` output
+    // names (one id per run, paired with the reviewed head).
+    const input = { ...publishInput, ...reviewDerivedPublishFields(review), reviewId };
+    const publish = await publishWithOutcome(input, seam, runDir);
+    // #1257: the review-step outputs describe the review this run PRODUCED;
+    // a superseded publication exits 0 exactly like a published one, so this
+    // output is what disambiguates them for downstream consumers. Written
+    // only when publication was attempted — absent means "not attempted"
+    // (see the publish-status contract description).
+    writeOutputs(env, [["publish-status", publish.status]]);
+    publishStatus = publish.status;
+    publishNative = publish.native;
+    publishFailed = publish.exitCode !== 0;
+  }
+
+  // #1425: the machine-readable bundle for a review this run produced
+  // (state precedence documented on `reviewBundleState`).
+  const bundleState = reviewBundleState(
+    publishStatus,
+    review.outputs.incompleteReason,
+    review.outputs.reviewResult,
+    review.partialCoverage !== undefined,
+  );
+  // The exact head this run reviewed — the bundle head SHA and the
+  // #1576 attestation head SHA are ONE value, so the two machine surfaces
+  // can never bind their conclusions to different commits.
+  const reviewedHeadSha = review.reviewedHeadSha || eventHeadSha || pre.head_sha;
+  const attestationSignals: ReviewAttestationSignals = {
+    reviewProduced: true,
+    modelUnavailable: review.outputs.analysisEngine === MODEL_UNAVAILABLE_ENGINE,
+    degraded: review.outputs.degradedGateBypass === true,
+    verdict: review.outputs.verdict,
+    requiredChecks: review.outputs.requiredChecks,
+    reviewResult: review.outputs.reviewResult,
+    incompleteReason: review.outputs.incompleteReason,
+    partialCoverage: review.partialCoverage !== undefined,
+    // #1656: the authoritative disposition — when present it owns the
+    // semantic conclusion and only the publication proof is decided here.
+    ...(review.finalDisposition !== undefined ? { disposition: review.finalDisposition } : {}),
+    headSha: reviewedHeadSha,
+    ...(publishStatus !== undefined
+      ? { publication: { status: publishStatus, ...(publishNative !== undefined ? { native: publishNative } : {}) } }
+      : {}),
+  };
+  emitReviewBundle(env, runDir, reviewId, {
+    state: bundleState,
+    repository: stage.REPO ?? "",
+    prNumber: parseBundlePrNumber(stage.PR_NUMBER),
+    headSha: reviewedHeadSha,
+    baseSha: pre.base_sha,
+    identity: {
+      diffFingerprint: review.diffFingerprint,
+      analysisEngine: review.outputs.analysisEngine,
+      actionVersion: ACTION_VERSION,
+    },
+    disposition: {
+      verdict: review.outputs.verdict,
+      verdictSource: review.outputs.verdictSource,
+      requiredChecks: review.outputs.requiredChecks,
+      reviewResult: review.outputs.reviewResult,
+      incompleteReason: review.outputs.incompleteReason,
+      degraded: review.outputs.degradedGateBypass === true,
+      // #1656: the authoritative disposition's kind and reason ride the
+      // bundle so the machine surface names WHAT the run concluded in the
+      // shared vocabulary.
+      ...(review.finalDisposition !== undefined ? { dispositionKind: review.finalDisposition.kind } : {}),
+      ...(review.finalDisposition !== undefined ? { dispositionReason: review.finalDisposition.reason } : {}),
+    },
+    ...(publishStatus !== undefined ? { publication: { status: publishStatus } } : {}),
+    findings: review.outputs.findings,
+    // #1518: the enforcement pass's merge-gating ids ride the local bundle
+    // too, on the same presence rule as the findings set.
+    ...(review.unresolvedRequirementIds !== undefined ? { unresolvedRequirementIds: review.unresolvedRequirementIds } : {}),
+    ...(review.unresolvedRequiredChecks !== undefined ? { unresolvedRequiredChecks: review.unresolvedRequiredChecks } : {}),
+    // #1541: the count the enforcement pass produced before the shared id
+    // cap shortened those lists. It rides the local bundle too, so a
+    // consumer can tell that the cap dropped ids.
+    ...(review.unresolvedRequirementIdsSourceTotal !== undefined ? { unresolvedRequirementIdsSourceTotal: review.unresolvedRequirementIdsSourceTotal } : {}),
+    ...(review.unresolvedRequiredChecksSourceTotal !== undefined ? { unresolvedRequiredChecksSourceTotal: review.unresolvedRequiredChecksSourceTotal } : {}),
+    // #1521: the obligation ROWS that blocked the review, plus the run's
+    // derived-obligation state — the local bundle names what blocked the
+    // review exactly like the published handoff does.
+    ...(review.unresolvedReviewObligations !== undefined ? { unresolvedReviewObligations: review.unresolvedReviewObligations } : {}),
+    ...(review.derivedObligationState !== undefined ? { derivedObligationState: review.derivedObligationState } : {}),
+  }, attestationSignals);
+
+  // ── Re-review label ───────────────────────────────────────────────────
+  await maybeClearRereviewLabel(stage, event);
+
+  const gate = failOnRequestChanges(
+    stage,
+    review.outputs.verdict,
+    review.outputs.degradedGateBypass,
+    (stage.FAIL_ON_DEGRADED_REVIEW ?? "false").toLowerCase() === "true",
+    review.outputs.findings,
+    "",
+    // #1656 audit round 2: the authoritative disposition gates the
+    // workflow, never the raw verdict.
+    review.finalDisposition?.kind,
+  );
+  return publishFailed ? Math.max(gate, 1) : gate;
+}
+
+/** #975: the fail-on-request-changes gate. Exported for tests (the
+ * blocking-finding renderer it calls is pure — see
+ * `./blocking-findings.ts`). A blocking verdict writes the blocking
+ * findings FIRST, as `::error file=...::` workflow-command annotations, so
+ * they land on the failed check and the Files tab; then the gate line
+ * itself, whose one-line summary names the blocking count and the first
+ * finding. `carriedPointer` (a run skipped by precheck that carries a
+ * `request_changes` verdict from an earlier review — this run recorded no
+ * findings of its own) is appended, space-separated, to BOTH the gate line
+ * and the step summary, so the (otherwise empty) summary still points at
+ * the run whose findings explain the failure. A degraded-review-eligible
+ * `request_changes` verdict (fallback with no evidence, or a model-failure
+ * notice) warns and returns 0 unless `failOnDegraded` is set. */
+export function failOnRequestChanges(
+  stage: Env,
+  verdict: string,
+  degradedGateBypassEligible = false,
+  failOnDegraded = false,
+  findingsJson = "",
+  carriedPointer = "",
+  /** #1656 audit round 2: the FINAL disposition kind when the run produced
+   * one. It is the gate's authority on #1656 runs: only a
+   * `request_changes` DISPOSITION fails the workflow — an INCOMPLETE or
+   * UNAVAILABLE review never blocks merely because the raw model verdict
+   * said request_changes. Absent (the carried/precheck skip path, where no
+   * disposition exists) keeps the legacy verdict-based behavior. */
+  dispositionKind?: string,
+): number {
+  if ((stage.FAIL_ON_REQUEST_CHANGES ?? "false").toLowerCase() !== "true") return 0;
+  if (dispositionKind !== undefined) {
+    if (dispositionKind !== "request_changes") {
+      if (dispositionKind === "unavailable" && degradedGateBypassEligible && failOnDegraded) {
+        // The operator's explicit degraded-review failure opt-in (#978)
+        // still applies to an UNAVAILABLE review.
+        process.stdout.write("::warning::Final disposition is unavailable (degraded review), and fail-on-degraded-review=true is set.\n");
+        return 1;
+      }
+      process.stdout.write(`Final disposition is '${dispositionKind}'; not blocking (fail-on-request-changes=true).\n`);
+      return 0;
+    }
+    // kind request_changes: fall through to the shared blocking path with
+    // the final verdict.
+  } else if (verdict !== "request_changes") {
+    process.stdout.write(`Final verdict is '${verdict || "<none>"}'; not blocking (fail-on-request-changes=true).\n`);
+    return 0;
+  } else if (degradedGateBypassEligible && !failOnDegraded) {
+    process.stdout.write("::warning::Final verdict is request_changes, but this review is eligible for the degraded gate bypass (fallback with no evidence, or model-failure notice); not blocking (fail-on-request-changes=true, fail-on-degraded-review=false).\n");
+    return 0;
+  }
+  let parsed: unknown = [];
+  if (findingsJson !== "") {
+    try {
+      const value = JSON.parse(findingsJson);
+      if (Array.isArray(value)) parsed = value;
+    } catch {
+      parsed = [];
+    }
+  }
+  for (const line of renderBlockingAnnotations(parsed)) {
+    process.stdout.write(line + "\n");
+  }
+  const summary = blockingGateSummary(parsed);
+  // `blockingGateSummary` returns "" only when no blocker/major finding
+  // exists at all — a locationless blocker still counts there.
+  const gate = summary !== "" ? summary : "no blocker/major finding was recorded";
+  const suffix = carriedPointer !== "" ? ` ${carriedPointer}` : "";
+  // The finding text is model-controlled, so both surfaces get their own
+  // escaping: control-character flattening keeps every rendered string one
+  // line, `escapeWorkflowData` on the command data (percent LAST would
+  // re-encode, so it runs percent-first inside the helper) stops a literal
+  // `%0A`/`%25` surviving into the runner's decode as a forged newline or
+  // command, and the Markdown step summary gets the file's fence-safe
+  // `inlineCodeValue` code span — one line, and it cannot open a link,
+  // heading, or fence (#903 precedent for untrusted text on this surface).
+  // `sanitizeMarkdown(..., "inert")` used to be this fence, but its inert
+  // mode is an identity for non-GitHub markdown links, so a hostile
+  // `](https://…)` payload stayed a clickable untrusted link on the
+  // summary.
+  const message = `fail-on-request-changes=true and the final verdict is request_changes: ${gate}${suffix}`
+    .replace(/[\u0000-\u001f\u007f]+/g, " ");
+  process.stdout.write(`::error::${escapeWorkflowData(message)}\n`);
+  if (carriedPointer !== "") {
+    appendStepSummary(stage, `**AI PR Review failed:** ${inlineCodeValue(message)}`);
+  }
+  return 1;
+}
+
+/** Clears the rerun label whenever this run was actually triggered by it —
+ * an event `action === "labeled"` whose label name matches `REREVIEW_LABEL`
+ * — regardless of whether the run went on to review or skip (#892: the
+ * skip branch used to `return` before this ran at all, stranding the
+ * label). Never clears on any other trigger (push, `synchronize`, an
+ * unrelated label, etc). */
+async function maybeClearRereviewLabel(stage: Env, event: StepEvent | undefined): Promise<void> {
+  const label = eventLabelName(event?.label);
+  if (event?.action === "labeled" && label !== "" && label === stage.REREVIEW_LABEL) {
+    await clearRereviewLabel(stage).catch(() => undefined);
+  }
+}
+
+async function clearRereviewLabel(stage: Env): Promise<void> {
+  const platform = resolvePlatform(stage.PLATFORM, stage.FORGEJO_API_URL ?? "", stage.GITHUB_SERVER_URL ?? "", stage.TANGLED_REPO_DID ?? "");
+  requireImplementedBackend(platform);
+  const label = stage.REREVIEW_LABEL ?? "";
+  const pr = stage.PR_NUMBER ?? "";
+  if (label === "" || !/^\d+$/.test(pr)) return;
+  const base = platform === "forgejo"
+    ? forgejoApiBase(stage)
+    : (stage.GITHUB_API_URL || "https://api.github.com");
+  const url = repoScopedUrl(base, stage.REPO ?? "", `/issues/${pr}/labels`, `/${encodeURIComponent(label)}`);
+  if (url === null) return;
+  if (platform === "forgejo") {
+    await forgejoAncillaryWrite(stage, url, "DELETE");
+    return;
+  }
+  await fetch(url, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${stage.GH_TOKEN ?? ""}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15000),
+  });
+}
+
+/** #914: "this run was accepted via the comment command" — a `created`
+ * `issue_comment` whose body is exactly the configured command. The command
+ * match here is RECOGNITION only: precheck has already authorized the run
+ * (permission check, fork gate) or skipped it, and a disabled command can
+ * never reach `should_review: "true"` in the first place. */
+function acceptedViaCommentCommand(stage: Env, event: StepEvent | undefined): boolean {
+  return (
+    event?.name === "issue_comment"
+    && event.action === "created"
+    && typeof event.comment?.body === "string"
+    && commentBodyTriggersCommentCommand(event.comment.body, (stage.REREVIEW_COMMAND ?? "").trim())
+  );
+}
+
+/** #914: an accepted comment-command re-review gets an immediate 👀 ack
+ * reaction on the triggering comment, BEFORE the (slow) review stage, so the
+ * commenter knows the run picked the command up. Supplied to the engine as
+ * `onAdmission` (#726): invoked after a passing admission, before any review
+ * stage — the same ordering the in-process precheck path had. Best-effort: a
+ * failed reaction degrades to a log line, never a failed run. */
+async function postAdmissionAckReaction(stage: Env, event: StepEvent | undefined): Promise<void> {
+  if (!acceptedViaCommentCommand(stage, event)) return;
+  const commentId = event?.comment?.id;
+  if (isUsableCommentId(commentId)) {
+    process.stderr.write(`[v3] posting re-review ack reaction on comment ${JSON.stringify(commentId)}\n`);
+    await postCommentAckReaction(stage, commentId).catch(() => undefined);
+  } else {
+    process.stderr.write(`[v3] re-review ack skipped: comment id ${JSON.stringify(commentId) ?? "null"}\n`);
+  }
+}
+
+/** #914: a comment id that may safely appear in a URL path: a finite number
+ * or an all-digit string (GitHub/Forgejo comment ids). Anything else means
+ * no ack — the run is never degraded by an unusable id. */
+function isUsableCommentId(id: number | string | undefined): id is number | string {
+  if (typeof id === "number") return Number.isFinite(id);
+  if (typeof id === "string") return /^\d+$/.test(id);
+  return false;
+}
+
+/** #914: best-effort 👀 (ack) reaction on the comment that triggered an
+ * accepted re-review. Same seam as `clearRereviewLabel` (resolvePlatform +
+ * requireImplementedBackend, repoScopedUrl, Bearer/token Authorization,
+ * 15 s timeout); the fetch failure is swallowed — the ack must never fail
+ * the run. */
+async function postCommentAckReaction(stage: Env, commentId: number | string): Promise<void> {
+  const platform = resolvePlatform(stage.PLATFORM, stage.FORGEJO_API_URL ?? "", stage.GITHUB_SERVER_URL ?? "", stage.TANGLED_REPO_DID ?? "");
+  requireImplementedBackend(platform);
+  const base = platform === "forgejo"
+    ? forgejoApiBase(stage)
+    : (stage.GITHUB_API_URL || "https://api.github.com");
+  const url = repoScopedUrl(base, stage.REPO ?? "", `/issues/comments/${encodeURIComponent(String(commentId))}/reactions`);
+  if (url === null) return;
+  if (platform === "forgejo") {
+    await forgejoAncillaryWrite(stage, url, "POST", { content: "eyes" });
+    return;
+  }
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${stage.GH_TOKEN ?? ""}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ content: "eyes" }),
+    signal: AbortSignal.timeout(15000),
+  }).catch(() => undefined);
+}
+
+/** #914: best-effort reply to a re-review command comment on a fork PR,
+ * pointing the commenter at the `ai-review-fork` label workflow. The body
+ * names the configured `rereview-command` — trusted operator input, rendered
+ * in backticks only when it is a non-empty run of printable ASCII (no
+ * whitespace, ≤ 80 chars) carrying no backtick of its own (a backtick in
+ * the command would close the code span early); any other value falls back
+ * to backtick-free wording that names no command at all. Same seam as the
+ * ack reaction; the fetch failure is swallowed — a failed reply must never
+ * fail the run. */
+async function postForkPrCommentReply(stage: Env): Promise<void> {
+  const platform = resolvePlatform(stage.PLATFORM, stage.FORGEJO_API_URL ?? "", stage.GITHUB_SERVER_URL ?? "", stage.TANGLED_REPO_DID ?? "");
+  requireImplementedBackend(platform);
+  const pr = stage.PR_NUMBER ?? "";
+  if (!/^\d+$/.test(pr)) return;
+  const base = platform === "forgejo"
+    ? forgejoApiBase(stage)
+    : (stage.GITHUB_API_URL || "https://api.github.com");
+  const url = repoScopedUrl(base, stage.REPO ?? "", `/issues/${pr}/comments`);
+  if (url === null) return;
+  const command = (stage.REREVIEW_COMMAND ?? "").trim();
+  const namesCommand =
+    command.length > 0 && command.length <= 80 && /^[\x21-\x7E]+$/.test(command) && !command.includes("`");
+  const replyBody = namesCommand
+    ? `The \`${command}\` command does not run on fork PRs. To review a fork PR, a maintainer adds the \`ai-review-fork\` label — see docs/fork-review.md.`
+    : "The re-review command does not run on fork PRs. To review a fork PR, a maintainer adds the ai-review-fork label — see docs/fork-review.md.";
+  if (platform === "forgejo") {
+    await forgejoAncillaryWrite(stage, url, "POST", { body: replyBody });
+    return;
+  }
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${stage.GH_TOKEN ?? ""}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body: replyBody }),
+    signal: AbortSignal.timeout(15000),
+  }).catch(() => undefined);
+}

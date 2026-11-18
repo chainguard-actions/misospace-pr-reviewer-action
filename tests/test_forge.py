@@ -1,0 +1,1187 @@
+"""Unit tests for :mod:`pr_reviewer.forge`.
+
+The forge capability is the one place the Python tooling talks to the
+host API. These tests pin the five properties every forge read/write
+relies on:
+
+- redirects are refused (the bearer token must never follow a 3xx to a
+  different origin — the ``#855``-class risk a hand-rolled ``urlopen``
+  would expose);
+- the base URL must use HTTPS for every non-loopback origin so the
+  bearer token is never sent over plaintext HTTP — loopback HTTP is
+  permitted only because the credential never leaves the host;
+- the token rides only the ``Authorization`` header, never the URL or
+  the body or argv;
+- a request URL is bound to the validated base; an absolute URL or a
+  path that contains CR/LF/whitespace is rejected before any network
+  call;
+- the error string never carries the token or the raw response body
+  (a hostile server could otherwise reflect the credential back into a
+  value that reaches callers or logs).
+
+No real network: every test either stubs an in-process HTTP server or
+exercises the request-building path before any byte goes out.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from pr_reviewer import forge  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# URL building and request shape
+# ---------------------------------------------------------------------------
+
+
+class TestForgeClientBuildsValidRequest:
+    def test_default_base_url_is_github(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        client = forge.ForgeClient()
+        assert client.base_url == "https://api.github.com"
+
+    def test_github_api_url_override_is_respected(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_API_URL", "https://ghe.example.com/api/v3")
+        client = forge.ForgeClient()
+        assert client.base_url == "https://ghe.example.com/api/v3"
+
+    def test_invalid_github_api_url_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_API_URL", "javascript:alert(1)")
+        with pytest.raises(forge.ForgeError, match="invalid GITHUB_API_URL"):
+            forge.ForgeClient()
+
+    def test_token_is_read_from_github_token_env(self, monkeypatch):
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN", "secret-a")
+        client = forge.ForgeClient()
+        assert client.token == "secret-a"
+
+    def test_token_is_read_from_gh_token_env(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.setenv("GH_TOKEN", "secret-b")
+        client = forge.ForgeClient()
+        assert client.token == "secret-b"
+
+    def test_explicit_token_wins_over_environment(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "env-token")
+        client = forge.ForgeClient(token="explicit-token")
+        assert client.token == "explicit-token"
+
+    def test_absent_token_is_empty_string(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        client = forge.ForgeClient()
+        assert client.token == ""
+
+
+class TestForgeClientRequiresHTTPSForNonLoopbackBase:
+    """The bearer token must ride only an encrypted transport for any host
+    the credential could leave the machine. Loopback HTTP is permitted
+    only because the request never leaves the box; a configured
+    ``http://ghe.example.com`` (or accidental ``http://`` override) would
+    attach ``Authorization: Bearer <token>`` to a cleartext request and
+    leak the credential on any network an attacker can observe. The
+    base-URL guard rejects that combination at ``__init__`` time, before
+    any byte goes out, and refuses to construct the client at all.
+    """
+
+    def test_http_to_non_loopback_hostname_is_rejected(self):
+        with pytest.raises(forge.ForgeError, match="non-loopback HTTP"):
+            forge.ForgeClient(base_url="http://ghe.example.com/api/v3")
+
+    def test_http_to_non_loopback_ipv4_is_rejected(self):
+        with pytest.raises(forge.ForgeError, match="non-loopback HTTP"):
+            forge.ForgeClient(base_url="http://10.0.0.1/api/v3")
+
+    def test_http_to_loopback_ipv4_is_allowed(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        client = forge.ForgeClient(
+            base_url="http://127.0.0.1:8080/api/v3", token="loopback-secret"
+        )
+        assert client.base_url == "http://127.0.0.1:8080/api/v3"
+
+    def test_http_to_localhost_is_allowed(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        client = forge.ForgeClient(base_url="http://localhost/api/v3")
+        assert client.base_url == "http://localhost/api/v3"
+
+    def test_http_to_ipv6_loopback_is_allowed(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_API_URL", raising=False)
+        client = forge.ForgeClient(base_url="http://[::1]:8080/api/v3")
+        assert client.base_url == "http://[::1]:8080/api/v3"
+
+    def test_https_to_non_loopback_host_is_allowed(self):
+        client = forge.ForgeClient(
+            base_url="https://ghe.example.com/api/v3", token="enterprise-token"
+        )
+        assert client.base_url == "https://ghe.example.com/api/v3"
+        assert client.token == "enterprise-token"
+
+    def test_token_with_non_loopback_http_fails_before_request(self):
+        """A token + non-loopback HTTP base URL must raise ForgeError at
+        ``__init__`` so no byte is ever put on the wire carrying the
+        credential. The test asserts (a) construction fails, (b) the
+        error is the documented ForgeError from the base-URL guard, and
+        (c) no network request is made — verified by a local socket
+        listener bound to ``127.0.0.1`` that records every connection
+        and is asserted empty. The base URL still names the would-be
+        attacker host, so the constructor rejection (not a connection
+        refusal) is what stopped the credential. A failure mode where
+        the guard passes and the client later opened a TCP socket would
+        still leak the credential on the first byte.
+        """
+        contacted = {"count": 0}
+
+        class CountingHandler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                contacted["count"] += 1
+                super().handle_one_request()
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        class CountingServer(HTTPServer):
+            def process_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                contacted["count"] += 1
+                super().process_request(*args, **kwargs)
+
+        server = CountingServer(("127.0.0.1", 0), CountingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            SECRET = "would-leak-on-http"
+            with pytest.raises(forge.ForgeError, match="non-loopback HTTP"):
+                forge.ForgeClient(
+                    base_url="http://attacker.example.com/api/v3",
+                    token=SECRET,
+                )
+            assert contacted["count"] == 0, (
+                "the base-URL guard must refuse to construct the client "
+                "before any TCP connection — a token should never reach "
+                "the wire over plaintext HTTP"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_token_with_non_loopback_http_via_env_fails_before_request(self, monkeypatch):
+        """The ``GITHUB_API_URL`` env-var path must apply the same guard —
+        an operator who sets ``GITHUB_API_URL=http://...`` by accident
+        gets the same refused construction, not a silently-leaking
+        client.
+        """
+        monkeypatch.setenv("GITHUB_API_URL", "http://ghe.example.com/api/v3")
+        monkeypatch.setenv("GITHUB_TOKEN", "would-leak-on-http")
+        with pytest.raises(forge.ForgeError, match="non-loopback HTTP"):
+            forge.ForgeClient()
+
+
+class TestForgeClientRejectsPathInjection:
+    """The path is the only forge-shaped argument the caller controls. Any
+    attempt to smuggle an absolute URL, a control character, or whitespace
+    into the request URL must be rejected before any network call."""
+
+    def test_absolute_url_in_path_is_rejected(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client._url("https://evil.example.com/x")
+
+    def test_protocol_relative_path_is_rejected(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client._url("//evil.example.com/x")
+
+    def test_crlf_in_path_is_rejected(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client._url("/repos/x\r\nHost: evil")
+
+    def test_space_in_path_is_rejected(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client._url("/repos with space/x")
+
+    def test_tab_in_path_is_rejected(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client._url("/repos\twith\ttab")
+
+
+# ---------------------------------------------------------------------------
+# Redirect safety — the #855-class contract
+# ---------------------------------------------------------------------------
+
+
+class TestForgeClientRefusesRedirects:
+    """The bearer token must never follow a 3xx to a different origin.
+    A real ``urlopen`` call copies ``Authorization`` onto a redirected
+    request even across origins — the canonical ``#855`` leak. The
+    :class:`ForgeClient` MUST raise instead."""
+
+    def _make_origin_redirecting_to(self, target_url: str, recorder: dict) -> HTTPServer:
+        def handle(self):
+            self.raw_requestline = self.rfile.readline()
+            if not self.raw_requestline:
+                return
+            if not self.parse_request():
+                return
+            recorder["auth"].append(self.headers.get("Authorization"))
+            recorder["requests"] += 1
+            self.send_response(302)
+            self.send_header("Location", target_url)
+            self.end_headers()
+
+        def log_message(self, *_args):  # noqa: ANN001
+            pass
+
+        cls = type(
+            "OriginHandler",
+            (BaseHTTPRequestHandler,),
+            {"handle_one_request": handle, "log_message": log_message},
+        )
+        return HTTPServer(("127.0.0.1", 0), cls)
+
+    def _make_target(self, recorder: dict) -> HTTPServer:
+        def handle(self):
+            self.raw_requestline = self.rfile.readline()
+            if not self.raw_requestline:
+                return
+            if not self.parse_request():
+                return
+            recorder["auth"].append(self.headers.get("Authorization"))
+            recorder["requests"] += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"x":1}')
+
+        def log_message(self, *_args):  # noqa: ANN001
+            pass
+
+        cls = type(
+            "TargetHandler",
+            (BaseHTTPRequestHandler,),
+            {"handle_one_request": handle, "log_message": log_message},
+        )
+        return HTTPServer(("127.0.0.1", 0), cls)
+
+    def test_3xx_does_not_forward_authorization_to_target(self, monkeypatch):
+        SECRET = "test-secret-token"
+
+        target_recorder = {"auth": [], "requests": 0}
+        target = self._make_target(target_recorder)
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        try:
+            target_url = f"http://127.0.0.1:{target.server_port}/api/redirected"
+            origin_recorder = {"auth": [], "requests": 0}
+            origin = self._make_origin_redirecting_to(target_url, origin_recorder)
+            origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+            origin_thread.start()
+            try:
+                client = forge.ForgeClient(
+                    base_url=f"http://127.0.0.1:{origin.server_port}",
+                    token=SECRET,
+                )
+                with pytest.raises(forge.ForgeError, match="[Rr]edirect"):
+                    client.get("/repos/foo/bar")
+                assert target_recorder["requests"] == 0, "target must never be contacted"
+                assert all(
+                    auth is None for auth in target_recorder["auth"]
+                ), "target must never see Authorization"
+            finally:
+                origin.shutdown()
+                origin.server_close()
+        finally:
+            target.shutdown()
+            target.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Authorization header
+# ---------------------------------------------------------------------------
+
+
+class TestForgeClientAttachesAuthorizationOnlyToValidatedOrigin:
+    """The token must travel only as the ``Authorization`` header on a
+    request to the validated base. A URL parameter, a body field, or
+    argv must never carry it."""
+
+    def _capture_request(self, token: str) -> tuple[HTTPServer, dict]:
+        seen: dict = {"auth": None, "body": b"", "url": None}
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                seen["auth"] = self.headers.get("Authorization")
+                seen["url"] = self.path
+                content_length = int(self.headers.get("Content-Length") or 0)
+                if content_length:
+                    seen["body"] = self.rfile.read(content_length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, seen
+
+    def test_authorization_header_carries_token(self, monkeypatch):
+        SECRET = "the-secret-value"
+        server, seen = self._capture_request(SECRET)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            payload = client.get("/repos/test/repo")
+            assert payload == {"ok": True}
+            assert seen["auth"] == f"Bearer {SECRET}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_token_does_not_appear_in_url_or_body(self, monkeypatch):
+        SECRET = "the-secret-value"
+        server, seen = self._capture_request(SECRET)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            client.get("/repos/test/repo", {"per_page": "100"})
+            # Token must not appear anywhere in the URL or body, only in
+            # the header.
+            assert SECRET not in seen["url"]
+            assert SECRET not in seen["body"].decode("utf-8", errors="replace")
+            assert seen["auth"] == f"Bearer {SECRET}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_unauthenticated_request_omits_authorization_header(self):
+        server, seen = self._capture_request("")
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token="",
+            )
+            client.get("/repos/test/repo")
+            assert seen["auth"] is None
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Error string safety
+# ---------------------------------------------------------------------------
+
+
+class TestForgeErrorDoesNotEchoSecrets:
+    """A hostile server could reflect the token back in a 4xx body. The
+    forge error string must be a fixed message — never the response
+    body, never the token."""
+
+    def _make_server(self, body: bytes, status: int) -> HTTPServer:
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_http_404_error_does_not_include_response_body(self):
+        SECRET = "leaked-on-404"
+        body = json.dumps({"message": f"token {SECRET} invalid"}).encode("utf-8")
+        server = self._make_server(body, 404)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            with pytest.raises(forge.ForgeError) as info:
+                client.get("/repos/test/repo")
+            assert SECRET not in str(info.value), "token must not appear in error string"
+            assert "404" in str(info.value), "fixed status code IS reported"
+            assert info.value.status == 404, (
+                "the status rides on the error so a caller can tell 'absent' "
+                "from 'broken' without parsing the message"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_transport_failure_carries_no_status(self):
+        # Nothing was answered, so there is no status to report: a caller
+        # must not mistake an unreachable forge for an absent resource.
+        client = forge.ForgeClient(base_url="http://127.0.0.1:1")
+        with pytest.raises(forge.ForgeError) as info:
+            client.get("/repos/test/repo")
+        assert info.value.status is None
+
+    def test_an_unusable_payload_carries_no_status(self):
+        server = self._make_server(b"not-json", 200)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            with pytest.raises(forge.ForgeError) as info:
+                client.get("/repos/test/repo")
+            assert info.value.status is None
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_invalid_json_response_is_a_fixed_error(self):
+        server = self._make_server(b"not-json", 200)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            with pytest.raises(forge.ForgeError, match="invalid JSON"):
+                client.get("/repos/test/repo")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestForgeClientRefusesMalformedResponses:
+    """A hostile server can answer with a forged status line or a truncated
+    body. Both raise an ``http.client`` exception whose text carries the
+    bytes the server chose, and the server saw the credential in the
+    ``Authorization`` header. The client must refuse the response with a
+    fixed error string, never with the server's own bytes."""
+
+    def _make_server(self, raw: bytes) -> HTTPServer:
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                self.wfile.write(raw)
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def _client(self, server: HTTPServer, token: str) -> "forge.ForgeClient":
+        return forge.ForgeClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            token=token,
+        )
+
+    def test_a_forged_status_line_is_a_fixed_error(self):
+        SECRET = "leaked-in-the-status-line"
+        server = self._make_server(b"HTTP/1.1 " + SECRET.encode() + b"\r\n\r\n")
+        try:
+            with pytest.raises(forge.ForgeError) as info:
+                self._client(server, SECRET).get("/repos/test/repo")
+            assert SECRET not in str(info.value), (
+                "the forged status line must not reach the error string"
+            )
+            assert info.value.status is None, (
+                "a malformed response carries no HTTP status"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_forged_status_line_is_a_fixed_error_for_a_write(self):
+        SECRET = "leaked-in-the-status-line"
+        server = self._make_server(b"HTTP/1.1 " + SECRET.encode() + b"\r\n\r\n")
+        try:
+            client = self._client(server, SECRET)
+            with pytest.raises(forge.ForgeError) as info:
+                client.post("/repos/test/repo/pulls", {"title": "t"})
+            assert SECRET not in str(info.value)
+            with pytest.raises(forge.ForgeError) as info:
+                client.delete("/repos/test/repo/issues/1/labels/bug")
+            assert SECRET not in str(info.value)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_truncated_body_is_a_fixed_error(self):
+        SECRET = "leaked-in-a-truncated-body"
+        server = self._make_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+            + SECRET.encode()
+        )
+        try:
+            with pytest.raises(forge.ForgeError) as info:
+                self._client(server, SECRET).get("/repos/test/repo")
+            assert SECRET not in str(info.value), (
+                "the truncated body must not reach the error string"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+
+
+class TestGetPagesWalksUntilEmptyPage:
+    """``get_pages`` walks until the FORGE answers an EMPTY page. A page
+    shorter than ``per_page`` never ends the walk by itself: GitHub honors
+    ``per_page``, but a forge that caps the page size (Forgejo answers at
+    most ``MAX_RESPONSE_ITEMS``, 50 by default) answers every full page
+    short, and a walk that stopped at a short page handed the caller an
+    incomplete list while looking whole (#1487)."""
+
+    def _make_paginated(
+        self,
+        pages: list[list[dict]],
+        page_size: int | None = None,
+    ) -> HTTPServer:
+        """A stub list endpoint.
+
+        It answers ``page`` with that slice of ``pages`` and an empty page
+        past the end, and records the ``page`` number of every request on
+        ``server.requested_pages``. ``page_size`` caps the STRIDE the stub
+        uses to slice, regardless of the requested ``per_page`` -- the
+        Forgejo ``MAX_RESPONSE_ITEMS`` behavior the walk must survive.
+        """
+        requested: list[int] = []
+        stride = page_size
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                query = urllib.parse.urlparse(self.path).query
+                params = dict(urllib.parse.parse_qsl(query))
+                page = int(params.get("page", "1"))
+                requested.append(page)
+                if stride is None:
+                    index = page - 1
+                    body = pages[index] if 0 <= index < len(pages) else []
+                else:
+                    items = [item for one_page in pages for item in one_page]
+                    start = (page - 1) * stride
+                    body = items[start : start + stride]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode("utf-8"))
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server.requested_pages = requested  # type: ignore[attr-defined]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_yields_every_item_across_pages(self):
+        server = self._make_paginated(
+            [
+                [{"i": 1}, {"i": 2}, {"i": 3}],
+                [{"i": 4}],
+            ]
+        )
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items = list(client.get_pages("/x", per_page=3))
+            assert items == [{"i": 1}, {"i": 2}, {"i": 3}, {"i": 4}]
+            # The short final page does not end the walk: the walk asks
+            # for one page more and stops on the empty answer.
+            assert server.requested_pages == [1, 2, 3]  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_short_page_does_not_end_the_walk(self):
+        server = self._make_paginated(
+            [
+                [{"i": 1}, {"i": 2}],  # short page
+                [{"i": 3}, {"i": 4}, {"i": 5}, {"i": 6}],  # full page
+            ]
+        )
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            # per_page=4, page 1 answers 2 items: short, NOT last. The
+            # old rule stopped here and lost the rest of the list.
+            items = list(client.get_pages("/x", per_page=4))
+            assert items == [
+                {"i": 1},
+                {"i": 2},
+                {"i": 3},
+                {"i": 4},
+                {"i": 5},
+                {"i": 6},
+            ]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_forgejo_page_size_cap_still_yields_the_whole_list(self):
+        """The #1487 regression: a forge that caps every answer below the
+        requested ``per_page`` must not end the walk early."""
+        pages = [
+            [{"i": n} for n in range(page * 50, page * 50 + 50)]
+            for page in range(3)
+        ]
+        server = self._make_paginated(pages, page_size=50)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items = list(client.get_pages("/x", per_page=100))
+            assert len(items) == 150
+            assert server.requested_pages == [1, 2, 3, 4]  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_string_per_page_param_walks_the_same_rule(self):
+        server = self._make_paginated(
+            [
+                [{"i": 1}, {"i": 2}],
+                [{"i": 3}],
+            ]
+        )
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            # A caller that hands ``per_page`` in params as a string gets
+            # the same walk: the rule compares pages against emptiness,
+            # not against the requested size.
+            items = list(client.get_pages("/x", params={"per_page": "2"}))
+            assert items == [{"i": 1}, {"i": 2}, {"i": 3}]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestGetPagesHonorsMaxPages:
+    """``max_pages`` bounds the walk. It is the SAFETY NET against a forge
+    that never answers an empty page -- not the walk rule -- and a walk it
+    cuts short must be reported, because a truncated list is not a
+    complete one."""
+
+    def _make_endless(self, page_items: list[dict]) -> HTTPServer:
+        """A stub that answers EVERY page with ``page_items``: the walk
+        would never end on its own; only the bound ends it."""
+        requested: list[int] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                query = urllib.parse.urlparse(self.path).query
+                requested.append(
+                    int(dict(urllib.parse.parse_qsl(query)).get("page", "1"))
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(page_items).encode("utf-8"))
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server.requested_pages = requested  # type: ignore[attr-defined]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def _make_pages(self, pages: list[object]) -> HTTPServer:
+        """A stub that answers each page with the given payload (a list,
+        or any non-list value the forge was not supposed to send) and an
+        empty page past the end."""
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                query = urllib.parse.urlparse(self.path).query
+                page = int(dict(urllib.parse.parse_qsl(query)).get("page", "1"))
+                index = page - 1
+                body = pages[index] if 0 <= index < len(pages) else []
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode("utf-8"))
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_the_bound_stops_a_walk_that_never_terminates(self):
+        server = self._make_endless([{"i": 1}, {"i": 2}, {"i": 3}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items = list(client.get_pages("/x", per_page=3, max_pages=2))
+            assert items == [{"i": 1}, {"i": 2}, {"i": 3}] * 2
+            assert server.requested_pages == [1, 2]  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_default_bound_is_the_safety_net(self):
+        server = self._make_endless([{"i": 1}, {"i": 2}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items = list(client.get_pages("/x", per_page=2))
+            assert len(items) == 2 * forge.DEFAULT_MAX_PAGES
+            assert len(server.requested_pages) == forge.DEFAULT_MAX_PAGES  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_report_says_the_walk_was_cut_short(self):
+        """A caller must be able to tell a complete list from a cut one."""
+        server = self._make_pages(
+            [
+                [{"i": 1}, {"i": 2}, {"i": 3}],
+                [{"i": 4}],
+            ]
+        )
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            # The bound ends the walk on the first page, and that page was
+            # not empty: the list may hold items the walk never saw.
+            items, truncated = client.get_pages_report("/x", per_page=3, max_pages=1)
+            assert len(items) == 3
+            assert truncated is True
+            # The walk ends on the forge's own empty answer: whole list.
+            items, truncated = client.get_pages_report("/x", per_page=3)
+            assert len(items) == 4
+            assert truncated is False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_bound_cut_on_an_endless_forge_is_reported(self):
+        """The acceptance pairing: a forge that never answers an empty
+        page is stopped by the bound, and the report says so."""
+        server = self._make_endless([{"i": 1}, {"i": 2}, {"i": 3}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items, truncated = client.get_pages_report("/x", per_page=3, max_pages=2)
+            assert len(items) == 6
+            assert truncated is True
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_non_list_payload_ends_the_walk_but_is_not_a_bound_cut(self):
+        """A payload that is not a list (an error envelope where a page
+        was expected) ends the walk without the bound ever firing."""
+        server = self._make_pages(
+            [
+                [{"i": 1}, {"i": 2}, {"i": 3}],
+                {"message": "not a list"},
+            ]
+        )
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items, truncated = client.get_pages_report("/x", per_page=3, max_pages=10)
+            assert items == [{"i": 1}, {"i": 2}, {"i": 3}]
+            assert truncated is False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_bound_never_reached_is_not_reported_as_cut(self):
+        """A walk that ends on the forge's empty page before the bound is
+        complete even when the pages it read were short."""
+        server = self._make_pages([[{"i": 1}], [{"i": 2}], []])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            items, truncated = client.get_pages_report("/x", per_page=3, max_pages=10)
+            assert items == [{"i": 1}, {"i": 2}]
+            assert truncated is False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_unbounded_walk_is_never_reported_as_cut(self):
+        server = self._make_endless([{"i": 1}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            walk = client.get_pages("/x", per_page=1, max_pages=None)
+            first = [next(walk) for _ in range(3)]
+            assert first == [{"i": 1}] * 3
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_zero_or_negative_bound_reads_no_page(self):
+        server = self._make_endless([{"i": 1}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            assert list(client.get_pages("/x", max_pages=0)) == []
+            items, truncated = client.get_pages_report("/x", max_pages=-1)
+            assert items == []
+            assert truncated is False
+            assert server.requested_pages == []  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_invalid_bound_is_refused_before_any_request(self):
+        server = self._make_endless([{"i": 1}])
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            )
+            with pytest.raises(forge.ForgeError, match="invalid max_pages"):
+                client.get_pages_report("/x", max_pages="2")
+            with pytest.raises(forge.ForgeError, match="invalid max_pages"):
+                # ``True`` is an int by type but never a page count.
+                client.get_pages_report("/x", max_pages=True)
+            with pytest.raises(forge.ForgeError, match="invalid max_pages"):
+                next(client.get_pages("/x", max_pages=1.5))
+            assert server.requested_pages == []  # type: ignore[attr-defined]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# DELETE (label removal)
+# ---------------------------------------------------------------------------
+
+
+class TestForgeClientDelete:
+    """``delete`` mirrors ``get`` exactly: the same validated base URL, the
+    same no-redirect opener, the token only in the ``Authorization``
+    header, and a fixed credential-free error string. A 404 is an ordinary
+    :class:`ForgeError` -- the caller decides whether "already gone" is a
+    failure or the expected outcome (removing a label that is not there).
+    """
+
+    def _server(
+        self, status: int = 200, body: bytes = b"", location: str = ""
+    ) -> tuple[HTTPServer, dict]:
+        seen: dict = {"auth": None, "method": None, "path": None, "body": b""}
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_one_request(self):
+                self.raw_requestline = self.rfile.readline()
+                if not self.raw_requestline:
+                    return
+                if not self.parse_request():
+                    return
+                seen["auth"] = self.headers.get("Authorization")
+                seen["method"] = self.command
+                seen["path"] = self.path
+                content_length = int(self.headers.get("Content-Length") or 0)
+                if content_length:
+                    seen["body"] = self.rfile.read(content_length)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                if location:
+                    self.send_header("Location", location)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def log_message(self, *_args):  # noqa: ANN001
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, seen
+
+    def test_delete_sends_the_delete_method_with_the_token_in_the_header(self):
+        SECRET = "the-secret-value"
+        server, seen = self._server()
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            client.delete("/repos/test/repo/issues/1/labels/bug")
+            assert seen["method"] == "DELETE"
+            assert seen["path"] == "/repos/test/repo/issues/1/labels/bug"
+            assert seen["auth"] == f"Bearer {SECRET}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_delete_never_puts_the_token_in_the_url_or_the_body(self):
+        SECRET = "the-secret-value"
+        server, seen = self._server()
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            client.delete("/repos/test/repo/issues/1/labels/bug")
+            assert SECRET not in seen["path"]
+            assert SECRET not in seen["body"].decode("utf-8", errors="replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_delete_returns_the_parsed_payload(self):
+        server, _seen = self._server(body=json.dumps({"ok": True}).encode("utf-8"))
+        try:
+            client = forge.ForgeClient(base_url=f"http://127.0.0.1:{server.server_port}")
+            payload = client.delete("/repos/test/repo/issues/1/labels/bug")
+            assert payload == {"ok": True}
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_delete_refuses_a_redirect(self):
+        server, _seen = self._server(
+            status=302, location="http://127.0.0.1:1/elsewhere"
+        )
+        try:
+            client = forge.ForgeClient(base_url=f"http://127.0.0.1:{server.server_port}")
+            with pytest.raises(forge.ForgeError, match="[Rr]edirect"):
+                client.delete("/repos/test/repo/issues/1/labels/bug")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_delete_404_is_a_credential_free_error(self):
+        SECRET = "leaked-on-404"
+        body = json.dumps({"message": f"token {SECRET} invalid"}).encode("utf-8")
+        server, _seen = self._server(status=404, body=body)
+        try:
+            client = forge.ForgeClient(
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                token=SECRET,
+            )
+            with pytest.raises(forge.ForgeError) as info:
+                client.delete("/repos/test/repo/issues/1/labels/bug")
+            assert SECRET not in str(info.value), "token must not appear in error string"
+            assert "404" in str(info.value), "fixed status code IS reported"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_delete_still_validates_the_path(self):
+        client = forge.ForgeClient()
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client.delete("https://evil.example.com/x")
+        with pytest.raises(forge.ForgeError, match="invalid path"):
+            client.delete("/repos/x\r\nHost: evil")
+
+
+# ---------------------------------------------------------------------------
+# The legacy / historical re-exports scripts expose
+# ---------------------------------------------------------------------------
+
+
+class TestReExportsKeepBackwardsCompat:
+    """``scripts/check_corpus_anchor_in_diff`` and
+    ``scripts/harvest_human_findings`` re-export ``GitHubAPIError`` as an
+    alias of :class:`forge.ForgeError` so existing callers/tests can
+    catch either name. The alias must be the SAME class — not a
+    separate subclass — so ``except`` clauses keep working."""
+
+    def test_check_corpus_anchor_uses_same_forge_error(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import check_corpus_anchor_in_diff as ccai
+            assert ccai.GitHubAPIError is forge.ForgeError
+        finally:
+            sys.path.pop(sys.path.index(str(ROOT / "scripts")))
+
+    def test_harvest_human_findings_uses_same_forge_error(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import harvest_human_findings as hhf
+            assert hhf.GitHubAPIError is forge.ForgeError
+        finally:
+            sys.path.pop(sys.path.index(str(ROOT / "scripts")))
+
+
+# ---------------------------------------------------------------------------
+# The one-transport invariant over scripts/
+# ---------------------------------------------------------------------------
+
+
+class TestScriptsDoNotHandRollForgeRequests:
+    """No script under ``scripts/`` builds its own forge request.
+
+    Every forge read and write goes through :mod:`pr_reviewer.forge`. A
+    script that imports a request transport builds its own request, and a
+    hand-built request is exactly how the weekly eval summary kept a
+    plaintext-HTTP base URL and an unattached-token window open
+    (#1407). The gate is an import scan, not a text scan — a mention of
+    ``urllib`` in a docstring is fine.
+
+    A script that genuinely needs a non-forge transport must be named in
+    :data:`_EXEMPT` with a reason, so the exemption is visible instead of
+    silent. The empty list is the honest state today: no script under
+    ``scripts/`` talks to a forge except through the capability. The
+    ``gh`` calls in the shell scripts are a separate item (#1041); they
+    are not Python request transports and are covered by their own gate.
+    """
+
+    # Python modules that can issue an HTTP request. ``urllib.parse`` is
+    # deliberately absent — building a URL is not talking to a forge.
+    REQUEST_MODULES = frozenset({
+        "urllib.request",
+        "http.client",
+        "requests",
+        "httpx",
+        "urllib3",
+    })
+
+    # Repo-relative paths exempt from the gate, each with a non-empty reason.
+    _EXEMPT: dict[str, str] = {}
+
+    @classmethod
+    def transport_imports(cls, tree: ast.AST) -> list[str]:
+        """Every prohibited request transport the module imports.
+
+        Covers both spellings a transport can arrive under: the whole
+        dotted module (``import urllib.request``, ``from http.client
+        import HTTPConnection``) and a transport imported as a name from
+        its parent package (``from urllib import request``, ``from http
+        import client``). Checking only ``ImportFrom.module`` misses the
+        second spelling, which binds the very module the gate forbids.
+        """
+        found: list[str] = []
+        for node in ast.walk(tree):
+            dotted: list[str] = []
+            if isinstance(node, ast.Import):
+                dotted = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module:
+                    dotted = [
+                        module,
+                        *(f"{module}.{alias.name}" for alias in node.names),
+                    ]
+            else:
+                continue
+            found.extend(name for name in dotted if name in cls.REQUEST_MODULES)
+        return found
+
+    def test_no_script_imports_a_request_transport(self):
+        scripts_dir = ROOT / "scripts"
+        offenders: list[str] = []
+        for path in sorted(scripts_dir.rglob("*.py")):
+            relative = str(path.relative_to(ROOT))
+            if relative in self._EXEMPT:
+                assert self._EXEMPT[relative].strip(), (
+                    f"{relative} is exempt from the transport gate "
+                    "without a reason"
+                )
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            if self.transport_imports(tree):
+                offenders.append(relative)
+        assert offenders == [], (
+            "scripts must not hand-roll forge requests; use "
+            "pr_reviewer.forge: " + ", ".join(sorted(set(offenders)))
+        )
+
+    def test_every_exemption_carries_a_reason(self):
+        for path, reason in self._EXEMPT.items():
+            assert reason.strip(), (
+                f"{path} is exempt from the transport gate without a reason"
+            )
+
+    @pytest.mark.parametrize(
+        ("source", "flagged"),
+        [
+            ("import urllib.request", True),
+            ("import urllib.request as req", True),
+            ("from urllib import request", True),
+            ("from urllib import request as req", True),
+            ("from urllib.request import urlopen", True),
+            ("import http.client", True),
+            ("from http import client", True),
+            ("from http.client import HTTPConnection", True),
+            ("import requests", True),
+            ("from requests import get", True),
+            ("import httpx", True),
+            ("import urllib3", True),
+            # Building a URL is not talking to a forge.
+            ("import urllib.parse", False),
+            ("from urllib.parse import urlparse", False),
+            ("import json", False),
+        ],
+    )
+    def test_gate_detects_each_transport_spelling(self, source, flagged):
+        tree = ast.parse(source)
+        found = self.transport_imports(tree)
+        assert bool(found) is flagged, f"{source!r} -> {found}"
+
+

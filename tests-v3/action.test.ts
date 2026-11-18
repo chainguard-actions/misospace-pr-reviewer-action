@@ -1,0 +1,170 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { actionStageEnv, createRunDir, eventLabelName, writeOutputs } from "../src/run/action.js";
+import { forgejoTokenFromEnv } from "../src/platform/forgejo-auth.js";
+import { existsSync } from "node:fs";
+
+function withDir(): { dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "v3-action-"));
+  return { dir, cleanup: (): void => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("action stage env: only endpoint + model given, everything else derived", () => {
+  const { dir, cleanup } = withDir();
+  try {
+    const event = join(dir, "event.json");
+    writeFileSync(event, JSON.stringify({ action: "opened", pull_request: { number: 42, head: { sha: "a".repeat(40) } } }));
+    const stage = actionStageEnv({
+      "INPUT_AI-BASE-URL": "https://llm.example.invalid/v1",
+      "INPUT_AI-MODEL": "m",
+      "INPUT_GITHUB-TOKEN": "tok",
+      GITHUB_REPOSITORY: "o/r",
+      GITHUB_EVENT_PATH: event,
+      GITHUB_SERVER_URL: "https://github.com",
+    });
+    assert.equal(stage.REPO, "o/r");
+    assert.equal(stage.PR_NUMBER, "42");
+    assert.equal(stage.GH_TOKEN, "tok");
+    assert.equal(stage.FORGEJO_API_URL, "");
+    // The agreed drop-in defaults reach the stages.
+    assert.equal(stage.TOOL_MODE, "native_loop");
+    assert.equal(stage.DEEP_REVIEW, "auto");
+    assert.equal(stage.CI_STATUS_CHECK, "true");
+    assert.equal(stage.PUBLISH_MODE, "review_comment");
+    assert.equal(stage.ON_MODEL_FAILURE, "notice");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#1161: the stage env carries the effective allow-approve value — the runner merges the contract default", () => {
+  // The runner exports an INPUT_ variable for EVERY declared input, with
+  // the contract default merged in. The action can therefore only tell
+  // "set to a non-default value" from "default" — never "explicitly false"
+  // from "unset" — which is the same limitation the repository-config
+  // narrowing has.
+  const base = {
+    "INPUT_AI-BASE-URL": "https://llm.example.invalid/v1",
+    "INPUT_AI-MODEL": "m",
+    GITHUB_REPOSITORY: "o/r",
+    GITHUB_SERVER_URL: "https://github.com",
+  };
+  assert.equal(actionStageEnv({ ...base }).ALLOW_APPROVE, "false");
+  assert.equal(actionStageEnv({ ...base, "INPUT_ALLOW-APPROVE": "false" }).ALLOW_APPROVE, "false");
+  assert.equal(actionStageEnv({ ...base, "INPUT_ALLOW-APPROVE": "true" }).ALLOW_APPROVE, "true");
+});
+
+test("action stage env: a non-GitHub server URL is the Forgejo API base", () => {
+  const stage = actionStageEnv({ "INPUT_AI-BASE-URL": "https://x.invalid", "INPUT_AI-MODEL": "m", GITHUB_SERVER_URL: "https://forge.example.invalid" });
+  assert.equal(stage.FORGEJO_API_URL, "https://forge.example.invalid");
+});
+
+test("action stage env keeps token fallback while integration mode selects OIDC", () => {
+  const base = {
+    "INPUT_AI-BASE-URL": "https://llm.example.invalid/v1",
+    "INPUT_AI-MODEL": "m",
+    "INPUT_GITHUB-TOKEN": "runner",
+    FORGEJO_TOKEN: "injected-forgejo-token",
+    GITHUB_TOKEN: "injected-github-token",
+    GITHUB_SERVER_URL: "https://forge.example.invalid",
+  };
+  const tokenMode = actionStageEnv(base);
+  assert.equal(tokenMode.FORGEJO_TOKEN, "injected-forgejo-token");
+  assert.equal(forgejoTokenFromEnv(tokenMode), "injected-forgejo-token");
+  assert.equal(actionStageEnv({ ...base, "INPUT_FORGEJO-TOKEN": "explicit-pat" }).FORGEJO_TOKEN, "explicit-pat");
+  assert.equal(actionStageEnv({ ...base, FORGEJO_TOKEN: "" }).FORGEJO_TOKEN, "runner");
+
+  const integrationMode = actionStageEnv({
+    ...base,
+    "INPUT_FORGEJO-AUTH-METHOD": "authorized_integration",
+    "INPUT_FORGEJO-AUTHORIZED-INTEGRATION-AUDIENCE": "aud",
+  });
+  assert.equal(integrationMode.FORGEJO_TOKEN, "");
+  assert.equal(forgejoTokenFromEnv(integrationMode), undefined);
+  assert.throws(
+    () => actionStageEnv({
+      ...base,
+      "INPUT_FORGEJO-AUTH-METHOD": "authorized_integration",
+      "INPUT_FORGEJO-AUTHORIZED-INTEGRATION-AUDIENCE": "aud",
+      "INPUT_FORGEJO-TOKEN": "explicit-pat",
+    }),
+    /forgejo-token.*cannot be set/,
+  );
+});
+
+// #1678 alias, #1683 review: a run that DECLARES the Gitea identity must have
+// the stage binding consult the alias BEFORE the GitHub fallback, or a Gitea
+// deployment whose only credential is GITEA_TOKEN reads and publishes with
+// the GitHub token. (The alias itself is identity-scoped by the resolver: a
+// run that never declares `platform: gitea` keeps the pre-#1678 chain — that
+// lane is pinned in platform-gitea.test.ts.)
+test("action stage env honors the GITEA_TOKEN alias ahead of the GitHub fallback", () => {
+  const base = {
+    "INPUT_AI-BASE-URL": "https://llm.example.invalid/v1",
+    "INPUT_AI-MODEL": "m",
+    "INPUT_GITHUB-TOKEN": "runner",
+    GITHUB_TOKEN: "injected-github-token",
+    GITHUB_SERVER_URL: "https://gitea.example.invalid",
+  };
+  const aliasOnly = actionStageEnv({ ...base, "INPUT_PLATFORM": "gitea", GITEA_TOKEN: "gitea-pat" });
+  assert.equal(aliasOnly.FORGEJO_TOKEN, "gitea-pat");
+  assert.equal(forgejoTokenFromEnv(aliasOnly), "gitea-pat");
+
+  // The family's own name still wins, in the documented order.
+  const both = actionStageEnv({ ...base, "INPUT_PLATFORM": "gitea", GITEA_TOKEN: "gitea-pat", FORGEJO_TOKEN: "forgejo-pat" });
+  assert.equal(both.FORGEJO_TOKEN, "forgejo-pat");
+  assert.equal(forgejoTokenFromEnv(both), "forgejo-pat");
+
+  // Integration mode binds no token, alias included. The typed input
+  // boundary refuses platform gitea + integration mode outright (the
+  // config-refusal lane pinned in config.test.ts), so this lane declares the
+  // family platform: the binding's own auth-method check fires first.
+  const integration = actionStageEnv({
+    ...base,
+    "INPUT_PLATFORM": "forgejo",
+    GITEA_TOKEN: "gitea-pat",
+    "INPUT_FORGEJO-AUTH-METHOD": "authorized_integration",
+    "INPUT_FORGEJO-AUTHORIZED-INTEGRATION-AUDIENCE": "aud",
+  });
+  assert.equal(integration.FORGEJO_TOKEN, "");
+});
+
+test("multiline outputs use a delimiter the value cannot forge", () => {
+  const { dir, cleanup } = withDir();
+  try {
+    const out = join(dir, "out.txt");
+    writeFileSync(out, "");
+    writeOutputs({ GITHUB_OUTPUT: out }, [["review-markdown", "line1\nverdict=approve\nline3"], ["verdict", "request_changes"]]);
+    const text = readFileSync(out, "utf8");
+    const match = /^review-markdown<<(ghadelimiter_[0-9a-f]+)\n([\s\S]*?)\n\1\n/.exec(text);
+    assert.ok(match, text);
+    assert.equal(match[2], "line1\nverdict=approve\nline3");
+    assert.match(text, /\nverdict=request_changes\n$/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("labeled events carry the label as an object with a name", () => {
+  assert.equal(eventLabelName({ name: "ai-review" }), "ai-review");
+  assert.equal(eventLabelName("ai-review"), "ai-review");
+  assert.equal(eventLabelName(undefined), "");
+});
+
+test("each action invocation gets its own run dir, so a second one never reads the first's artifacts", () => {
+  const { dir, cleanup } = withDir();
+  try {
+    const first = createRunDir(dir);
+    writeFileSync(join(first, "pr.diff"), "diff --git a/one b/one\n");
+    writeFileSync(join(first, "pr-object.json"), "{\"number\": 1}");
+    const second = createRunDir(dir);
+    assert.notEqual(first, second);
+    assert.equal(existsSync(join(second, "pr.diff")), false);
+    assert.equal(existsSync(join(second, "pr-object.json")), false);
+  } finally {
+    cleanup();
+  }
+});

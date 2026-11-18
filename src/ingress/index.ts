@@ -1,0 +1,145 @@
+// Public surface of the self-hosted Forgejo ingress/publication adapters
+// (#730) and the post-v3 self-hosted GitHub App auth/capability substrate
+// (#729), layered over the canonical event/job boundary from #728.
+//
+// Module map:
+//   signature.ts         - X-Gitea-Signature HMAC-SHA256 verification (fail closed)
+//   github-app-signature.ts - X-Hub-Signature-256 "sha256="+hex verification (fail closed)
+//   github-app-auth.ts   - App JWT mint + short-lived repo-scoped installation-token broker
+//   github-app-client.ts - GitHub App read+write capability client over the typed transport
+//   forgejo-events.ts    - native Gitea/Forgejo event projection onto the #728 envelope
+//   gitea-events.ts      - Gitea-named ingress entry point (#1678) onto that same
+//                          shared projection: verifier, parse, non-HTTP dispatch, handler
+//   webhook-handler.ts   - Node http webhook ingress (verify before parse, fixed bodies)
+//   github-webhook-handler.ts - Node http GitHub App webhook ingress
+//                           (X-Hub-Signature-256 over the RAW body; the event-name
+//                           projection from the unauthenticated X-GitHub-Event header)
+//   endpoints.ts         - REST/web endpoint resolution from a configured platform base URL
+//   api-client.ts        - read-only authenticated Forgejo REST client
+//   clone-credentials.ts - git clone credentials as a Basic Authorization header only
+//   capabilities.ts      - publish-capability matrix and explicit degradation checks
+//   dispatch.ts          - canonical event -> deduped generations + the publish gate
+//   reconcile.ts         - missed-webhook reconciliation poll
+//   followup-host.ts     - operator-mode consumer host for canonical `follow_up` events
+//   operator-router.ts   - operator-mode event router: `follow_up` -> the follow-up
+//                           consumer, every other canonical event -> the dispatch seam
+//   operator-host.ts     - operator-mode production host: builds the router unconditionally
+//                           and binds it into the webhook handler (the in-repo production
+//                           caller of the router)
+
+export type { ForgejoWebhookHandlerOptions } from "./webhook-handler.js";
+export {
+  DEFAULT_MAX_WEBHOOK_BODY_BYTES,
+  createForgejoWebhookHandler,
+} from "./webhook-handler.js";
+export type { GitHubWebhookHandlerOptions } from "./github-webhook-handler.js";
+export {
+  createGitHubWebhookHandler,
+  githubBodySupportsVocabulary,
+  projectGitHubWebhookPayload,
+} from "./github-webhook-handler.js";
+export { computeForgejoWebhookSignature, verifyForgejoWebhookSignature } from "./signature.js";
+export {
+  computeGitHubWebhookSignature,
+  verifyGitHubWebhookSignature,
+} from "./github-app-signature.js";
+export { projectForgejoWebhookPayload } from "./forgejo-events.js";
+export type {
+  GiteaWebhookDelivery,
+  GiteaWebhookDispatchOptions,
+  GiteaWebhookDispatchOutcome,
+} from "./gitea-events.js";
+export {
+  computeGiteaWebhookSignature,
+  createGiteaWebhookHandler,
+  dispatchGiteaWebhookEvent,
+  parseGiteaWebhookEvent,
+  projectGiteaWebhookPayload,
+  verifyGiteaWebhookSignature,
+} from "./gitea-events.js";
+
+export type {
+  AuthFailureClassification,
+  AuthResult,
+  GitHubAppAuthenticatorOptions,
+  InstallationToken,
+  InstallationTokenOptions,
+} from "./github-app-auth.js";
+export {
+  GitHubAppAuthenticator,
+  installationScopeKey,
+  isValidInstallationId,
+} from "./github-app-auth.js";
+
+export type {
+  CheckRunPayload,
+  GitHubAppCapabilityClientOptions,
+  ReviewCommentPayload,
+  ReviewPayload,
+  WriteResult,
+} from "./github-app-client.js";
+export { GitHubAppCapabilityClient } from "./github-app-client.js";
+
+export type {
+  ForgejoEndpoints,
+  IngressEndpoints,
+  RepositoryEndpoints,
+} from "./endpoints.js";
+export {
+  FORGEJO_WEBHOOK_PATH,
+  GITEA_WEBHOOK_PATH,
+  ingressWebhookPath,
+  resolveForgejoEndpoints,
+  resolveRepositoryEndpoints,
+  selectIngressEndpoints,
+} from "./endpoints.js";
+
+export type { ReadResult, ForgejoIngressClientOptions } from "./api-client.js";
+export { ForgejoIngressClient, createGiteaIngressClient } from "./api-client.js";
+
+export type { CloneCredential } from "./clone-credentials.js";
+export { buildCloneCredential } from "./clone-credentials.js";
+
+export type {
+  CapabilityCheck,
+  CapabilityName,
+  ForgePlatform,
+  PublishCapabilities,
+} from "./capabilities.js";
+export {
+  FORGEJO_CAPABILITIES,
+  GITHUB_CAPABILITIES,
+  GITEA_CAPABILITIES,
+  capabilitiesFor,
+  requireCapability,
+} from "./capabilities.js";
+
+export type { GenerationLedger, DispatchOutcome, PublishGate } from "./dispatch.js";
+export { MemoryGenerationLedger, dispatchCanonicalEvent, gateJobPublication } from "./dispatch.js";
+
+export type {
+  ReconcileReport,
+  ReconcileHandoffRefusal,
+  ReconcileOptions,
+} from "./reconcile.js";
+export { reconcileRepositories } from "./reconcile.js";
+
+export type {
+  FollowUpConsumer,
+  FollowUpConsumerOptions,
+  FollowUpForgeAdapter,
+} from "./followup-host.js";
+export { createFollowUpConsumer } from "./followup-host.js";
+
+export type {
+  OperatorEventOutcome,
+  OperatorEventRouter,
+  OperatorEventRouterOptions,
+} from "./operator-router.js";
+export { createOperatorEventRouter } from "./operator-router.js";
+
+export type { OperatorHost, OperatorHostOptions } from "./operator-host.js";
+export {
+  createOperatorHost,
+  OPERATOR_RATE_LIMIT_LEDGER_FILENAME,
+} from "./operator-host.js";
