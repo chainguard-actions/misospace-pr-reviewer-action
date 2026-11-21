@@ -1,0 +1,359 @@
+/** System-prompt assembly (#706 PR 4): byte-exact port of
+ * `resolve_system_prompt`, `apply_system_prompt_fragments` and
+ * `apply_specialist_leads_fragment` (`scripts/sections/config.sh`).
+ *
+ * v2 runs these in three phases, and the orchestrator must keep them apart
+ * because each gate's input only exists at its phase:
+ *
+ * 1. `resolveSystemPrompt` at config time — replace vs append, the
+ *    `SYSTEM_PROMPT_FILE` + inline composition, the bundled default;
+ * 2. `applySystemPromptFragments` after classification (`classification.sh`)
+ *    — the context-dial, presence-file and `pr_kind` gated fragments, the
+ *    verbosity dial, and the append-mode addendum;
+ * 3. `applySpecialistLeadsFragment` after the specialist phase is reaped
+ *    (`corpus.sh`) — its presence signal does not exist earlier.
+ *
+ * The assembled text is what v2 exports as `SYSTEM_PROMPT`: the value the
+ * standard review call sends and the native-loop harness trusts verbatim
+ * (`src/tools/harness.ts` `resolveReviewSystemPrompt`). */
+
+import { BUNDLED_PROMPT_ASSETS, rawFragment, type PromptAssets } from "./assets.js";
+import { DEPENDENCY_EVIDENCE_KINDS } from "../classification/classify.js";
+import { MAX_DISTRIBUTED_HINTS, MAX_GROUPS_PER_RULE, MAX_GROUP_NAME_CHARS } from "../enforcement/requirement-trace.js";
+import { bashCapture, bashLowerCapture, bashReadCapture, bashReplaceFirst, jqLockfileOnlyLowRisk, jqRawPrKind, type PromptWorkspace } from "./bash.js";
+
+/** Workspace artifacts the fragment gates read, written by earlier phases. */
+export const PROMPT_PRESENCE_FILES = {
+  reviewThreads: "review-threads-present.txt",
+  humanReviews: "human-reviews-present.txt",
+  requirementLedger: "requirement-ledger-present.txt",
+  specialistLeads: "specialist-leads-present.txt",
+  classification: "classification.json",
+  /** #1337: the deterministic coverage-accounting section (empty unless the
+   * classification is dependency-shaped AND dependency changes were
+   * detected — the same presence the corpus gates on). */
+  dependencyCoverage: "dependency-coverage.md",
+} as const;
+
+/** The sentence v2 appends to every assembled default prompt. */
+export const CROSS_STEP_TRACE_GUIDANCE =
+  " Trace producer -> persisted representation -> transport/environment -> consumer -> decision for cross-step features; verify the production wiring uses the same artifact and capability as the tests. A test or CI result absent from a truncated corpus is not evidence that the exact head failed or lacks coverage: distinguish omitted evidence from an observed counterexample, and do not request changes solely because a tail is missing.";
+
+export class SystemPromptFileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SystemPromptFileError";
+  }
+}
+
+/** Raw operator settings (`system-prompt`, `system-prompt-file`,
+ * `system-prompt-mode`). Empty means unset, as in v2's `${VAR:-}`. */
+export interface SystemPromptSettings {
+  readonly systemPrompt?: string;
+  readonly systemPromptFile?: string;
+  /** Defaults to `replace`; only the exact value `append` appends. */
+  readonly systemPromptMode?: string;
+}
+
+/** v2's `SYSTEM_PROMPT` / `SYSTEM_PROMPT_IS_DEFAULT` /
+ * `SYSTEM_PROMPT_ADDENDUM` globals. */
+export interface SystemPromptState {
+  readonly systemPrompt: string;
+  /** The bundled default is in use, so the fragment placeholders exist. */
+  readonly isDefault: boolean;
+  /** Append-mode operator prompt, composed on after fragment assembly. */
+  readonly addendum: string;
+}
+
+/** Port of `resolve_system_prompt`. Throws `SystemPromptFileError` for a
+ * configured `SYSTEM_PROMPT_FILE` that is not a regular file (v2: `error` +
+ * `exit 1`). */
+export function resolveSystemPrompt(
+  settings: SystemPromptSettings,
+  workspace: PromptWorkspace,
+  assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+): SystemPromptState {
+  const inline = settings.systemPrompt ?? "";
+  const file = settings.systemPromptFile ?? "";
+  const mode = settings.systemPromptMode || "replace";
+  let user = "";
+  if (file !== "") {
+    if (!workspace.isFile(file)) throw new SystemPromptFileError(`SYSTEM_PROMPT_FILE does not exist: ${file}`);
+    const bytes = workspace.readBytes(file);
+    if (bytes === null) throw new SystemPromptFileError(`SYSTEM_PROMPT_FILE could not be read: ${file}`);
+    user = bashReadCapture(bytes);
+    if (inline !== "") user = `${user}\n\n${inline}`;
+  } else if (inline !== "") {
+    user = inline;
+  }
+  if (user !== "" && mode !== "append") return { systemPrompt: user, isDefault: false, addendum: "" };
+  return { systemPrompt: bashCapture(assets.defaultSystemPrompt), isDefault: true, addendum: user };
+}
+
+/** Dials `apply_system_prompt_fragments` reads from the environment. Raw
+ * values; case and trailing newlines are normalized as v2 does. */
+export interface FragmentDials {
+  /** `related-code-context`; v2 default `true`. */
+  readonly relatedCodeContext?: string;
+  /** `pr-thread-context`; v2 default `true`. */
+  readonly prThreadContext?: string;
+  /** `review-verbosity`; `concise` substitutes the brevity fragment. */
+  readonly reviewVerbosity?: string;
+}
+
+/** `"$(<fragment) "` — the guidance plus the separating space. */
+function guidance(assets: PromptAssets, name: string): string {
+  return `${bashCapture(rawFragment(assets, name))} `;
+}
+
+/** Port of `apply_system_prompt_fragments`. Dials left empty take the
+ * config.sh defaults (`RELATED_CODE_CONTEXT`/`PR_THREAD_CONTEXT` = true). */
+export function applySystemPromptFragments(
+  state: SystemPromptState,
+  dials: FragmentDials,
+  workspace: PromptWorkspace,
+  assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+): SystemPromptState {
+  let prompt = state.systemPrompt;
+  const sub = (placeholder: string, text: string) => {
+    prompt = bashReplaceFirst(prompt, `{{${placeholder}}}`, text);
+  };
+  if (state.isDefault) {
+    sub("RELATED_CODE_GUIDANCE", bashLowerCapture(dials.relatedCodeContext || "true") === "true" ? guidance(assets, "related_code") : "");
+    sub("PR_THREAD_GUIDANCE", bashLowerCapture(dials.prThreadContext || "true") === "true" ? guidance(assets, "pr_thread") : "");
+    sub("REVIEW_THREADS_GUIDANCE", workspace.isNonEmpty(PROMPT_PRESENCE_FILES.reviewThreads) ? guidance(assets, "review_threads") : "");
+    sub("HUMAN_REVIEWS_GUIDANCE", workspace.isNonEmpty(PROMPT_PRESENCE_FILES.humanReviews) ? guidance(assets, "human_reviews") : "");
+    sub("REQUIREMENT_LEDGER_GUIDANCE", workspace.isNonEmpty(PROMPT_PRESENCE_FILES.requirementLedger) ? guidance(assets, "requirement_ledger") : "");
+    // Neutralized here; applySpecialistLeadsFragment appends the guidance
+    // once the (later) presence signal exists.
+    sub("SPECIALIST_LEADS_GUIDANCE", "");
+    sub("VERBOSITY_GUIDANCE", bashLowerCapture(dials.reviewVerbosity || "normal") === "concise" ? guidance(assets, "concise") : "");
+    prompt += CROSS_STEP_TRACE_GUIDANCE;
+  }
+  if (state.isDefault && workspace.isFile(PROMPT_PRESENCE_FILES.classification)) {
+    const bytes = workspace.readBytes(PROMPT_PRESENCE_FILES.classification);
+    const kind = bytes === null ? "" : jqRawPrKind(bytes.toString("utf8"));
+    // #1379: the infra set gains the vendor-agnostic dependency-update
+    // kinds — the same manifest-shaped update families as their Renovate
+    // twins without the forge-authorship gate.
+    const infra =
+      kind === "dependency_upgrade" ||
+      kind === "k8s_manifest" ||
+      kind === "renovate_chart_update" ||
+      kind === "renovate_image_update" ||
+      kind === "image_update" ||
+      kind === "chart_update" ||
+      kind === "platform_version_update" ||
+      kind === "action_update";
+    const digest =
+      kind === "renovate_digest_only" ||
+      kind === "image_digest_only" ||
+      kind === "renovate_image_update";
+    // #1379: upstream-evidence obligations for every dependency-update kind
+    // (the Renovate twins included — the gate only zero-selects specialists,
+    // the primary review's must_check still carries the obligations).
+    // Single source of truth with the tool-harness reserve gate: the same
+    // exported classification family (src/classification/classify.ts).
+    const depEvidence = DEPENDENCY_EVIDENCE_KINDS.has(kind);
+    // #1595: the lockfile-only scoped triage — a dependency_upgrade whose
+    // classification artifact carries `lockfile_only_refresh` with
+    // `parseable = true` and `material = 0` (the deterministic parser
+    // verdict; `low_risk` is a numeric count, the zero-material invariant
+    // is the gate) swaps the dependency-evidence fragment for the scoped
+    // advisory-only variant, so the prompt steers exactly the obligations
+    // the artifact's must_check still names. Same artifact-driven,
+    // deterministic gate as every other fragment; an absent/malformed
+    // triage keeps the full-set fragment (fail closed).
+    const lockfileScoped = depEvidence && jqLockfileOnlyLowRisk(bytes === null ? "" : bytes.toString("utf8"));
+    sub("VERSION_BUMP_GUIDANCE", infra ? guidance(assets, "version_bump") : "");
+    sub("IMAGE_DIGEST_GUIDANCE", digest ? guidance(assets, "image_digest") : "");
+    sub("RELEASE_NOTES_GUIDANCE", infra || digest ? guidance(assets, "release_notes") : "");
+    sub("DEPENDENCY_EVIDENCE_GUIDANCE", depEvidence ? guidance(assets, lockfileScoped ? "dependency_evidence_lockfile_scoped" : "dependency_evidence") : "");
+    // #1337: dependency-upgrade coverage accounting. Gated on the
+    // deterministic section being present (kind-shaped AND dependency
+    // changes detected), so the instructions never reference a section the
+    // corpus does not carry.
+    sub("COVERAGE_ACCOUNTING_GUIDANCE", workspace.isNonEmpty(PROMPT_PRESENCE_FILES.dependencyCoverage) ? guidance(assets, "coverage_accounting") : "");
+  } else {
+    // Also runs on a replace-mode operator prompt: v2 strips these five
+    // placeholders (first occurrence) from any prompt text (#1379 added
+    // DEPENDENCY_EVIDENCE_GUIDANCE).
+    sub("VERSION_BUMP_GUIDANCE", "");
+    sub("IMAGE_DIGEST_GUIDANCE", "");
+    sub("RELEASE_NOTES_GUIDANCE", "");
+    sub("DEPENDENCY_EVIDENCE_GUIDANCE", "");
+    sub("COVERAGE_ACCOUNTING_GUIDANCE", "");
+  }
+  if (state.addendum !== "") prompt = `${prompt}\n\n${state.addendum}`;
+  return { ...state, systemPrompt: prompt };
+}
+
+/** Port of `apply_specialist_leads_fragment`: appends the leads guidance as
+ * its own line when the default prompt is in use and
+ * `specialist-leads-present.txt` is non-empty; idempotent. */
+export function applySpecialistLeadsFragment(
+  state: SystemPromptState,
+  workspace: PromptWorkspace,
+  assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+): SystemPromptState {
+  if (!state.isDefault) return state;
+  if (!workspace.isNonEmpty(PROMPT_PRESENCE_FILES.specialistLeads)) return state;
+  const leads = bashCapture(rawFragment(assets, "specialist_leads"));
+  if (leads === "") return state;
+  if (state.systemPrompt.includes(leads)) return state;
+  return { ...state, systemPrompt: `${state.systemPrompt}\n${leads}` };
+}
+
+/**
+ * #874: the requirement-trace guidance, appended only when the
+ * `requirement-trace` input is enabled AND the requirement ledger is
+ * non-empty (the same presence signal `REQUIREMENT_LEDGER_GUIDANCE` gates) —
+ * a bare instruction with no ledger to trace would be dead weight. Runs
+ * alongside `applySystemPromptFragments` (same phase: both the dial and the
+ * ledger presence file exist by then); idempotent like the other appended
+ * (non-placeholder) fragments.
+ */
+export function applyRequirementTraceFragment(
+  state: SystemPromptState,
+  workspace: PromptWorkspace,
+  enabled: boolean,
+  assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+  scopeIds?: readonly string[],
+  distributedHints?: readonly { requirementId: string; groups: readonly { name: string; owners?: readonly string[]; tests?: readonly string[] }[] }[],
+): SystemPromptState {
+  if (!state.isDefault || !enabled) return state;
+  if (!workspace.isNonEmpty(PROMPT_PRESENCE_FILES.requirementLedger)) return state;
+  // #935: with a deterministic scope, ask only for the in-scope requirements
+  // (none in scope: no trace instructions at all).
+  if (scopeIds !== undefined && scopeIds.length === 0) return state;
+  // #1678: when a deterministic scope exists, the ledger guidance must demand
+  // the SAME exact set the closing-verdict contract validates. Out-of-scope
+  // ledger rows would make the closing serialization contract-invalid and
+  // burn the single bounded correction on scope instead of structure. Only
+  // the default sentence is replaced (this fragment is `isDefault`-gated
+  // above), so operator replace-mode prompts keep their own text.
+  if (scopeIds !== undefined && scopeIds.length > 0) {
+    state = {
+      ...state,
+      systemPrompt: state.systemPrompt.replace(
+        "Every requirement in the Requirement Ledger must be assessed in requirement_coverage.",
+        "Every requirement named in the trace scope or in the Required requirement decisions block must be assessed in requirement_coverage; no other requirement may carry a coverage row.",
+      ),
+    };
+  }
+  let trace = bashCapture(rawFragment(assets, "requirement_trace"));
+  if (trace === "") return state;
+  if (scopeIds !== undefined) {
+    trace = trace.replace(
+      "For every acceptance/normative requirement in trace scope,",
+      `For every requirement in trace scope (${scopeIds.join(", ")}); other ledger requirements need no trace,`,
+    );
+  }
+  if (distributedHints && distributedHints.length > 0) {
+    const cleanName = (name: string): string => name.replace(/[\x00-\x1f\x7f`]/g, "").slice(0, MAX_GROUP_NAME_CHARS);
+    // #1519: the hints now carry FULL seam objects; the prompt line still
+    // renders the seam NAMES only (the rendered plan section is where the
+    // per-seam evidence paths live). A hint whose every seam name sanitizes
+    // away renders nothing and is dropped, never an empty `id →` tail.
+    const hintLine = `Distributed requirements — cite one enforcement location in each declared seam: ${distributedHints
+      .slice(0, MAX_DISTRIBUTED_HINTS)
+      .map((hint) => {
+        const names = (hint.groups ?? [])
+          .slice(0, MAX_GROUPS_PER_RULE)
+          .map((group) => cleanName(group?.name ?? ""))
+          .filter((name) => name !== "");
+        return names.length === 0 ? null : `\`${cleanName(hint.requirementId)}\` → ${names.join(", ")}`;
+      })
+      .filter((rendered) => rendered !== null)
+      .join("; ")}`;
+    if (distributedHints.some((hint) => (hint.groups ?? []).some((group) => cleanName(group?.name ?? "") !== ""))) {
+      trace += `\n${hintLine}`;
+    }
+  }
+  if (state.systemPrompt.includes(trace)) return state;
+  return { ...state, systemPrompt: `${state.systemPrompt}\n${trace}` };
+}
+
+/**
+ * #1003: the human-review triage instructions, appended only when the
+ * `review-triage` input is enabled. Deliberately ungated by any presence
+ * file (unlike the #874 trace fragment): the question is answerable from the
+ * corpus plus the repository's trusted instruction files, and a missing
+ * ledger is not a reason to stay silent — the fragment itself tells the
+ * reviewer to answer `unknown` when the escalation policy is not in context.
+ *
+ * Opt-in and review-only: with the input off the assembled prompt is
+ * byte-identical to pre-#1003 (no mention of triage anywhere), and with it on
+ * nothing about tool, evidence, fork or model routing changes — triage grants
+ * no capability. Same idempotent appended-fragment discipline as the others.
+ *
+ * Deliberate exception to the `isDefault`-only rule every other fragment
+ * follows: #1003's acceptance requires triage to compose with custom system
+ * prompts, so an operator replace-mode prompt is preserved verbatim and the
+ * triage instructions are appended as one extra line. The other fragments
+ * stay tied to the default because they assume the placeholder discipline
+ * the bundled default ships with; triage is opt-in by config — the operator
+ * has explicitly switched it on — so omitting it would silently degrade the
+ * answer to `unknown` for any operator using a custom prompt.
+ */
+export function applyReviewTriageFragment(
+  state: SystemPromptState,
+  enabled: boolean,
+  allowedTargets: readonly string[] = [],
+  assets: PromptAssets = BUNDLED_PROMPT_ASSETS,
+): SystemPromptState {
+  if (!enabled) return state;
+  const triage = bashCapture(rawFragment(assets, "review_triage"));
+  if (triage === "") return state;
+  const routing = renderReviewTriageRoutingFragment(allowedTargets);
+  let prompt = state.systemPrompt;
+  if (!prompt.includes(triage)) {
+    prompt = `${prompt}\n${triage}`;
+  }
+  if (routing !== "" && !prompt.includes(routing)) {
+    prompt = `${prompt}\n${routing}`;
+  }
+  return prompt === state.systemPrompt ? state : { ...state, systemPrompt: prompt };
+}
+
+/**
+ * #1005: the routing addendum appended after the triage question ONLY when
+ * `review-triage-routing` is enabled and at least one logical target is
+ * configured. It names the exact configured logical ids the model may choose
+ * from — the model can never name a concrete GitHub user or team — and it is
+ * constructed here rather than in the bundled `review_triage.txt` fragment so
+ * the v2-parity fragment text (shared with the v2 runtime) is unchanged and a
+ * disabled run's prompt stays byte-identical.
+ */
+export function renderReviewTriageRoutingFragment(allowedTargets: readonly string[]): string {
+  const ids = [...new Set(allowedTargets.map((id) => id.trim().toLowerCase()).filter((id) => id !== ""))].sort();
+  if (ids.length === 0) return "";
+  return `Routing targets are configured for this repository. When \`review_triage_decision\` is \`required\`, also set \`review_triage_targets\` to the configured capability ids that apply, chosen only from this exact list: ${ids.join(", ")}. Use the ids verbatim; never invent, rename, or guess an id, and never put a GitHub username, team name, or @handle in the field. Leave \`review_triage_targets\` empty whenever \`review_triage_decision\` is not \`required\`.`;
+}
+
+/**
+ * #812: the superseded-discussion rule, appended v3-only after the corpus's
+ * discussion sections exist (never by the v2-parity fragment assembly). The
+ * current PR description and linked issues are authoritative context, and a
+ * claim in earlier discussion they override is not a blocker — thread
+ * comments older than the latest description edit are labeled
+ * "earlier discussion (may be superseded by the current description)" in the
+ * corpus, so this rule tells the reviewer what that label means.
+ */
+export const SUPERSEDED_DISCUSSION_GUIDANCE =
+  "The current PR description and any linked issues are authoritative context and outrank the discussion sections: a claim in earlier discussion (PR conversation comments or review threads, including a comment labeled \"earlier discussion (may be superseded by the current description)\") that the current PR description or a linked issue overrides or supersedes is not a blocker and must not be cited as a merge gate.";
+
+/** Append `SUPERSEDED_DISCUSSION_GUIDANCE` once, when the default prompt is
+ * in use and the corpus carries discussion (the PR-thread or review-threads
+ * section); idempotent. Operator replace-mode prompts are left untouched,
+ * like every other fragment. */
+export function applySupersededDiscussionFragment(
+  state: SystemPromptState,
+  workspace: PromptWorkspace,
+): SystemPromptState {
+  if (!state.isDefault) return state;
+  if (state.systemPrompt.includes(SUPERSEDED_DISCUSSION_GUIDANCE)) return state;
+  const hasDiscussion = workspace.isNonEmpty("pr-thread.md") || workspace.isNonEmpty("review-threads.md");
+  if (!hasDiscussion) return state;
+  return { ...state, systemPrompt: `${state.systemPrompt}\n${SUPERSEDED_DISCUSSION_GUIDANCE}` };
+}

@@ -1,0 +1,47 @@
+name: Test explicit pr-number against the harness repository
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The PR lookup is repo-scoped on GITHUB_REPOSITORY (a harness sentinel),
+      # so it cannot succeed; the action must fail gracefully and never approve.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          ai-base-url: https://ai.example.invalid/v1
+          ai-model: test-model
+          pr-number: "1"
+          ci-status-check: "false"
+          tool-mode: "off"
+          deep-review: "false"
+      - name: Assert action ran (outputs set, or failed gracefully on the sentinel repo)
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SHOULD_REVIEW: ${{ steps.action.outputs.should-review }}
+          VERDICT: ${{ steps.action.outputs.verdict }}
+          ATTESTATION: ${{ steps.action.outputs.review-attestation }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "should-review: $SHOULD_REVIEW"
+          echo "verdict: $VERDICT"
+          echo "attestation: $ATTESTATION"
+          if echo "$ATTESTATION" | grep -q '"conclusion":"approved"'; then
+            echo "FAIL: attestation must never be approved here"
+            exit 1
+          fi
+          if [ "$OUTCOME" = "success" ]; then
+            if [ -z "$SHOULD_REVIEW" ] || [ -z "$ATTESTATION" ]; then
+              echo "FAIL: action succeeded but outputs are empty"
+              exit 1
+            fi
+            echo "PASS: action completed with outputs"
+          elif [ "$OUTCOME" = "failure" ]; then
+            echo "PASS: action failed gracefully (sentinel repo is not resolvable)"
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

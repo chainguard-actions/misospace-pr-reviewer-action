@@ -1,0 +1,525 @@
+/**
+ * Cleanup of previous managed native reviews (#680 port of
+ * `cleanup_native_reviews` + `resolve_superseded_review_threads` in
+ * `scripts/publish_helpers.sh`, carrying #769).
+ *
+ * Managed reviews are matched by the marker their bodies START with, never
+ * by author — author matching was structurally broken for installation
+ * tokens (#190) and marker matching keeps working when the workflow's token
+ * identity changes. Cleanup excludes the replacement review id so it can
+ * never touch the review the current run just created. Review content
+ * is never modified — the review is hidden or dismissed, not rewritten.
+ */
+import { isManagedBody } from "../metadata/markers.js";
+import type { PublishPlatformApi, PublishReviewRef } from "../platform/publish-api.js";
+import { hasUsableOwner, ownerMatchesIdentity, type IdentityResolution, type TrustedOwnerIdentity } from "../platform/owner-identity.js";
+
+export type CleanupLog = (line: string) => void;
+
+/** #1093: the trusted owner identity the cleanup decisions run under.
+ * Prefers the adapter's `resolveTrustedOwner()` (which carries a bounded
+ * diagnostics reason and the Forgejo Authorized Integration user-id proof);
+ * falls back to `authenticatedIdentity()` (login-kind) when the adapter does
+ * not implement it. `null` when neither can prove an identity — callers
+ * fail closed (no deletions). */
+export async function resolvePublishTrustedOwner(api: PublishPlatformApi): Promise<{ owner: TrustedOwnerIdentity | null; reason: string }> {
+  if (typeof api.resolveTrustedOwner === "function") {
+    try {
+      const resolution: IdentityResolution = await api.resolveTrustedOwner();
+      return { owner: resolution.identity, reason: resolution.reason };
+    } catch {
+      return { owner: null, reason: "unavailable" };
+    }
+  }
+  let identity: string | null = null;
+  try {
+    identity = await api.authenticatedIdentity?.() ?? null;
+  } catch {
+    identity = null;
+  }
+  return identity === null || identity.trim() === ""
+    ? { owner: null, reason: "unavailable" }
+    : { owner: { kind: "login", login: identity }, reason: "user-login" };
+}
+
+/** Best-effort retirement after replacement publication; never trusts comment text alone.
+ * #1099: the trusted-owner identity is resolved once per publish run and
+ * threaded in here (`resolvePublishTrustedOwner` is the caller's job), so the
+ * Forgejo reaction self-write probe fires once per run instead of twice. The
+ * identity proof is shared, never the per-item verification: the ownership
+ * re-checks below still run independently for every review and comment.
+ * Fail-closed: a `null` identity retires nothing and still emits the bounded
+ * `identity reason: <reason>` WARN. */
+export async function retireManagedInlineComments(
+  api: PublishPlatformApi, reviews: readonly PublishReviewRef[], marker: string, log: CleanupLog,
+  trustedOwner: Awaited<ReturnType<typeof resolvePublishTrustedOwner>>,
+  mayDelete: () => Promise<boolean> = async () => true,
+): Promise<void> {
+  const { owner, reason } = trustedOwner;
+  if (owner === null) {
+    log(`  WARN: Could not verify authenticated owner (identity reason: ${reason}); no inline comments retired`);
+    return;
+  }
+  const managed = reviews.filter((r) => isManagedBody(typeof r.body === "string" ? r.body : "", marker)
+    && ownerMatchesIdentity(r.user, owner));
+  const ids = managed.map((r) => String(r.id)).filter((id) => /^[1-9]\d*$/.test(id));
+  // #1093: an empty eligible set is a real, bounded outcome (nothing prior to
+  // retire) and must be distinguishable from the unusable-snapshot refusals
+  // below (unsupported forge, incomplete enumeration) and from a run that
+  // never reached cleanup at all. No ids, bodies, or comment text are logged.
+  if (ids.length === 0) {
+    log("  NOTE: No managed native reviews owned by the trusted identity; nothing to retire");
+    return;
+  }
+  const listed = await api.listManagedInlineComments(ids);
+  if (!listed.supported) { log("  NOTE: Inline-comment retirement unsupported by this forge"); return; }
+  if (!listed.complete) { log("  WARN: Inline-comment enumeration incomplete; no comments retired"); return; }
+  if (listed.comments.length > 100) { log("  WARN: More than 100 inline comments; processing only the first 100"); }
+  let retired = 0, replies = 0, failed = 0, eligible = 0;
+  const seen = new Set<string>();
+  if (listed.comments.length === 0) { log("  Inline comments: eligible=0 retired=0 skipped-discussion=0 failed=0"); return; }
+  const authors = new Map(ids.map((id) => [id, owner]));
+  const foreignReviews = new Set<string>();
+  for (const comment of listed.comments) {
+    const reviewOwner = authors.get(String(comment.reviewId));
+    if (!reviewOwner || !ownerMatchesIdentity(comment.user, reviewOwner)) foreignReviews.add(String(comment.reviewId));
+  }
+  for (const comment of listed.comments.slice(0, 100)) {
+    const key = `${String(comment.reviewId)}:${String(comment.id)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const review = managed.find((r) => String(r.id) === String(comment.reviewId));
+    if (foreignReviews.has(String(comment.reviewId))) { replies++; continue; }
+    if (!review || !/^[1-9]\d*$/.test(String(comment.id ?? ""))) { failed++; continue; }
+    // Adapters derive discussion status from complete listings; unknown status fails closed.
+    if (comment.inReplyToId != null || comment.in_reply_to_id != null || comment.hasReplies !== false || !hasUsableOwner(comment.user)) { replies++; continue; }
+    eligible++;
+    try {
+      if (!(await mayDelete())) { log("  WARN: Head or latest review changed; stopping inline-comment retirement"); break; }
+      // Replies may arrive after the initial listing. Refresh discussion state before mutation.
+      const fresh = await api.listManagedInlineComments([String(review.id)]);
+      if (!fresh.supported || !fresh.complete) { log("WARN: Discussion revalidation incomplete; stopping retirement"); break; }
+      const current = fresh.comments.find((row) => String(row.id) === String(comment.id));
+      if (fresh.comments.some((row) => !ownerMatchesIdentity(row.user, owner))
+        || (current && (current.hasReplies !== false || current.in_reply_to_id != null || current.inReplyToId != null))) { replies++; continue; }
+      if (!(await mayDelete())) break;
+      if (await api.retireInlineComment(String(review.id), String(comment.id))) retired++;
+      else { failed++; break; }
+    } catch { failed++; break; }
+  }
+  log(`  Inline comments: eligible=${eligible} retired=${retired} skipped-discussion=${replies} failed=${failed}`);
+}
+
+const DISMISSAL_MESSAGE = "Superseded by a newer automated review for this pull request.";
+
+/** Resolve the cleanup flag exactly like `resolve_cleanup_flag` (v2). */
+export function resolveCleanupFlag(raw: string | undefined, mode: string): "true" | "false" {
+  const value = (raw ?? "").toLowerCase();
+  if (value === "true") return "true";
+  if (value === "false") return "false";
+  if (value === "auto" || value === "") {
+    // #1161: `review_blockers` publishes a native review like the other
+    // native modes, so cleanup is on by default for it too.
+    return mode === "review_comment" || mode === "review_verdict" || mode === "review_blockers" ? "true" : "false";
+  }
+  throw new Error("Invalid cleanup_previous_native_reviews value; expected auto, true, or false");
+}
+
+/**
+ * Select the managed reviews to clean up: bodies starting with the
+ * configured marker (or the legacy `<!-- ai-pr-reviewer` prefix), skipping
+ * already-minimized reviews unless they still carry a live verdict (a
+ * previous run may have minimized but failed the dismissal).
+ */
+export function selectManagedReviews(
+  reviews: readonly PublishReviewRef[],
+  marker: string,
+  minimizedIds: readonly string[],
+): Array<{ id: string; nodeId: string; state: string; minimized: boolean }> {
+  const minimized = new Set(minimizedIds.map(String));
+  const selected: Array<{ id: string; nodeId: string; state: string; minimized: boolean }> = [];
+  for (const review of reviews) {
+    const body = typeof review.body === "string" ? review.body : "";
+    if (!isManagedBody(body, marker)) continue;
+    const state = review.state ?? "";
+    const id = String(review.id ?? "");
+    if (id === "") continue;
+    const isMinimized = minimized.has(id);
+    const liveVerdict = state === "APPROVED" || state === "CHANGES_REQUESTED";
+    if (!liveVerdict && isMinimized) continue;
+    selected.push({
+      id,
+      nodeId: typeof review.node_id === "string" ? review.node_id : "",
+      state,
+      minimized: isMinimized,
+    });
+  }
+  return selected;
+}
+
+/**
+ * Dismiss and minimize (hide as outdated) every previous managed native
+ * review, then resolve the superseded review threads (GitHub only — thread
+ * state is GraphQL-only). Individual failures log warnings and never abort
+ * cleanup; a failed review listing skips cleanup entirely.
+ */
+export async function cleanupManagedReviews(
+  api: PublishPlatformApi,
+  prNumber: string,
+  marker: string,
+  log: CleanupLog,
+  excludeReviewIds: readonly string[] = [],
+  snapshot?: readonly PublishReviewRef[],
+): Promise<string[]> {
+  log(`Cleaning up previous managed native reviews for #${prNumber}`);
+  let reviews: PublishReviewRef[];
+  try {
+    reviews = snapshot ? [...snapshot] : await api.listReviews();
+  } catch {
+    log(`  WARN: Could not list reviews for #${prNumber}; skipping cleanup`);
+    return [];
+  }
+
+  // Minimized state lives only in GraphQL (the REST list does not expose
+  // it). The read is an IDEMPOTENCY guard, not a safety gate: the GitHub
+  // adapter answers an unreadable minimized state with an EMPTY SET (it
+  // never throws), so the only thing an empty set changes is that a body
+  // which is already hidden may be hidden again (idempotent). On Forgejo
+  // there is no GraphQL API: the query is skipped.
+  let minimizedIds: string[] = [];
+  if (api.platform === "github") {
+    minimizedIds = await api.minimizedReviewIds();
+  } else {
+    log(`  NOTE: Skipping GraphQL minimized-state query (platform=${api.platform}; no GraphQL API)`);
+  }
+
+  const excluded = new Set(excludeReviewIds.map(String));
+  const managed = selectManagedReviews(reviews, marker, minimizedIds).filter((review) => !excluded.has(review.id));
+  if (managed.length === 0) {
+    log(`  No previous managed native reviews to clean up for #${prNumber}`);
+    return [];
+  }
+
+  for (const review of managed) {
+    // #1144: the review id is the review's identity for the whole cleanup
+    // decision, and the dismissal interpolates it into a REST path
+    // (`/reviews/{id}/dismissals`). A malformed id is not targetable at
+    // all: such a review is neither dismissed nor hidden.
+    if (!/^[1-9]\d*$/.test(review.id)) continue;
+    if (review.state === "APPROVED" || review.state === "CHANGES_REQUESTED") {
+      const dismissed = await api.dismissReview(review.id, DISMISSAL_MESSAGE);
+      if (dismissed) {
+        log(`  Dismissed outdated managed review #${review.id} (${review.state})`);
+      } else {
+        log(`  WARN: Could not dismiss review #${review.id} (may require additional permissions)`);
+      }
+    }
+    if (review.nodeId !== "" && !review.minimized) {
+      const minimizedNow = await api.minimizeReview(review.nodeId);
+      if (minimizedNow) {
+        log(`  Minimized (hidden as outdated) review #${review.id}`);
+      } else if (api.platform === "forgejo") {
+        log(`  NOTE: Skipping minimizeComment for review #${review.id} (platform=${api.platform}; no GraphQL API)`);
+      } else {
+        log(`  WARN: Could not minimize review #${review.id} (may require additional permissions)`);
+      }
+    }
+  }
+  return managed.map((review) => review.id);
+}
+
+/** The submitted states whose reviews #1144 hiding may target. An unknown,
+ * absent, or pending state proves nothing a mutation may be aimed at: it
+ * fails closed. */
+const HIDEABLE_STATES: ReadonlySet<string> = new Set(["COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
+
+/**
+ * #1181: the whole-review deletion predicate — the single source both the
+ * eligibility filter and the per-mutation gate derive from. Deletion is
+ * attempted ONLY when ALL of:
+ * - the review's state is a non-verdict state (`COMMENTED` or `DISMISSED`):
+ *   verdict states (`APPROVED`/`CHANGES_REQUESTED`) are NEVER deleted — they
+ *   keep the existing dismissal path, which strikes the stale merge-gate
+ *   vote without destroying the review; AND
+ * - the forge-reported `official` flag is PROVEN `false` on the row (true,
+ *   absent, and unknown all fail closed).
+ *
+ * Rationale (upstream Forgejo, `models/issues/review.go`): `DeleteReview`
+ * ends with `if r.Official { restoreLatestOfficialReview(ctx, r.IssueID,
+ * r.ReviewerID) }`, and `restoreLatestOfficialReview` re-officials the
+ * LATEST remaining review of types {Approve, Reject, Request} by the same
+ * reviewer (`Desc("id")`) WITHOUT filtering on `Dismissed`. Because a
+ * dismissed review keeps its original state token (the API flags `dismissed`
+ * separately), a `DISMISSED` row's underlying type can be an official
+ * Approve/Reject — deleting it would re-official an older `APPROVED` review
+ * from the same reviewer, silently reactivating a stale merge-gate verdict.
+ * Whole-review deletion must never be able to exploit that side effect.
+ */
+function deletionEligible(review: PublishReviewRef): boolean {
+  return (review.state === "COMMENTED" || review.state === "DISMISSED")
+    && review.official === false;
+}
+
+/**
+ * #1144: after a verified newer-publication checkpoint at the current PR
+ * head, every older managed review from the trusted publishing identity is
+ * proven superseded and must stop being visible — even when this run's
+ * replacement is partial/incomplete or used the fallback submission path.
+ * The newest published managed review is the only visible managed review,
+ * period; this supersedes the #1114 carve-out that kept an older
+ * `CHANGES_REQUESTED`/`APPROVED` body visible on an incomplete replacement.
+ *
+ * The state-specific operation mirrors `cleanupManagedReviews`, minus the
+ * destructive/authoritative effects that stay behind the strict
+ * complete-coverage gate (inline-comment deletion, thread resolution):
+ * - `APPROVED`/`CHANGES_REQUESTED`: dismissal through the existing
+ *   dismissal behavior (strikes the stale merge-gate verdict), then
+ *   minimization hides the body when a GraphQL node id is present and the
+ *   body is not already hidden (a previous run may have minimized but
+ *   failed the dismissal);
+ * - `COMMENTED`/`DISMISSED`: minimization only (GitHub `minimizeComment`,
+ *   classifier OUTDATED) — presentation only, never review content.
+ *
+ * Fail-closed provenance, the same policy retirement follows:
+ * - a `null` trusted owner hides nothing (bounded identity-reason WARN);
+ * - candidates are managed-marker reviews OWNED by that proven identity;
+ *   foreign/human reviews never match the owner, and any unknown/absent
+ *   state or pending review is excluded;
+ * - excluded ids (the replacement this run just published) are skipped;
+ * - the minimized-state read is an IDEMPOTENCY guard, not a safety gate: it
+ *   only prevents re-hiding an already-hidden body. The GitHub adapter
+ *   answers an unreadable minimized state with an empty set (it never
+ *   throws), so in production the hide still runs; only an adapter that
+ *   actually throws (the defensive catch) hides no bodies — and even then
+ *   the dismissals still run, because dismissal has no GraphQL dependency;
+ * - `mayHide` revalidates supersession (current head, the replacement
+ *   checkpoint, no newer competing publication) at the mutation boundary
+ *   before every review's mutations, so a competing run can never hide the
+ *   winner.
+ * #1176: a forge with no GraphQL hide but an author-side review deletion
+ * (`DELETE /repos/{owner}/{repo}/pulls/{index}/reviews/{id}` on Forgejo)
+ * substitutes deletion for minimization — the superseded body otherwise
+ * stays visible forever. Deletion is attempted only for reviews PROVEN to
+ * carry no inline comments (a complete enumeration over the review's
+ * comments): the DELETE destroys the review and all of its code comments in
+ * one stroke, so a review carrying inline findings is refused fail-closed
+ * (those findings must survive an incomplete run per #1144), and so is an
+ * enumeration that is incomplete or unsupported — an uncertain picture never
+ * licenses a destructive mutation.
+ * #1181: deletion is further narrowed to NON-VERDICT rows that PROVABLY
+ * cannot reactivate a stale verdict (`deletionEligible`, above): the state
+ * must be `COMMENTED`/`DISMISSED` and the forge-reported `official` flag
+ * must be proven `false`. Upstream, `DeleteReview` restores the latest
+ * remaining official Approve/Reject/Request review by the same reviewer
+ * (`restoreLatestOfficialReview`, no Dismissed filter), so deleting a
+ * verdict row — or a `DISMISSED` row whose underlying type is an official
+ * Approve/Reject — would re-official a stale merge-gate vote. Verdict states
+ * therefore keep the dismissal path and are never deletion targets, and a
+ * non-verdict row whose `official` flag is true, absent, or unknown is
+ * refused with an explicit bounded NOTE (deletion refused, body stays
+ * visible) rather than silently dropped. The publication-boundary re-check
+ * (`mayHide`) applies again immediately before the DELETE, exactly like it
+ * gates every other mutation. The complete-coverage path
+ * (`cleanupManagedReviews`) deliberately NEVER deletes whole reviews:
+ * deletion there would destroy reply threads and foreign-authored comments
+ * that per-comment retirement preserves.
+ * GraphQL minimization is GitHub-only: other forges log an explicit note,
+ * make zero GraphQL calls, and still dismiss verdict states where the
+ * adapter supports it (a failed dismissal is a bounded WARN, matching the
+ * complete-path behavior). Individual failures log bounded diagnostics and
+ * never throw; review content is never modified.
+ */
+export async function hideSupersededManagedReviews(
+  api: PublishPlatformApi,
+  reviews: readonly PublishReviewRef[],
+  marker: string,
+  log: CleanupLog,
+  trustedOwner: Awaited<ReturnType<typeof resolvePublishTrustedOwner>>,
+  excludeReviewIds: readonly string[] = [],
+  mayHide: () => Promise<boolean> = async () => true,
+): Promise<void> {
+  const { owner, reason } = trustedOwner;
+  if (owner === null) {
+    log(`  WARN: Could not verify authenticated owner (identity reason: ${reason}); no superseded reviews hidden`);
+    return;
+  }
+  // Minimized state and `minimizeComment` are GraphQL-only capabilities.
+  // The REST dismissal path does not depend on them. The minimized-state
+  // read is an idempotency guard only: an empty set means "nothing is known
+  // to be minimized", not "the read failed" — the GitHub adapter answers an
+  // unreadable state with an empty set and never throws, so the hide still
+  // runs (only a re-hide of an already-hidden body is possible).
+  let canMinimize = false;
+  const minimized = new Set<string>();
+  if (api.platform === "github") {
+    try {
+      for (const id of await api.minimizedReviewIds()) minimized.add(String(id));
+      canMinimize = true;
+    } catch {
+      log("  WARN: Could not read minimized review state; no review bodies minimized");
+    }
+  } else {
+    log(`  NOTE: Skipping GraphQL review minimization (platform=${api.platform}; no GraphQL API)`);
+  }
+  // #1176: deletion substitutes for minimization only where no GraphQL hide
+  // exists (the per-review attempt below gates on `canDelete && !canMinimize`,
+  // so GitHub keeps minimization and the #1144 invariant that hiding never
+  // enumerates inline comments).
+  const canDelete = api.supersededReviewDeletion?.supported === true
+    && typeof api.deleteSupersededReview === "function";
+  const excluded = new Set(excludeReviewIds.map(String));
+  const eligible = reviews.filter((review) => {
+    const id = String(review.id ?? "");
+    // #1144: the dismissal interpolates the review id into a REST path
+    // (`/reviews/{id}/dismissals`), so a malformed id is never targetable.
+    if (!/^[1-9]\d*$/.test(id) || excluded.has(id)) return false;
+    const state = review.state ?? "";
+    if (!HIDEABLE_STATES.has(state)) return false;
+    if (!isManagedBody(typeof review.body === "string" ? review.body : "", marker)) return false;
+    if (!ownerMatchesIdentity(review.user, owner)) return false;
+    // A live verdict must be dismissed even if a previous run already hid
+    // the body but failed the dismissal.
+    if (state === "APPROVED" || state === "CHANGES_REQUESTED") return true;
+    // Non-verdict bodies hide once, and only with a GraphQL node to aim at;
+    // without one, provenance for the mutation is unestablished. #1176: on a
+    // forge with author-side review deletion there is a second, node-free
+    // mechanism. #1181: the eligibility filter admits non-verdict rows whose
+    // `official` flag is NOT proven false only so the per-review pass can
+    // emit the bounded deletion-refusal NOTE — the DELETE itself is gated by
+    // `deletionEligible` at the mutation boundary below, and filter and gate
+    // derive from that same predicate, so a forge that somehow carries both
+    // capabilities never counts a review it will not actually process.
+    return (canMinimize && !minimized.has(id) && typeof review.node_id === "string" && review.node_id !== "")
+      || (canDelete && !canMinimize);
+  });
+  if (eligible.length === 0) {
+    log("  NOTE: No superseded owned managed reviews to hide");
+    return;
+  }
+  if (eligible.length > 100) log("  WARN: More than 100 eligible superseded reviews; processing only the first 100");
+  let dismissed = 0, minimizedNow = 0, failed = 0, deleted = 0;
+  for (const review of eligible.slice(0, 100)) {
+    const id = String(review.id);
+    try {
+      if (!(await mayHide())) { log("  WARN: Head or latest review changed; stopping superseded review cleanup"); break; }
+      // #1176: where no GraphQL hide exists, deletion substitutes for it —
+      // but only after the review is proven to carry no inline comments
+      // (complete enumeration), because the DELETE destroys the review and
+      // all of its code comments. Findings survive an incomplete run per
+      // #1144, so a review carrying them, or an enumeration that cannot
+      // prove emptiness, is refused fail-closed and the body stays visible.
+      // #1181: the DELETE also fires the upstream `restoreLatestOfficialReview`
+      // side effect (the latest remaining Approve/Reject/Request review by
+      // the same reviewer is re-officialed without a Dismissed filter), so
+      // the mutation is gated by `deletionEligible`: non-verdict state AND a
+      // proven-false `official` flag. Verdict states are never deletion
+      // targets — the dismissal path below strikes their stale vote instead.
+      if (canDelete && !canMinimize && deletionEligible(review)) {
+        // The enumeration itself is bounded to this review: an adapter that
+        // throws here refuses only THIS review's deletion (falling back to
+        // the state-specific behavior below) instead of aborting the whole
+        // cleanup pass.
+        let listed: Awaited<ReturnType<PublishPlatformApi["listManagedInlineComments"]>>;
+        try {
+          listed = await api.listManagedInlineComments([id]);
+        } catch {
+          listed = { supported: true, complete: false, comments: [] };
+        }
+        if (listed.supported && listed.complete && listed.comments.length === 0) {
+          // The publication-boundary re-check applies per mutation: prove
+          // supersession again immediately before the DELETE.
+          if (!(await mayHide())) { log("  WARN: Head or latest review changed; stopping superseded review cleanup"); break; }
+          // The DELETE is bounded to this review too: a throwing adapter
+          // (the seam is public and swallows its own transport errors, but a
+          // mock need not) refuses only this review's deletion instead of
+          // aborting the pass.
+          let deletion: { ok: boolean; error?: string };
+          try {
+            deletion = await api.deleteSupersededReview!(id);
+          } catch (error) {
+            deletion = { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+          if (deletion.ok) {
+            deleted++;
+            log(`  Deleted superseded managed review #${id} (carried no inline findings)`);
+            continue;
+          }
+          failed++;
+          // #1181: a failed DELETE on a non-verdict row is a bounded failure —
+          // no dismissal fallback applies to non-verdict rows (dismissal is
+          // the verdict-state path), so the body simply stays visible.
+          log(`  WARN: Could not delete superseded review #${id} (${deletion.error ?? "unknown reason"}); its body stays visible`);
+        } else if (listed.supported && listed.complete) {
+          log(`  NOTE: Superseded review #${id} carries inline findings; deletion refused, its body stays visible`);
+        } else if (listed.supported) {
+          log(`  WARN: Inline-comment enumeration for review #${id} is incomplete; deletion refused, its body stays visible`);
+        } else {
+          log(`  NOTE: Inline-comment enumeration is unsupported by this forge; deletion refused, review #${id} stays visible`);
+        }
+      } else if (canDelete && !canMinimize && review.state !== "APPROVED" && review.state !== "CHANGES_REQUESTED") {
+        // #1181: a non-verdict row whose `official` flag is not proven false
+        // never reaches the DELETE (the upstream restore side effect could
+        // reactivate a stale verdict); the refusal is an explicit bounded
+        // NOTE, not a silent drop. Verdict states are absent here on purpose:
+        // they are never deletion targets, and their stale vote is struck by
+        // the dismissal path below.
+        log(`  NOTE: Deletion refused for review #${id} (official-count flag not proven false; deleting could reactivate a stale verdict); its body stays visible`);
+      }
+      if (review.state === "APPROVED" || review.state === "CHANGES_REQUESTED") {
+        if (await api.dismissReview(id, DISMISSAL_MESSAGE)) {
+          dismissed++;
+          log(`  Dismissed superseded managed review #${id} (${review.state})`);
+        } else {
+          failed++;
+          log(`  WARN: Could not dismiss review #${id} (may require additional permissions)`);
+        }
+      }
+      if (canMinimize && !minimized.has(id) && typeof review.node_id === "string" && review.node_id !== "") {
+        if (await api.minimizeReview(String(review.node_id))) minimizedNow++;
+        else failed++;
+      }
+    } catch { failed++; break; }
+  }
+  log(`  Superseded reviews: eligible=${Math.min(eligible.length, 100)} dismissed=${dismissed} minimized=${minimizedNow} failed=${failed} deleted=${deleted}`);
+}
+
+/**
+ * Resolve the inline review threads that superseded managed reviews opened
+ * (#769): dismissal strikes the verdict and minimization hides the body,
+ * but a thread stays open on the Files tab and re-anchors to the new head.
+ * Thread state is GraphQL-only, hence GitHub-only; bounded to the first 100
+ * threads. Human threads are never touched: a thread qualifies only when its
+ * first comment belongs to a managed review.
+ */
+export async function resolveSupersededThreads(
+  api: PublishPlatformApi,
+  managedIds: readonly string[],
+  log: CleanupLog = () => undefined,
+): Promise<number> {
+  if (managedIds.length === 0) return 0;
+  const ids = managedIds.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0) {
+    log("  WARN: Could not parse managed review ids; skipping review-thread resolution");
+    return 0;
+  }
+  const query = await api.unresolvedSupersededThreads(ids);
+  if (!query.ok) {
+    log("  WARN: Could not list review threads; superseded threads left open");
+    return 0;
+  }
+  if (query.hasNextPage) {
+    log("  WARN: More than 100 review threads; only the first 100 were checked");
+  }
+  let resolved = 0;
+  for (const thread of query.threads) {
+    if (await api.resolveThread(thread.id)) {
+      resolved += 1;
+    } else {
+      log(`  WARN: Could not resolve review thread ${thread.id} (may require additional permissions)`);
+    }
+  }
+  if (resolved > 0) {
+    log(`  Resolved ${resolved} superseded review thread(s)`);
+  }
+  return resolved;
+}

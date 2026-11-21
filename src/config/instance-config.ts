@@ -1,0 +1,786 @@
+/** #727: the Operator-mode instance configuration schema (v1).
+ *
+ * One operator installs one controller for many repositories. The instance
+ * config is that operator's **trusted** policy file: it defines the forge
+ * integrations, the named model/executor/evidence profiles repositories may
+ * select from, the adoption policy, and the global reviewer defaults that
+ * form the envelope repository config may narrow.
+ *
+ * Trust model (the #727 layering, made structural):
+ *
+ * - **Hard security policy** is not a config section — it is what this
+ *   validator refuses to express. There is no field anywhere in the schema
+ *   for inline credentials (only opaque *credential references* resolved by
+ *   the #735 credential broker), model endpoints are scheme-checked
+ *   http/https with no embedded credentials, executor profiles are a closed
+ *   `kind` enum whose backend specs are bounded versioned fields (#733: a
+ *   fixed local argv or an OCI image reference — never a PodSpec, host
+ *   path, or free-form string), and every budget carries a hard ceiling.
+ *   Unknown fields are rejected at every level, so a hostile or mistaken
+ *   key has no place to land.
+ * - **Operator policy** is this file — trusted input, validated strictly.
+ *   A malformed or invalid instance config must fail closed (a typed error
+ *   the controller refuses to start on), never partially apply: silently
+ *   running with a subset of the operator's policy could only ever be
+ *   *wider* than intended, never narrower.
+ * - **Repository config** is untrusted and is resolved by
+ *   `effective-config.ts` (which reuses `repository-config.ts`'s
+ *   narrow-only precedence); it can never create authority this file did
+ *   not grant.
+ *
+ * Profiles are **names**, not infrastructure (#727): repository config
+ * references `model-profile: local-fast`, never a URL, image, PodSpec, or
+ * credential. An unknown name is rejected or falls back to the operator's
+ * default according to the explicit `unknown-profile-policy` knob — it can
+ * never become arbitrary infrastructure.
+ *
+ * The YAML surface is v3 kebab-case (same convention as
+ * `contracts/action-v3.yml`); TypeScript fields are camelCase. `version` is
+ * required and must be exactly 1; schema evolution is additive within v1
+ * and version-bumped otherwise.
+ */
+
+import { parse as parseYaml } from "yaml";
+import { parseRepoRef } from "../platform/repo-ref.js";
+import { forgeWireFamily, isForgeId, type ForgeId } from "../platform/resolve.js";
+import type { ActionContract } from "./contract.js";
+import type { AdoptionPolicy } from "./adoption.js";
+import { validateNamespacePolicies, type NamespacePolicy } from "./namespace-policy.js";
+import { SECRET_INPUTS, InstanceConfigError, hasControlCharacters } from "./schema.js";
+import type { ApiFormat } from "./types.js";
+import { normalizeCandidate } from "./repository-config.js";
+
+// Shared hygiene helper and the trusted-layer error live in the leaf
+// `schema.ts` so `namespace-policy.ts` can use/subclass them without an
+// import cycle through this module; re-exported here for the existing
+// import sites.
+export { InstanceConfigError, hasControlCharacters };
+
+/** Hard byte cap on the instance config file itself. The file is trusted
+ * operator input, but the controller still bounds what it will ever parse. */
+export const MAX_INSTANCE_CONFIG_BYTES = 262_144;
+
+/** Hard ceiling for a model profile's declared context window. */
+export const MAX_MODEL_CONTEXT_TOKENS = 10_000_000;
+
+/** Hard ceiling on a model profile's model id. The executor envelope mirrors
+ * this ceiling (#1496) — keep them in sync; drift fails closed there. */
+const MAX_MODEL_ID_CHARS = 512;
+
+/** Hard ceiling for an executor profile's per-worker review concurrency. */
+export const MAX_EXECUTOR_MAX_REVIEWS = 64;
+
+/** Hard ceiling for the controller's review concurrency. */
+export const MAX_QUEUE_CONCURRENT_REVIEWS = 256;
+
+/** Hard ceiling on adoption list entries (and, reusing the same generous
+ * bound, on profile-list length). */
+export const MAX_ADOPTION_LIST_ENTRIES = 10_000;
+
+const PROFILE_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
+const CREDENTIAL_REF_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CURRENCY_RE = /^[A-Z]{3}$/;
+const MAX_ENDPOINT_BYTES = 2048;
+const MAX_PATH_BYTES = 4_096;
+
+export type UnknownProfilePolicy = "reject" | "fallback_default";
+
+export interface ModelPricing {
+  readonly inputPerMillion: number;
+  readonly outputPerMillion: number;
+  readonly currency: string;
+}
+
+export interface ModelProfile {
+  readonly name: string;
+  readonly endpoint: string;
+  readonly apiFormat: ApiFormat;
+  /** Opaque credential reference resolved by the credential broker (#735).
+   * Never an inline secret — the schema has no field that could hold one. */
+  readonly credential: string;
+  /** The model id sent to the endpoint on the wire. `""` means the operator
+   * configured none (sentinel discipline — consumers never branch on
+   * undefined), and a run whose selected profile carries no model id is
+   * REFUSED at execution-envelope composition (#1496). The schema stays
+   * permissive so a non-review instance config still validates. */
+  readonly model: string;
+  readonly contextTokens: number | null;
+  readonly pricing: ModelPricing | null;
+}
+
+export interface ForgeIntegration {
+  readonly name: string;
+  /** `gitea` (#1682): the Gitea wire family — native webhook
+   * (`X-Gitea-Signature`), REST `/api/v1`, and clone transport are the
+   * Forgejo-compatible ones the `forgejo` stack already speaks. It is an
+   * IDENTITY kind (capability composition, diagnostics, and the
+   * forge-integration guards see `gitea`); the canonical forge platform of
+   * every event, job, and durable record stays `forgejo`
+   * (`forgeFamily`), so generations converge across webhooks and polls. */
+  readonly kind: ForgeId;
+  readonly endpoint: string;
+  readonly credential: string;
+}
+
+/** The canonical forge platform family (#1682): the platform identity that
+ * flows through `CanonicalForgeEvent`, `ReviewJob`, the generation id, the
+ * queue/state records, and the execution envelope — the three REST families
+ * `github` | `forgejo` | `gitlab`. A `gitea` integration belongs to the
+ * `forgejo` family (Forgejo is a Gitea fork; the wire formats are the same),
+ * so `kind: gitea` never re-keys a generation and never splits an instance's
+ * webhook/poll convergence; a `gitlab` integration (#740) is its OWN family.
+ * ONE definition: the platform seam owns it (`forgeWireFamily`, #1678), and
+ * every family-aware guard compares through this function. */
+export type ForgeFamily = "github" | "forgejo" | "gitlab";
+
+export function forgeFamily(kind: ForgeIntegration["kind"]): ForgeFamily {
+  return forgeWireFamily(kind);
+}
+
+/** The `local` executor backend spec (#733): the fixed argv the executor
+ * launches. `command` is a single argv element — never a shell line; the
+ * executor spawns argv-only and there is no `/bin/sh -c` anywhere on this
+ * path — and `args` are the operator's fixed arguments, placed BEFORE the
+ * request-path argument the executor appends. */
+export interface LocalExecutorSpec {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+/** The `oci` executor backend spec (#733): the fully-qualified image
+ * reference a container-based executor runs. Name[:tag][@sha256:digest]
+ * only — no volumes, privileges, or env; anything more must arrive as an
+ * explicit versioned schema field (#734), never a free-form string. */
+export interface OciImageSpec {
+  readonly image: string;
+}
+
+/** One required cpu/memory quantity pair of a Kubernetes executor's
+ * resource block. Requests and limits are both mandatory — a pod without
+ * a declared footprint is not shippable. */
+export interface KubernetesResourcePair {
+  readonly cpu: string;
+  readonly memory: string;
+}
+
+/** One operator-declared volume mapping of the Kubernetes executor spec:
+ * a PVC the controller and the worker pod both see, anchored at
+ * `controllerRoot` — the claim is mounted in the pod at the SAME
+ * absolute path, because the request envelope is the validated request
+ * serialized VERBATIM: its workspace and result coordinates are only
+ * correct when both sides see identical paths. The schema can express
+ * NOTHING else — there is no hostPath, no arbitrary PodSpec fragment,
+ * no way to rename paths across the boundary, and no other volume type,
+ * so the pod's storage surface is exactly these mappings. */
+export interface KubernetesVolumeMapping {
+  readonly claim: string;
+  readonly controllerRoot: string;
+}
+
+/** The `kubernetes` executor backend spec (#734): everything the executor
+ * needs to build one ephemeral Job per review execution, and nothing
+ * more. Every security-relevant pod property (non-root uid/gid, seccomp,
+ * capability drop, read-only rootfs, no SA-token automount, backoffLimit
+ * 0, TTL cleanup, resources, deadline) is a fixed executor default, not
+ * configuration; this spec carries only the operator's deployment facts:
+ * the worker image contract, where jobs live, and which PVCs carry the
+ * controller/worker shared paths. */
+export interface KubernetesExecutorSpec {
+  readonly image: string;
+  /** The image's fixed operator argv, placed before the envelope path the
+   * executor appends (the worker-image contract's argv prefix). */
+  readonly args: readonly string[];
+  readonly namespace: string;
+  /** Dedicated worker service account, required by name — the executor
+   * never falls back to `default`, and its token is never mounted. */
+  readonly serviceAccount: string;
+  readonly ttlSecondsAfterFinished: number;
+  readonly resources: {
+    readonly requests: KubernetesResourcePair;
+    readonly limits: KubernetesResourcePair;
+  };
+  /** 1..8 controller/pod shared-volume mappings. */
+  readonly volumes: readonly KubernetesVolumeMapping[];
+  /** Optional RuntimeClass pin (#1422): when set, the worker pod template
+   * carries `runtimeClassName` so the pod runs under the operator's
+   * sandboxed runtime (gVisor, Kata, …). An operator-trusted deployment
+   * fact like the namespace or service account; absent means the cluster
+   * default runtime, and a missing/unsupported RuntimeClass fails the
+   * launch closed — never a fallback to an unpinned pod. */
+  readonly runtimeClassName?: string;
+}
+
+export interface ExecutorProfile {
+  readonly name: string;
+  /** Closed set. Backend specs are the versioned schema fields below
+   * (#733/#734): `local` a fixed argv, `oci` an image reference,
+   * `kubernetes` the worker-image/deployment spec above — never
+   * free-form keys here. */
+  readonly kind: "local" | "oci" | "kubernetes";
+  readonly maxReviews: number | null;
+  /** The `local` backend spec; non-null only for `kind: "local"`. */
+  readonly local: LocalExecutorSpec | null;
+  /** The `oci` backend spec; non-null only for `kind: "oci"`. */
+  readonly oci: OciImageSpec | null;
+  /** The `kubernetes` backend spec; non-null only for `kind:
+   * "kubernetes"`. */
+  readonly kubernetes: KubernetesExecutorSpec | null;
+}
+
+export interface EvidenceProfile {
+  readonly name: string;
+  /** Operator-owned path to an evidence-providers file (the same format as
+   * the Action's `evidence-providers-file` input). Provider commands are
+   * operator-defined; repositories select a profile by name only. */
+  readonly providersFile: string;
+}
+
+export interface InstanceQueue {
+  readonly maxConcurrentReviews: number | null;
+}
+
+export interface InstanceStorage {
+  readonly statePath: string | null;
+  readonly workspaceCachePath: string | null;
+}
+
+export interface InstanceConfig {
+  readonly version: 1;
+  /** What happens when repository config selects a profile name the
+   * instance does not define: `reject` (default) fails the review closed
+   * with a bounded diagnostic; `fallback_default` falls back to the
+   * operator's default profile with a warning. Explicit either way (#727:
+   * "rejected/falls back according to explicit operator policy"). */
+  readonly unknownProfilePolicy: UnknownProfilePolicy;
+  readonly forges: readonly ForgeIntegration[];
+  readonly modelProfiles: readonly ModelProfile[];
+  readonly defaultModelProfile: string;
+  readonly executorProfiles: readonly ExecutorProfile[];
+  readonly defaultExecutorProfile: string | null;
+  readonly evidenceProfiles: readonly EvidenceProfile[];
+  readonly defaultEvidenceProfile: string | null;
+  /** Operator-managed namespace/account shared review policies (#1350):
+   * one bounded review-rule set per forge account/organization, matched
+   * deterministically and layered between the operator envelope and the
+   * repository config. Operator config data — never repository-supplied
+   * content — so a PR can never change the shared policy governing its own
+   * review. Validated by `namespace-policy.ts`; any problem fails this
+   * validation closed (`NamespacePolicyError`, an `InstanceConfigError`
+   * subclass, propagates). */
+  readonly namespacePolicies: readonly NamespacePolicy[];
+  readonly adoption: AdoptionPolicy;
+  /** Global reviewer defaults — the envelope repository config may narrow.
+   * Keys are `repo-configurable` contract input ids, normalized to the
+   * string form `loadConfig` consumes (validated at `validateInstanceConfig`). */
+  readonly reviewerDefaults: Readonly<Record<string, string>>;
+  /** Whether repository config may override `repo-policy` inputs (the
+   * operator-mode equivalent of the Action's `allow-repo-policy-overrides`). */
+  readonly allowRepoPolicyOverrides: boolean;
+  readonly queue: InstanceQueue;
+  readonly storage: InstanceStorage;
+}
+
+function fail(path: string, why: string): never {
+  throw new InstanceConfigError(`${path}: ${why}`);
+}
+
+function objectAt(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail(path, "must be a mapping");
+  return value as Record<string, unknown>;
+}
+
+function rejectUnknown(item: Record<string, unknown>, allowed: readonly string[], path: string): void {
+  for (const key of Object.keys(item)) {
+    if (!allowed.includes(key)) fail(path, `unsupported field '${key}'`);
+  }
+}
+
+function stringAt(value: unknown, path: string): string {
+  if (typeof value !== "string" || value === "") fail(path, "must be a non-empty string");
+  if (hasControlCharacters(value)) fail(path, "must not contain control characters");
+  return value;
+}
+
+function integerAt(value: unknown, path: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) fail(path, "must be an integer");
+  if (value < min || value > max) fail(path, `must be between ${min} and ${max}`);
+  return value;
+}
+
+function booleanAt(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") fail(path, "must be a boolean");
+  return value;
+}
+
+/** Validate a profile/forge name: lowercase kebab-case, bounded length. */
+function profileNameAt(value: unknown, path: string): string {
+  const name = stringAt(value, path);
+  if (!PROFILE_NAME_RE.test(name)) fail(path, `must match ${PROFILE_NAME_RE.source}`);
+  return name;
+}
+
+/** Validate an endpoint URL: absolute http/https (self-hosted local models
+ * stay first-class), no embedded credentials, bounded length. This is the
+ * operator layer, so no host allowlisting happens here — that is the hard
+ * network policy's job at execution time; the config layer enforces scheme
+ * and credential hygiene so nothing secret ever lands in a URL. */
+function endpointAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (Buffer.byteLength(text, "utf8") > MAX_ENDPOINT_BYTES) fail(path, `must be at most ${MAX_ENDPOINT_BYTES} bytes`);
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    fail(path, "must be an absolute URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") fail(path, "must be an http or https URL");
+  if (url.username !== "" || url.password !== "") fail(path, "must not embed credentials in the URL");
+  if (url.hostname === "") fail(path, "must have a hostname");
+  return text;
+}
+
+/** Validate an opaque credential reference. Any string matching the token
+ * grammar is acceptable — the reference is *resolved* by the credential
+ * broker (#735); the config file never sees the secret itself. */
+function credentialRefAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (!CREDENTIAL_REF_RE.test(text)) fail(path, "must be a credential reference (letters, digits, '.', '_', ':', '-')");
+  return text;
+}
+
+function operatorPathAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (Buffer.byteLength(text, "utf8") > MAX_PATH_BYTES) fail(path, `must be at most ${MAX_PATH_BYTES} bytes`);
+  return text;
+}
+
+function validateDuplicateNames(names: readonly string[], label: string): void {
+  if (new Set(names).size !== names.length) fail(label, "contains duplicate names");
+}
+
+function validateProfilePricing(value: unknown, path: string): ModelPricing {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["input-per-million", "output-per-million", "currency"], path);
+  const input = item["input-per-million"];
+  const output = item["output-per-million"];
+  if (typeof input !== "number" || !Number.isFinite(input) || input < 0) fail(`${path}.input-per-million`, "must be a non-negative finite number");
+  if (typeof output !== "number" || !Number.isFinite(output) || output < 0) fail(`${path}.output-per-million`, "must be a non-negative finite number");
+  let currency = "USD";
+  if (item.currency !== undefined) {
+    const text = stringAt(item.currency, `${path}.currency`);
+    if (!CURRENCY_RE.test(text)) fail(`${path}.currency`, "must be a 3-letter uppercase currency code");
+    currency = text;
+  }
+  return Object.freeze({ inputPerMillion: input, outputPerMillion: output, currency });
+}
+
+function validateModelProfile(value: unknown, path: string): ModelProfile {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["name", "endpoint", "api-format", "credential", "model", "context-tokens", "pricing"], path);
+  const name = profileNameAt(item.name, `${path}.name`);
+  const apiFormat = item["api-format"];
+  if (apiFormat !== "openai" && apiFormat !== "anthropic") fail(`${path}.api-format`, "must be 'openai' or 'anthropic'");
+  let model = "";
+  if (item.model !== undefined) {
+    model = stringAt(item.model, `${path}.model`);
+    if (model.length > MAX_MODEL_ID_CHARS) fail(`${path}.model`, `must be at most ${MAX_MODEL_ID_CHARS} characters`);
+  }
+  return Object.freeze({
+    name,
+    endpoint: endpointAt(item.endpoint, `${path}.endpoint`),
+    apiFormat,
+    credential: credentialRefAt(item.credential, `${path}.credential`),
+    model,
+    contextTokens: item["context-tokens"] === undefined ? null : integerAt(item["context-tokens"], `${path}.context-tokens`, 1, MAX_MODEL_CONTEXT_TOKENS),
+    pricing: item.pricing === undefined ? null : validateProfilePricing(item.pricing, `${path}.pricing`),
+  });
+}
+
+function validateForgeIntegration(value: unknown, path: string): ForgeIntegration {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["name", "kind", "endpoint", "credential"], path);
+  const kind = item.kind;
+  // The closed declared-forge vocabulary is the platform seam's (`isForgeId`),
+  // not a second list here (#1683).
+  if (!isForgeId(kind)) {
+    fail(`${path}.kind`, "must be 'github', 'forgejo', 'gitea', or 'gitlab'");
+  }
+  return Object.freeze({
+    name: profileNameAt(item.name, `${path}.name`),
+    kind,
+    endpoint: endpointAt(item.endpoint, `${path}.endpoint`),
+    credential: credentialRefAt(item.credential, `${path}.credential`),
+  });
+}
+
+/** An OCI image reference: lowercase registry/repo name, optional tag,
+ * optional sha256 digest pin. Bounded and punctuation-disciplined — an
+ * image reference is data for a container runtime, never a command line. */
+const OCI_IMAGE_RE = /^[a-z0-9][a-z0-9._/-]*(?::[a-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$/;
+const MAX_IMAGE_CHARS = 512;
+
+/** Shell metacharacters a local executor command/arg must never contain:
+ * each element is ONE argv word passed to `spawn` without a shell, so
+ * `|;&<>` etc. have no meaning here — their presence means the operator
+ * (or an injection) wrote a shell line where an argv element belongs. */
+const EXECUTOR_ARGV_METACHARS = /[|;&<>`$]/;
+const MAX_LOCAL_EXECUTOR_ARGS = 32;
+
+function validateExecutorProfile(value: unknown, path: string): ExecutorProfile {
+  const item = objectAt(value, path);
+  // The closed key set IS the #727 hard rule, now with the #733/#734
+  // versioned specs: an image lives only inside `oci.image` or
+  // `kubernetes.image`, an argv only inside `local.command`/`local.args`
+  // or `kubernetes.args` — rejectUnknown proves no PodSpec, host path, or
+  // free-form infrastructure key can land anywhere else.
+  rejectUnknown(item, ["name", "kind", "max-reviews", "local", "oci", "kubernetes"], path);
+  const kind = item.kind;
+  if (kind !== "local" && kind !== "oci" && kind !== "kubernetes") fail(`${path}.kind`, "must be 'local', 'oci', or 'kubernetes'");
+  const local = item.local === undefined ? null : validateLocalExecutorSpec(item.local, `${path}.local`);
+  const oci = item.oci === undefined ? null : validateOciImageSpec(item.oci, `${path}.oci`);
+  const kubernetes = item.kubernetes === undefined ? null : validateKubernetesExecutorSpec(item.kubernetes, `${path}.kubernetes`);
+  if (kind === "local") {
+    if (local === null) fail(`${path}.local`, "is required for kind 'local'");
+    if (oci !== null) fail(`${path}.oci`, "must be absent for kind 'local'");
+    if (kubernetes !== null) fail(`${path}.kubernetes`, "must be absent for kind 'local'");
+  } else if (kind === "oci") {
+    if (oci === null) fail(`${path}.oci`, "is required for kind 'oci'");
+    if (local !== null) fail(`${path}.local`, "must be absent for kind 'oci'");
+    if (kubernetes !== null) fail(`${path}.kubernetes`, "must be absent for kind 'oci'");
+  } else {
+    if (kubernetes === null) fail(`${path}.kubernetes`, "is required for kind 'kubernetes'");
+    if (local !== null) fail(`${path}.local`, "must be absent for kind 'kubernetes'");
+    if (oci !== null) fail(`${path}.oci`, "must be absent for kind 'kubernetes'");
+  }
+  return Object.freeze({
+    name: profileNameAt(item.name, `${path}.name`),
+    kind,
+    maxReviews: item["max-reviews"] === undefined ? null : integerAt(item["max-reviews"], `${path}.max-reviews`, 1, MAX_EXECUTOR_MAX_REVIEWS),
+    local,
+    oci,
+    kubernetes,
+  });
+}
+
+/** Validate one argv element of a local executor spec: a non-empty,
+ * NUL-free (control characters are refused by `stringAt`), bounded string
+ * with no shell metacharacters — the executor spawns argv-only, so a shell
+ * line here is always a mistake or an injection attempt. */
+function executorArgvElementAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (Buffer.byteLength(text, "utf8") > MAX_PATH_BYTES) fail(path, `must be at most ${MAX_PATH_BYTES} bytes`);
+  if (EXECUTOR_ARGV_METACHARS.test(text)) fail(path, "must be a single argv element (no shell metacharacters)");
+  return text;
+}
+
+function validateLocalExecutorSpec(value: unknown, path: string): LocalExecutorSpec {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["command", "args"], path);
+  const argsRaw = item.args ?? [];
+  if (!Array.isArray(argsRaw)) fail(`${path}.args`, "must be a list of argv strings");
+  if (argsRaw.length > MAX_LOCAL_EXECUTOR_ARGS) fail(`${path}.args`, `must have at most ${MAX_LOCAL_EXECUTOR_ARGS} entries`);
+  return Object.freeze({
+    command: executorArgvElementAt(item.command, `${path}.command`),
+    args: Object.freeze(argsRaw.map((entry, index) => executorArgvElementAt(entry, `${path}.args[${index}]`))) as readonly string[],
+  });
+}
+
+function validateOciImageSpec(value: unknown, path: string): OciImageSpec {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["image"], path);
+  const image = stringAt(item.image, `${path}.image`);
+  if (image.length > MAX_IMAGE_CHARS) fail(`${path}.image`, `must be at most ${MAX_IMAGE_CHARS} characters`);
+  if (!OCI_IMAGE_RE.test(image)) fail(`${path}.image`, "must be an image reference (name[:tag][@sha256:digest])");
+  return Object.freeze({ image });
+}
+
+/** A DNS-1123 label: the grammar k8s namespaces, service accounts, and
+ * PVC names are built from. */
+const KUBERNETES_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** A k8s resource quantity the executor will accept: a plain number with
+ * an optional standard suffix (cpu `m`, memory decimal/binary SI). */
+const KUBERNETES_QUANTITY_RE = /^[0-9]+(\.[0-9]+)?(m|k|M|G|Ki|Mi|Gi|Ti)?$/;
+const MAX_QUANTITY_CHARS = 32;
+const MAX_KUBERNETES_TTL_SECONDS = 604_800;
+const MAX_KUBERNETES_VOLUMES = 8;
+
+function kubernetesNameAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (!KUBERNETES_NAME_RE.test(text)) fail(path, "must be a DNS-1123 label (lowercase alphanumerics and '-')");
+  return text;
+}
+
+function kubernetesQuantityAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (text.length > MAX_QUANTITY_CHARS) fail(path, `must be at most ${MAX_QUANTITY_CHARS} characters`);
+  if (!KUBERNETES_QUANTITY_RE.test(text)) fail(path, "must be a resource quantity (e.g. '500m', '2', '512Mi', '2Gi')");
+  return text;
+}
+
+/** An absolute, bounded, control-free directory path that is never the
+ * filesystem root itself — the anchor of a volume mapping on one side of
+ * the controller/pod boundary. */
+function kubernetesMountRootAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  if (!text.startsWith("/")) fail(path, "must be an absolute path");
+  if (text === "/") fail(path, "must not be the filesystem root");
+  if (text.endsWith("/")) fail(path, "must not end with '/'");
+  if (text.length > MAX_PATH_BYTES) fail(path, `must be at most ${MAX_PATH_BYTES} bytes`);
+  if (hasControlCharacters(text)) fail(path, "must not contain control characters");
+  return text;
+}
+
+/** Two roots conflict when one equals the other or contains it — a
+ * shared prefix would make one path match two volume mappings, so such a
+ * spec is a config bug and fails closed. */
+function rootsConflict(a: string, b: string): boolean {
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function validateKubernetesVolumeMappings(value: unknown, path: string): readonly KubernetesVolumeMapping[] {
+  if (!Array.isArray(value)) fail(path, "must be a list of volume mappings");
+  if (value.length < 1) fail(path, "must have at least 1 entry");
+  if (value.length > MAX_KUBERNETES_VOLUMES) fail(path, `must have at most ${MAX_KUBERNETES_VOLUMES} entries`);
+  const mappings = Object.freeze(value.map((entry, index) => {
+    const item = objectAt(entry, `${path}[${index}]`);
+    rejectUnknown(item, ["claim", "controller-root"], path);
+    return Object.freeze({
+      claim: kubernetesNameAt(item.claim, `${path}[${index}].claim`),
+      controllerRoot: kubernetesMountRootAt(item["controller-root"], `${path}[${index}].controller-root`),
+    });
+  }));
+  for (let i = 0; i < mappings.length; i++) {
+    for (let j = i + 1; j < mappings.length; j++) {
+      if (rootsConflict(mappings[i]!.controllerRoot, mappings[j]!.controllerRoot)) {
+        fail(path, `volume mappings ${i} and ${j} have overlapping controller roots`);
+      }
+    }
+  }
+  return mappings;
+}
+
+function validateKubernetesExecutorSpec(value: unknown, path: string): KubernetesExecutorSpec {
+  const item = objectAt(value, path);
+  // The closed key set is the whole point: a PodSpec fragment, host path,
+  // node selector, toleration, or any other raw Kubernetes object has NO
+  // field to land in — the executor builds the pod from fixed security
+  // defaults plus exactly these operator facts.
+  rejectUnknown(item, ["image", "args", "namespace", "service-account", "ttl-seconds-after-finished", "resources", "volumes", "runtime-class-name"], path);
+  const image = stringAt(item.image, `${path}.image`);
+  if (image.length > MAX_IMAGE_CHARS) fail(`${path}.image`, `must be at most ${MAX_IMAGE_CHARS} characters`);
+  if (!OCI_IMAGE_RE.test(image)) fail(`${path}.image`, "must be an image reference (name[:tag][@sha256:digest])");
+  const argsRaw = item.args ?? [];
+  if (!Array.isArray(argsRaw)) fail(`${path}.args`, "must be a list of argv strings");
+  if (argsRaw.length > MAX_LOCAL_EXECUTOR_ARGS) fail(`${path}.args`, `must have at most ${MAX_LOCAL_EXECUTOR_ARGS} entries`);
+  const ttl = item["ttl-seconds-after-finished"];
+  if (ttl === undefined) fail(`${path}.ttl-seconds-after-finished`, "is required (finished jobs must always be cleaned up)");
+  const resources = objectAt(item.resources, `${path}.resources`);
+  rejectUnknown(resources, ["requests", "limits"], path);
+  const validatePair = (pairValue: unknown, label: string): KubernetesResourcePair => {
+    const pair = objectAt(pairValue, `${path}.${label}`);
+    rejectUnknown(pair, ["cpu", "memory"], path);
+    return Object.freeze({
+      cpu: kubernetesQuantityAt(pair.cpu, `${path}.${label}.cpu`),
+      memory: kubernetesQuantityAt(pair.memory, `${path}.${label}.memory`),
+    });
+  };
+  // Optional DNS-1123 label (#1422): the pin is carried through only when
+  // the operator set it, so an absent field stays absent (the pod template
+  // then carries no runtimeClassName and the cluster default applies).
+  const runtimeClassName = item["runtime-class-name"] === undefined
+    ? undefined
+    : kubernetesNameAt(item["runtime-class-name"], `${path}.runtime-class-name`);
+  return Object.freeze({
+    image,
+    args: Object.freeze(argsRaw.map((entry, index) => executorArgvElementAt(entry, `${path}.args[${index}]`))) as readonly string[],
+    namespace: kubernetesNameAt(item.namespace, `${path}.namespace`),
+    serviceAccount: kubernetesNameAt(item["service-account"], `${path}.service-account`),
+    ttlSecondsAfterFinished: integerAt(ttl, `${path}.ttl-seconds-after-finished`, 1, MAX_KUBERNETES_TTL_SECONDS),
+    resources: Object.freeze({
+      requests: validatePair(resources.requests, "resources.requests"),
+      limits: validatePair(resources.limits, "resources.limits"),
+    }),
+    volumes: validateKubernetesVolumeMappings(item.volumes, `${path}.volumes`),
+    ...(runtimeClassName === undefined ? {} : { runtimeClassName }),
+  });
+}
+
+function validateEvidenceProfile(value: unknown, path: string): EvidenceProfile {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["name", "providers-file"], path);
+  return Object.freeze({
+    name: profileNameAt(item.name, `${path}.name`),
+    providersFile: operatorPathAt(item["providers-file"], `${path}.providers-file`),
+  });
+}
+
+function validateAdoption(value: unknown, path: string): AdoptionPolicy {
+  const item = objectAt(value, path);
+  rejectUnknown(item, ["mode", "allowlist", "denylist", "discovered-default"], path);
+  const mode = item.mode;
+  if (mode !== "all_allowed" && mode !== "allowlist" && mode !== "opt_in" && mode !== "opt_out") {
+    fail(`${path}.mode`, "must be 'all_allowed', 'allowlist', 'opt_in', or 'opt_out'");
+  }
+  const discoveredDefault = item["discovered-default"] ?? "skip";
+  if (discoveredDefault !== "adopt" && discoveredDefault !== "skip") {
+    fail(`${path}.discovered-default`, "must be 'adopt' or 'skip'");
+  }
+  const validateList = (listValue: unknown, label: string): readonly string[] => {
+    if (listValue === undefined) return Object.freeze([]) as readonly string[];
+    if (!Array.isArray(listValue)) fail(`${path}.${label}`, "must be a list of 'owner/name' strings");
+    if (listValue.length > MAX_ADOPTION_LIST_ENTRIES) fail(`${path}.${label}`, `must have at most ${MAX_ADOPTION_LIST_ENTRIES} entries`);
+    const entries = listValue.map((entry, index) => {
+      const text = stringAt(entry, `${path}.${label}[${index}]`);
+      if (parseRepoRef(text) === null) fail(`${path}.${label}[${index}]`, "must be an 'owner/name' repository identity");
+      return text;
+    });
+    if (new Set(entries).size !== entries.length) fail(`${path}.${label}`, "contains duplicate identities");
+    return Object.freeze(entries) as readonly string[];
+  };
+  return Object.freeze({
+    mode,
+    allowlist: validateList(item.allowlist, "allowlist"),
+    denylist: validateList(item.denylist, "denylist"),
+    discoveredDefault,
+  });
+}
+
+/** Validate the reviewer-defaults envelope against the action contract:
+ * every key must be a `repo-configurable` contract input (secrets and
+ * endpoints are structurally excluded by `validateContract`), and every
+ * value must pass the same per-type validation the repository-config layer
+ * applies — normalized to the string form `loadConfig` consumes. */
+function validateReviewerDefaults(value: unknown, contract: ActionContract, path: string): Readonly<Record<string, string>> {
+  if (value === undefined) return Object.freeze({});
+  const item = objectAt(value, path);
+  const byId = new Map(contract.inputs.map((input) => [input.id, input]));
+  const out: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(item)) {
+    const input = byId.get(key);
+    if (!input || !input["repo-configurable"] || SECRET_INPUTS.has(key)) {
+      fail(`${path}.${key}`, "is not a repo-configurable input; reviewer defaults may only set the envelope repository config may narrow");
+    }
+    const candidate = normalizeCandidate(input, raw);
+    if (!candidate.ok) fail(`${path}.${key}`, candidate.reason);
+    out[key] = candidate.text;
+  }
+  return Object.freeze(out);
+}
+
+/** Validate an instance-config object (already parsed from YAML or handed
+ * over as a plain object) into the frozen typed shape. Strict: unknown
+ * fields are rejected at every level and any problem throws
+ * `InstanceConfigError` — the operator layer fails closed, it never
+ * partially applies. `contract` supplies the repo-configurable input set
+ * that `reviewer-defaults` may reference. */
+export function validateInstanceConfig(value: unknown, contract: ActionContract): InstanceConfig {
+  const root = objectAt(value, "instance config");
+  rejectUnknown(
+    root,
+    [
+      "version", "unknown-profile-policy", "forges", "model-profiles", "default-model-profile",
+      "executor-profiles", "default-executor-profile", "evidence-profiles", "default-evidence-profile",
+      "namespace-policies",
+      "adoption", "reviewer-defaults", "allow-repo-policy-overrides", "queue", "storage",
+    ],
+    "instance config",
+  );
+  if (root.version !== 1) fail("instance config.version", "must be exactly 1 (the only supported schema version)");
+  const unknownProfilePolicy = root["unknown-profile-policy"] ?? "reject";
+  if (unknownProfilePolicy !== "reject" && unknownProfilePolicy !== "fallback_default") {
+    fail("instance config.unknown-profile-policy", "must be 'reject' or 'fallback_default'");
+  }
+  const modelProfilesRaw = root["model-profiles"] === undefined ? undefined : root["model-profiles"];
+  if (!Array.isArray(modelProfilesRaw) || modelProfilesRaw.length === 0) {
+    fail("instance config.model-profiles", "must be a non-empty list — operator mode always needs at least one model profile");
+  }
+  if (modelProfilesRaw.length > MAX_ADOPTION_LIST_ENTRIES) {
+    fail("instance config.model-profiles", `must have at most ${MAX_ADOPTION_LIST_ENTRIES} entries`);
+  }
+  const models = Object.freeze(modelProfilesRaw.map((entry, index) => validateModelProfile(entry, `instance config.model-profiles[${index}]`))) as readonly ModelProfile[];
+  validateDuplicateNames(models.map(({ name }) => name), "instance config.model-profiles");
+  const defaultModelProfile = profileNameAt(root["default-model-profile"], "instance config.default-model-profile");
+  if (!models.some(({ name }) => name === defaultModelProfile)) {
+    fail("instance config.default-model-profile", `does not name a profile in model-profiles ('${defaultModelProfile}')`);
+  }
+  const forgesRaw = root.forges ?? [];
+  if (!Array.isArray(forgesRaw)) fail("instance config.forges", "must be a list");
+  const forges = Object.freeze(forgesRaw.map((entry, index) => validateForgeIntegration(entry, `instance config.forges[${index}]`)));
+  validateDuplicateNames(forges.map(({ name }) => name), "instance config.forges");
+  const executorsRaw = root["executor-profiles"] ?? [];
+  if (!Array.isArray(executorsRaw)) fail("instance config.executor-profiles", "must be a list");
+  const executors = Object.freeze(executorsRaw.map((entry, index) => validateExecutorProfile(entry, `instance config.executor-profiles[${index}]`)));
+  validateDuplicateNames(executors.map(({ name }) => name), "instance config.executor-profiles");
+  const defaultExecutorProfile = root["default-executor-profile"] === undefined
+    ? null
+    : profileNameAt(root["default-executor-profile"], "instance config.default-executor-profile");
+  if (defaultExecutorProfile !== null && !executors.some(({ name }) => name === defaultExecutorProfile)) {
+    fail("instance config.default-executor-profile", `does not name a profile in executor-profiles ('${defaultExecutorProfile}')`);
+  }
+  const evidenceRaw = root["evidence-profiles"] ?? [];
+  if (!Array.isArray(evidenceRaw)) fail("instance config.evidence-profiles", "must be a list");
+  const evidence = Object.freeze(evidenceRaw.map((entry, index) => validateEvidenceProfile(entry, `instance config.evidence-profiles[${index}]`)));
+  validateDuplicateNames(evidence.map(({ name }) => name), "instance config.evidence-profiles");
+  const defaultEvidenceProfile = root["default-evidence-profile"] === undefined
+    ? null
+    : profileNameAt(root["default-evidence-profile"], "instance config.default-evidence-profile");
+  if (defaultEvidenceProfile !== null && !evidence.some(({ name }) => name === defaultEvidenceProfile)) {
+    fail("instance config.default-evidence-profile", `does not name a profile in evidence-profiles ('${defaultEvidenceProfile}')`);
+  }
+  let queue: InstanceQueue = Object.freeze({ maxConcurrentReviews: null });
+  if (root.queue !== undefined) {
+    const item = objectAt(root.queue, "instance config.queue");
+    rejectUnknown(item, ["max-concurrent-reviews"], "instance config.queue");
+    queue = Object.freeze({
+      maxConcurrentReviews: item["max-concurrent-reviews"] === undefined
+        ? null
+        : integerAt(item["max-concurrent-reviews"], "instance config.queue.max-concurrent-reviews", 1, MAX_QUEUE_CONCURRENT_REVIEWS),
+    });
+  }
+  let storage: InstanceStorage = Object.freeze({ statePath: null, workspaceCachePath: null });
+  if (root.storage !== undefined) {
+    const item = objectAt(root.storage, "instance config.storage");
+    rejectUnknown(item, ["state-path", "workspace-cache-path"], "instance config.storage");
+    storage = Object.freeze({
+      statePath: item["state-path"] === undefined ? null : operatorPathAt(item["state-path"], "instance config.storage.state-path"),
+      workspaceCachePath: item["workspace-cache-path"] === undefined ? null : operatorPathAt(item["workspace-cache-path"], "instance config.storage.workspace-cache-path"),
+    });
+  }
+  return Object.freeze({
+    version: 1 as const,
+    unknownProfilePolicy,
+    forges,
+    modelProfiles: models,
+    defaultModelProfile,
+    executorProfiles: executors,
+    defaultExecutorProfile,
+    evidenceProfiles: evidence,
+    defaultEvidenceProfile,
+    namespacePolicies: validateNamespacePolicies(root["namespace-policies"], contract),
+    adoption: root.adoption === undefined
+      ? Object.freeze({ mode: "allowlist" as const, allowlist: Object.freeze([]) as readonly string[], denylist: Object.freeze([]) as readonly string[], discoveredDefault: "skip" as const })
+      : validateAdoption(root.adoption, "instance config.adoption"),
+    reviewerDefaults: validateReviewerDefaults(root["reviewer-defaults"], contract, "instance config.reviewer-defaults"),
+    allowRepoPolicyOverrides: root["allow-repo-policy-overrides"] === undefined ? false : booleanAt(root["allow-repo-policy-overrides"], "instance config.allow-repo-policy-overrides"),
+    queue,
+    storage,
+  });
+}
+
+/** Parse instance-config YAML text (the controller's trusted config file)
+ * and validate it. Any problem — size, syntax, shape, policy — throws a
+ * typed `InstanceConfigError`; the caller must fail closed, never run with
+ * a partial policy. */
+export function parseInstanceConfigText(text: string, contract: ActionContract): InstanceConfig {
+  if (Buffer.byteLength(text, "utf8") > MAX_INSTANCE_CONFIG_BYTES) {
+    throw new InstanceConfigError(`instance config exceeds the ${MAX_INSTANCE_CONFIG_BYTES}-byte cap`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch {
+    throw new InstanceConfigError("instance config is not valid YAML");
+  }
+  return validateInstanceConfig(parsed, contract);
+}

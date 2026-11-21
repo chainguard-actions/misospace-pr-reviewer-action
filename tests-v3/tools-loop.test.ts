@@ -1,0 +1,3823 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { Conversation } from "../src/model/conversation.js";
+import { sanitizedSourceProvenance } from "../src/context/evidence-provenance.js";
+import {
+  STOP_BUDGET,
+  STOP_MAX_ROUNDS,
+  STOP_MODEL_DONE,
+  STOP_INVESTIGATION_COMPLETE,
+  STOP_NO_TOOL_CALLS,
+  STOP_OBLIGATIONS_SETTLED,
+  STOP_REQUEST_ERROR,
+  STOP_WALL_CLOCK,
+  STOP_WALL_CLOCK_RESERVE,
+  TOOL_LOOP_ROUNDS_CEILING,
+  adaptiveLoopBudgets,
+  DEPENDENCY_EVIDENCE_OBLIGATIONS,
+  dependencyEvidenceObligationsForCall,
+  driveToolLoop,
+  extractToolCalls,
+  type DependencyEvidenceObligation,
+  type DriveToolLoopOptions,
+  type NativeLoopRoundTelemetry,
+  type ToolTurnSignal,
+} from "../src/tools/loop.js";
+import { buildSummarizerConversation, loopContextLimits } from "../src/tools/harness.js";
+import { attachTransportTiming, readTransportTiming, type TransportTiming } from "../src/transport/timing.js";
+
+function scriptedLoop(responses: unknown[], execResults: Record<string, unknown>[], clock: number[] = []) {
+  let responseIndex = 0;
+  let execIndex = 0;
+  let clockIndex = 0;
+  const postFn = async () => {
+    const next = responses[responseIndex++];
+    if (next !== undefined && next !== null && typeof next === "object" && "raise" in (next as Record<string, unknown>)) {
+      throw new Error(String((next as Record<string, unknown>).raise));
+    }
+    return next;
+  };
+  const executeFn = async () => execResults[execIndex++] ?? { tool: "?", status: "error", result: { error: "no scripted result" } };
+  const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+  return { postFn, executeFn, timeFn };
+}
+
+const openAiCall = (id: string, name: string, args: string) => ({
+  choices: [{ message: { content: null, tool_calls: [{ id, type: "function", function: { name, arguments: args } }] } }],
+});
+const openAiText = (text: string) => ({ choices: [{ message: { content: text } }] });
+
+test("a model that never calls tools degrades without consuming budget", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("no tools needed")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 4, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_NO_TOOL_CALLS);
+  assert.equal(outcome.degraded, true);
+  assert.equal(outcome.finalText, "no tools needed");
+  assert.equal(outcome.toolCallsIssued, 0);
+  assert.equal(outcome.requestsRemaining, 4);
+});
+
+test("model stops voluntarily after gathering evidence", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "read_file", '{"path":"a.ts"}'), openAiText("done")],
+    [{ tool: "read_file", status: "ok", result: { content: "body" } }],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 4, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.degraded, false);
+  assert.equal(outcome.finalText, "done");
+  assert.equal(outcome.executed.length, 1);
+  assert.equal(outcome.requestsRemaining, 3);
+});
+
+test("#1702: explicit trace test reads block premature investigation-complete until acquired", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("PR corpus and Requirement Trace Plan");
+  const { postFn, executeFn, timeFn } = scriptedLoop([
+    openAiCall("code", "read_file", '{"path":"src/enforcement/required-check-ci.ts"}'),
+    openAiCall("test1", "read_file", '{"path":"tests-v3/required-check-ci.test.ts"}'),
+    openAiCall("test2", "read_file", '{"path":"tests-v3/requirement-trace.test.ts"}'),
+    // #1729: the fourth turn is the model-confirmed completion round — the
+    // coverage gate armed at the end of round 3 and the model confirms with
+    // no tool calls.
+    openAiText("confirmed"),
+  ], [
+    { tool: "read_file", status: "ok", result: { content: "production code" } },
+    { tool: "read_file", status: "ok", result: { content: "CI matching regression tests" } },
+    { tool: "read_file", status: "ok", result: { content: "trace regression tests" } },
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai", model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: [
+      { id: "trace:test-read-1", tokens: ["tests-v3/required-check-ci.test.ts"], tools: ["read_file"] },
+      { id: "trace:test-read-2", tokens: ["tests-v3/requirement-trace.test.ts"], tools: ["read_file"] },
+    ],
+    coverageComplete: () => true,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_INVESTIGATION_COMPLETE);
+  assert.equal(outcome.executed.length, 3,
+    "source-only evidence must not end an investigation that has explicit test demands");
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["trace:test-read-1", "trace:test-read-2"]);
+  assert.deepEqual(outcome.requiredEvidenceSettlements.map((r) => [r.kind, r.evidenceState, r.successfulAttempt]), [
+    ["trace", "acquired", true], ["trace", "acquired", true],
+  ]);
+});
+
+test("#1702: trace acquisition cannot short-circuit missing changed-file coverage", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("PR corpus and Requirement Trace Plan");
+  const { postFn, executeFn, timeFn } = scriptedLoop([
+    openAiCall("test", "read_file", '{"path":"tests-v3/ci-wait.test.ts"}'),
+    openAiText("further code coverage was not established"),
+  ], [{ tool: "read_file", status: "ok", result: { content: "test evidence" } }]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai", model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    reserveForRequiredEvidence: 1,
+    requiredEvidence: [{ id: "trace:test-read-1", tokens: ["tests-v3/ci-wait.test.ts"], tools: ["read_file"] }],
+    coverageComplete: () => false,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE,
+    "acquired trace evidence alone must not signal obligations-settled if the change is still unread");
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["trace:test-read-1"]);
+});
+
+test("#1702: an unrelated read never settles mandatory trace test evidence", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("PR corpus and Requirement Trace Plan");
+  const { postFn, executeFn, timeFn } = scriptedLoop([
+    openAiCall("code", "read_file", '{"path":"src/other.ts"}'),
+    openAiText("cannot verify the tests"),
+  ], [{ tool: "read_file", status: "ok", result: { content: "unrelated code" } }]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai", model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    reserveForRequiredEvidence: 1,
+    requiredEvidence: [{ id: "trace:test-read-1", tokens: ["tests-v3/required-check-ci.test.ts"], tools: ["read_file"] }],
+    coverageComplete: () => true,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  assert.equal(outcome.requiredEvidenceSettlements[0]?.evidenceState, "open");
+  assert.equal(outcome.requiredEvidenceSettlements[0]?.acquisition, "unavailable");
+});
+
+test("#1702: trace and prose evidence remain visible together in reserved-window notes/refusals", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("PR corpus and Requirement Trace Plan");
+  const responses = [
+    openAiCall("optional-first", "read_file", '{"path":"src/other.ts"}'),
+    openAiCall("optional-second", "read_file", '{"path":"src/unrelated.ts"}'),
+    openAiText("evidence remains unresolved"),
+  ];
+  const requests: string[] = [];
+  let turn = 0;
+  const result = await driveToolLoop(
+    conversation,
+    async (payload) => {
+      requests.push(JSON.stringify(payload));
+      return responses[turn++];
+    },
+    async (name) => ({ tool: name, status: "ok", result: { content: "source read" } }),
+    {
+      apiFormat: "openai", model: "m",
+      budgets: { ...adaptiveLoopBudgets(3, 3, 120), maxRounds: 4 },
+      reserveForRequiredEvidence: 2,
+      requiredEvidence: [
+        { id: "trace:test-read-1", tokens: ["tests-v3/ci-wait.test.ts"], tools: ["read_file"] },
+        { id: "obligation-1", tokens: ["upstream", "matrix"], source: "must_check" },
+      ],
+      coverageComplete: () => false,
+      timeFn: () => 0,
+    },
+  );
+  assert.equal(requests.length, 3);
+  assert.match(requests[1]!, /Requirement Trace Plan/);
+  assert.match(requests[1]!, /Required Review Evidence/);
+  assert.equal(result.requiredEvidenceRefusals, 1);
+  const refusal = conversation.events.find((event) =>
+    event.kind === "tool_result" && JSON.stringify(event).includes("Reserved required-evidence budget"));
+  assert.ok(refusal, "a refused optional call still names the prose requirement alongside trace evidence");
+  assert.match(JSON.stringify(refusal), /Requirement Trace Plan/);
+});
+
+test("executor provenance rides through the loop into the rendered tool result", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "read_file", '{"path":"src/x.ts"}'), openAiText("done")],
+    [
+      {
+        tool: "read_file",
+        status: "ok",
+        result: { content: "x" },
+        provenance: sanitizedSourceProvenance(1, "src/x.ts", "abc123"),
+      },
+    ],
+  );
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 4, 120),
+    timeFn,
+  });
+  const event = conversation.events.find((e) => e.kind === "tool_result") as { evidence?: unknown };
+  assert.ok(event.evidence);
+  const msg = (conversation.renderOpenAiMessages() as Array<{ role: string; content: string }>).find((m) => m.role === "tool")!;
+  assert.ok(msg.content.includes('representation="sanitized_source"'));
+  assert.ok(msg.content.includes('synthesized="true"'));
+  assert.ok(msg.content.includes('redaction_count="1"'));
+  assert.ok(msg.content.includes('source_file="src/x.ts"'));
+  assert.ok(msg.content.includes('source_revision="abc123"'));
+});
+
+test("round budget exhausts with the doubled cap", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const rounds = 3;
+  const responses = Array.from({ length: rounds * 2 }, (_, i) => openAiCall(`c${i}`, "t", "{}"));
+  const exec = responses.map(() => ({ tool: "t", status: "ok", result: {} }));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(rounds, 50, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  assert.equal(outcome.rounds, 6); // 3 configured × 2, capped at 12
+});
+
+test("request budget exhaustion refuses further calls and records the distinct stop reason", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // One assistant turn requesting three calls against a budget of two: the
+  // third call is refused inside the round with a synthetic budget note.
+  const oneRound = { ...adaptiveLoopBudgets(1, 2, 120), maxRounds: 1 };
+  const response = openAiCall("c0", "t", '{"n":0}');
+  const extraCalls = [
+    openAiCall("c1", "t", '{"n":1}'),
+    openAiCall("c2", "t", '{"n":2}'),
+  ].map((r) => (r as { choices: Array<{ message: { tool_calls: Record<string, unknown>[] } }> }).choices[0]!.message.tool_calls[0]!);
+  (response as { choices: Array<{ message: { tool_calls: unknown[] } }> }).choices[0]!.message.tool_calls.push(...extraCalls);
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [response],
+    [0, 1, 2].map(() => ({ tool: "t", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: oneRound,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_BUDGET);
+  assert.equal(outcome.requestsRemaining, 0);
+  assert.equal(outcome.executed.length, 2);
+  // The refused third call got a synthetic budget note as its tool result.
+  const noteEvent = conversation.events.at(-1) as { kind: string; content: string; is_error: boolean };
+  assert.equal(noteEvent.kind, "tool_result");
+  assert.equal(noteEvent.is_error, true);
+  assert.match(noteEvent.content, /Tool-call budget exhausted/);
+  assert.equal(conversation.events.filter((e) => e.kind === "turn_note").length, 0);
+});
+
+test("exhaustion-aware budget notes appear from the second round onward", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const oneRoundThenStop = { ...adaptiveLoopBudgets(1, 4, 120), maxRounds: 2 };
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "t", "{}"), openAiText("done")],
+    [{ tool: "t", status: "ok", result: {} }],
+  );
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: oneRoundThenStop,
+    timeFn,
+  });
+  const notes = conversation.events.filter((e) => e.kind === "turn_note") as Array<{ content: string }>;
+  assert.equal(notes.length, 1);
+  assert.match(notes[0]!.content, /^\[loop budget\] 3 of 4 tool request\(s\)/);
+});
+
+test("#1222: OpenAI loop requests preserve prior messages as an exact prefix", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+    openAiText("done"),
+  ];
+  const payloads: Array<Record<string, unknown>> = [];
+  let responseIndex = 0;
+  const outcome = await driveToolLoop(
+    conversation,
+    async (payload) => {
+      payloads.push(structuredClone(payload));
+      return responses[responseIndex++];
+    },
+    async (_name, args) => ({ tool: "read_file", status: "ok", result: { content: String(args.path ?? "") } }),
+    {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(3, 8, 120),
+      timeFn: () => 0,
+    },
+  );
+
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(payloads.length, 3);
+  for (let index = 1; index < payloads.length; index++) {
+    const previous = payloads[index - 1]!.messages as Array<Record<string, unknown>>;
+    const current = payloads[index]!.messages as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      current.slice(0, previous.length),
+      previous,
+      `round ${index + 1} rewrote round ${index}'s OpenAI message prefix`,
+    );
+    assert.deepEqual(payloads[index]!.tools, payloads[index - 1]!.tools, "tool schema prefix must stay stable");
+  }
+
+  const notes = conversation.events.filter((e) => e.kind === "turn_note") as Array<{ content: string }>;
+  assert.equal(notes.length, 2);
+  assert.match(notes[0]!.content, /^\[loop budget\] 7 of 8 tool request\(s\)/);
+  assert.match(notes[1]!.content, /^\[loop budget\] 6 of 8 tool request\(s\)/);
+});
+
+test("duplicate calls are answered from a dedup note without burning budget", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const dup = openAiCall("c2", "t", '{"n":1}');
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "t", '{"n":1}'), dup],
+    [{ tool: "t", status: "ok", result: {} }, { tool: "t", status: "ok", result: {} }],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(1, 4, 120),
+    timeFn,
+  });
+  assert.equal(outcome.executed.length, 1); // only the first ran
+  assert.equal(outcome.requestsRemaining, 3);
+  const noteEvent = conversation.events.at(-1) as { content: string };
+  assert.match(noteEvent.content, /Duplicate request/);
+});
+
+test("malformed arguments get a repairable error result instead of crashing", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const oneRound = { ...adaptiveLoopBudgets(1, 4, 120), maxRounds: 1 };
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "t", '{"path": broken')],
+    [],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: oneRound,
+    timeFn,
+  });
+  assert.equal(outcome.executed.length, 0);
+  assert.equal(outcome.degraded, false); // a call WAS issued (refused ≠ never called)
+  assert.equal(outcome.toolCallsIssued, 1);
+  const event = conversation.events.at(-1) as { is_error: boolean; content: string };
+  assert.equal(event.is_error, true);
+  assert.match(event.content, /Invalid tool arguments \(not a JSON object\)/);
+});
+
+test("transport errors end the loop with the request-error stop reason", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = scriptedLoop([{ raise: "connection reset" }], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 4, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_REQUEST_ERROR);
+  assert.equal(outcome.error, "connection reset");
+  assert.equal(outcome.degraded, true);
+});
+
+test("#747: temperature null omits the field from every round; an absent temperature keeps 0.0", async () => {
+  const anthropicCall = { content: [{ type: "tool_use", id: "a1", name: "t", input: {} }] };
+  const anthropicText = { content: [{ type: "text", text: "done" }] };
+  const rounds = {
+    openai: [openAiCall("c1", "t", "{}"), openAiText("done")],
+    anthropic: [anthropicCall, anthropicText],
+  };
+  for (const apiFormat of ["openai", "anthropic"] as const) {
+    for (const temperature of [null, undefined]) {
+      const conversation = new Conversation();
+      conversation.addUser("corpus");
+      const payloads: Array<Record<string, unknown>> = [];
+      const scripted = rounds[apiFormat];
+      const outcome = await driveToolLoop(
+        conversation,
+        async (payload) => {
+          payloads.push(payload);
+          return scripted[payloads.length - 1];
+        },
+        async () => ({ tool: "t", status: "ok", result: {} }),
+        {
+          apiFormat,
+          model: "m",
+          budgets: adaptiveLoopBudgets(2, 4, 120),
+          timeFn: () => 0,
+          ...(temperature === undefined ? {} : { temperature }),
+        },
+      );
+      const label = `${apiFormat}, temperature ${String(temperature)}`;
+      assert.equal(outcome.stopReason, STOP_MODEL_DONE, label);
+      assert.equal(payloads.length, 2, label);
+      for (const payload of payloads) {
+        if (temperature === null) assert.equal("temperature" in payload, false, label);
+        else assert.equal(payload.temperature, 0.0, label);
+      }
+    }
+  }
+});
+
+test("wall-clock deadline stops the loop between rounds", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Clock: started=0, round-1 check=0 (runs), round-2 check=999 (stops).
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "t", "{}"), openAiCall("c2", "t", "{}")],
+    [{ tool: "t", status: "ok", result: {} }, { tool: "t", status: "ok", result: {} }],
+    [0, 0, 999],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK);
+  assert.equal(outcome.rounds, 1);
+});
+
+// #1198: when the harness passes an absolute whole-exchange deadline, the
+// between-rounds check fires on the ABSOLUTE clock instead of time-since-own-
+// start, so pre-loop setup time and a deadline taken before the loop both
+// count — and a loop that starts past the deadline never opens a round.
+
+test("#1198: an absolute deadline already past at loop start stops before any model request", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let postCalls = 0;
+  const postFn = async () => {
+    postCalls++;
+    return openAiCall("c1", "t", "{}");
+  };
+  const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+  // A constant clock past the deadline: the absolute check is independent of
+  // the loop's own started time, so zero remaining budget must end the run
+  // without a single new model request.
+  const timeFn = () => 500;
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    wallClockDeadline: 100,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK);
+  assert.equal(outcome.rounds, 0);
+  assert.equal(postCalls, 0, "no new model request begins with zero remaining budget");
+  assert.equal(outcome.toolCallsIssued, 0);
+});
+
+test("#1198: an absolute deadline fires before a new model request between rounds", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Clock: started=0, round-1 check=5 (runs), round-2 check=100 (at the
+  // deadline → stops BEFORE the second postFn call). The legacy elapsed check
+  // (100 - 0 vs the 120s ceiling) would have opened round 2 here.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c1", "t", "{}"), openAiCall("c2", "t", "{}")],
+    [{ tool: "t", status: "ok", result: {} }, { tool: "t", status: "ok", result: {} }],
+    [0, 5, 100],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    wallClockDeadline: 100,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK);
+  assert.equal(outcome.rounds, 1);
+  assert.equal(outcome.toolCallsIssued, 1);
+});
+
+test("#1198: without a finite absolute deadline the elapsed-since-start check still applies", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Unset, null, and non-finite deadlines all fall back to the legacy check.
+  for (const deadline of [undefined, null, Number.POSITIVE_INFINITY] as const) {
+    const { postFn, executeFn, timeFn } = scriptedLoop(
+      [openAiCall("c1", "t", "{}"), openAiCall("c2", "t", "{}")],
+      [{ tool: "t", status: "ok", result: {} }, { tool: "t", status: "ok", result: {} }],
+      [0, 0, 999],
+    );
+    const options: DriveToolLoopOptions = {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(4, 10, 120),
+      timeFn,
+    };
+    if (deadline !== undefined) options.wallClockDeadline = deadline;
+    const outcome = await driveToolLoop(conversation, postFn, executeFn, options);
+    assert.equal(outcome.stopReason, STOP_WALL_CLOCK, String(deadline));
+    assert.equal(outcome.rounds, 1, String(deadline));
+  }
+});
+
+// #1464: the wall-clock verdict reserve. When `wallClockReserveSec` is finite
+// and > 0, the between-rounds check stops starting exploratory rounds once the
+// remaining wall clock falls to or below the reserve, so the closing
+// in-conversation verdict always has budget left. The exceeded check keeps its
+// exact boundary form; the reserve branch fires AFTER it, so a clock already
+// at/past the deadline still reports `wall-clock-exceeded`. The reserve check
+// reads the clock once per round on top of the exceeded check's own read —
+// every scripted sequence below accounts for both reads.
+
+test("#1464: the verdict reserve stops exploratory rounds before the deadline", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let postCalls = 0;
+  const postFn = async () => {
+    postCalls++;
+    return openAiCall(`c${postCalls}`, "t", "{}");
+  };
+  const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+  // Deadline = 100, reserve = 30. Reads: started=0; r1 exceeded=0, r1
+  // reserve=0 (remaining 100 > 30 → round 1 runs); r2 exceeded=90 (90 < 100,
+  // so the exceeded check alone would NOT stop), r2 reserve=75 (remaining 25
+  // <= 30 → stop). Clock value 105 sits past the deadline: if the reserve
+  // branch failed to stop here, round 3's exceeded check would read it and
+  // report `wall-clock-exceeded` instead — the assertion below distinguishes
+  // the two stops.
+  const clock = [0, 0, 0, 90, 75, 105];
+  let clockIndex = 0;
+  const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    wallClockDeadline: 100,
+    wallClockReserveSec: 30,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK_RESERVE);
+  assert.equal(outcome.rounds, 1);
+  assert.equal(postCalls, 1, "no exploratory round starts at or inside the reserve");
+  // Reads after the stop: exactly the loop-end elapsedSec read. The 105 slot
+  // fed that read, not another round's checks.
+  assert.equal(clockIndex, 6);
+});
+
+test("#1464: the reserve boundary is inclusive — remaining == reserve stops, remaining just above runs another round", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Remaining exactly == reserve: r2 reserve read leaves 100 - 70 = 30 → stop.
+  {
+    let postCalls = 0;
+    const postFn = async () => {
+      postCalls++;
+      return openAiCall(`c${postCalls}`, "t", "{}");
+    };
+    const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+    const clock = [0, 0, 0, 80, 70];
+    let clockIndex = 0;
+    const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+    const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(4, 10, 120),
+      wallClockDeadline: 100,
+      wallClockReserveSec: 30,
+      timeFn,
+    });
+    assert.equal(outcome.stopReason, STOP_WALL_CLOCK_RESERVE);
+    assert.equal(outcome.rounds, 1);
+    assert.equal(postCalls, 1);
+  }
+  // Remaining just above the reserve: r2 reserve read leaves 100 - 69 = 31 →
+  // round 2 runs; r3's reserve read leaves 5 → stop there.
+  {
+    let postCalls = 0;
+    const postFn = async () => {
+      postCalls++;
+      return openAiCall(`c${postCalls}`, "t", "{}");
+    };
+    const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+    const clock = [0, 0, 0, 80, 69, 95, 95];
+    let clockIndex = 0;
+    const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+    const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(4, 10, 120),
+      wallClockDeadline: 100,
+      wallClockReserveSec: 30,
+      timeFn,
+    });
+    assert.equal(outcome.stopReason, STOP_WALL_CLOCK_RESERVE);
+    assert.equal(outcome.rounds, 2);
+    assert.equal(postCalls, 2);
+  }
+});
+
+test("#1464: a clock already at the deadline still reports wall-clock-exceeded, never the reserve", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let postCalls = 0;
+  const postFn = async () => {
+    postCalls++;
+    return openAiCall(`c${postCalls}`, "t", "{}");
+  };
+  const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+  // Reads: started=0; r1 exceeded=0, r1 reserve=0 (round 1 runs); r2
+  // exceeded=100 — AT the deadline (`>=`) → the exceeded branch stops before
+  // the reserve branch is ever reached.
+  const clock = [0, 0, 0, 100];
+  let clockIndex = 0;
+  const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    wallClockDeadline: 100,
+    wallClockReserveSec: 30,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK);
+  assert.equal(outcome.rounds, 1);
+  assert.equal(postCalls, 1);
+});
+
+test("#1464: the reserve works against the legacy elapsed-since-start check too", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let postCalls = 0;
+  const postFn = async () => {
+    postCalls++;
+    return openAiCall(`c${postCalls}`, "t", "{}");
+  };
+  const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+  // No deadline: remaining = started + wallClockSec - now = 0 + 120 - now.
+  // Reads: started=0; r1 exceeded=0 (elapsed 0), r1 reserve=0 (remaining 120
+  // > 30 → run); r2 exceeded=95 (elapsed 95 <= 120 → run), r2 reserve=91
+  // (remaining 29 <= 30 → stop).
+  const clock = [0, 0, 0, 95, 91];
+  let clockIndex = 0;
+  const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 10, 120),
+    wallClockReserveSec: 30,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_WALL_CLOCK_RESERVE);
+  assert.equal(outcome.rounds, 1);
+  assert.equal(postCalls, 1);
+});
+
+test("#1464: an unset/zero reserve keeps legacy behavior byte-identical (one clock read per round)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  for (const reserve of [undefined, null, 0, Number.POSITIVE_INFINITY] as const) {
+    let postCalls = 0;
+    const postFn = async () => {
+      postCalls++;
+      return openAiCall(`c${postCalls}`, "t", "{}");
+    };
+    const executeFn = async () => ({ tool: "t", status: "ok", result: {} });
+    // Same script as the pre-#1464 deadline test: started=0, r1 check=0, r2
+    // check=100 (at the deadline → stop). With no reserve the round loop must
+    // consume exactly one clock read per round, exactly as before.
+    const clock = [0, 0, 100];
+    let clockIndex = 0;
+    const timeFn = () => clock[clockIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+    const options: DriveToolLoopOptions = {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(4, 10, 120),
+      wallClockDeadline: 100,
+      timeFn,
+    };
+    if (reserve !== undefined) options.wallClockReserveSec = reserve;
+    const outcome = await driveToolLoop(conversation, postFn, executeFn, options);
+    assert.equal(outcome.stopReason, STOP_WALL_CLOCK, String(reserve));
+    assert.equal(outcome.rounds, 1, String(reserve));
+    assert.equal(postCalls, 1, String(reserve));
+    assert.equal(clockIndex, 4, `exactly one read per round (started, r1, r2, elapsed) (${reserve})`);
+  }
+});
+
+test("compaction: blunt truncation backstops when no summarizer frees enough", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("x".repeat(500));
+  conversation.addAssistantToolCalls([{ id: "c1", name: "t", arguments: "{}" }]);
+  const big = "y".repeat(30000);
+  conversation.addToolResult("c1", { blob: big }, { maxBytes: 40000 });
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 100, truncatedResultBytes: 100, summarizeKeepNewest: 0 },
+    timeFn,
+  });
+  assert.ok(outcome.compactionTruncate >= 1);
+  const event = conversation.events.find((e) => e.kind === "tool_result") as { content: string };
+  assert.ok(Buffer.byteLength(event.content, "utf8") <= 100);
+  // The 500-char user turn alone keeps the watermark unreachable: the driver
+  // proceeds on the protected conversation instead of dropping more.
+  assert.equal(outcome.compactionOverflowProtected, true);
+  const events = outcome.compactionEvents;
+  assert.ok(events.length >= 1);
+  const last = events.at(-1)!;
+  assert.equal(last.kind, "truncate");
+  assert.equal(last.cacheable_prefix_changed, true);
+  assert.ok(last.results_shortened >= 1);
+  assert.ok((last.bytes_freed ?? 0) > 0);
+  assert.ok(last.after_approx_tokens < last.before_approx_tokens);
+});
+
+test("#1043 review: compaction replaces a read_skill result with a truthful marker, never a partial body", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("x".repeat(500));
+  conversation.addAssistantToolCalls([{ id: "s1", name: "read_skill", arguments: "{}" }]);
+  const skillPayload = {
+    path: ".agents/skills/dependency-upgrades/SKILL.md",
+    content: `skill body ${"y".repeat(40_000)}`,
+    source: "trusted-base",
+    content_complete: true,
+  };
+  conversation.addToolResult("s1", skillPayload, { tool: "read_skill", maxBytes: 60_000 });
+  conversation.addAssistantToolCalls([{ id: "c2", name: "read_file", arguments: "{}" }]);
+  conversation.addToolResult("c2", { blob: "z".repeat(30_000) }, { maxBytes: 40_000 });
+  conversation.addAssistantToolCalls([{ id: "c3", name: "read_file", arguments: "{}" }]);
+  conversation.addToolResult("c3", "small newest evidence");
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 100, truncatedResultBytes: 100 },
+    timeFn,
+  });
+  assert.ok(outcome.compactionTruncate >= 1);
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ call_id: string; content: string }>;
+  const skill = events.find((e) => e.call_id === "s1")!;
+  assert.match(skill.content, /\[repository skill \(\.agents\/skills\/dependency-upgrades\/SKILL\.md\) discarded during context compaction/);
+  assert.doesNotMatch(skill.content, /skill body/, "no partial skill content survives");
+  const normal = events.find((e) => e.call_id === "c2")!;
+  assert.equal(normal.content, `{"blob": "${"z".repeat(30_000)}"}`, "protected newest results are never mutated");
+  assert.equal(events.find((e) => e.call_id === "c3")!.content, "small newest evidence");
+  assert.equal(outcome.compactionOverflowProtected, true);
+});
+
+test("#1043 review: digest folding leaves skill results out of the digest and marks them discarded", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("x".repeat(500));
+  conversation.addAssistantToolCalls([{ id: "s1", name: "read_skill", arguments: "{}" }]);
+  conversation.addToolResult(
+    "s1",
+    { path: ".agents/skills/app-security/SKILL.md", content: "SECRET-SKILL-ADVICE check auth boundaries", content_complete: true, source: "trusted-base" },
+    { tool: "read_skill", maxBytes: 60_000 },
+  );
+  conversation.addAssistantToolCalls([{ id: "c1", name: "read_file", arguments: "{}" }]);
+  conversation.addToolResult("c1", "old file evidence");
+  conversation.addAssistantToolCalls([{ id: "c2", name: "read_file", arguments: "{}" }]);
+  conversation.addToolResult("c2", "newest file evidence");
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const summarizeFn = (block: string) => {
+    assert.doesNotMatch(block, /SECRET-SKILL-ADVICE/, "skill bodies never enter the digest prompt");
+    assert.match(block, /old file evidence/);
+    return "digest of old evidence";
+  };
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 10, summarizeKeepNewest: 1 },
+    summarizeFn,
+    timeFn,
+  });
+  assert.ok(outcome.compactionSummarize >= 1);
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ call_id: string; content: string }>;
+  assert.match(events[0]!.content, /\[repository skill \(\.agents\/skills\/app-security\/SKILL\.md\) discarded during context compaction/);
+  assert.doesNotMatch(events[0]!.content, /SECRET-SKILL-ADVICE/);
+  assert.match(events[1]!.content, /Condensed digest/);
+  assert.equal(events.at(-1)!.content, "newest file evidence");
+});
+
+test("compaction: the model-generated digest folds old results, newest stay verbatim", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("x".repeat(500));
+  let digestCalls = 0;
+  const summaries = ["digest of old results"];
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const budgets = { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 10, summarizeKeepNewest: 1 };
+  for (let i = 0; i < 3; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "t", arguments: "{}" }]);
+    conversation.addToolResult(`c${i}`, `result ${i}`);
+  }
+  const summarizeFn = (block: string) => {
+    digestCalls++;
+    assert.match(block, /\[earlier result 1\]/);
+    return summaries[0]!;
+  };
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, { apiFormat: "openai", model: "m", budgets, summarizeFn, timeFn });
+  assert.ok(outcome.compactionSummarize >= 1);
+  assert.ok(digestCalls >= 1);
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ call_id: string; content: string }>;
+  assert.match(events[0]!.content, /Condensed digest/);
+  assert.equal(events.at(-1)!.content, "result 2");
+});
+
+test("#1638 review: the folded digest survives both truncation passes intact", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("x".repeat(500));
+  // A ~900-byte digest: inside the 2000-byte digest cap but ABOVE the
+  // 256-byte second-pass floor. Before the write-time cap + fold skip, the
+  // floor pass silently cut the preserved evidence down to 256 bytes.
+  const digest = `digest of old results\n${"d".repeat(900)}`;
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const budgets = {
+    ...adaptiveLoopBudgets(1, 8, 120),
+    maxConversationTokens: 10,
+    truncatedResultBytes: 2000,
+    summarizeKeepNewest: 1,
+  };
+  for (let i = 0; i < 3; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "t", arguments: "{}" }]);
+    conversation.addToolResult(`c${i}`, `result ${i}`);
+  }
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets,
+    summarizeFn: () => digest,
+    timeFn,
+  });
+  assert.ok(outcome.compactionSummarize >= 1);
+  assert.ok(outcome.compactionTruncate >= 1);
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ call_id: string; content: string }>;
+  assert.equal(events[0]!.content, "Condensed digest of earlier tool results:\n" + digest);
+  assert.equal(events.at(-1)!.content, "result 2");
+});
+
+test("#1635: no compaction below the watermark", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("u".repeat(1000));
+  for (let i = 1; i <= 4; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "read_file", arguments: "{}" }]);
+    conversation.addToolResult(`c${i}`, "r".repeat(5000), { maxBytes: 9000 });
+  }
+  const resultsBefore = (conversation.events.filter((e) => e.kind === "tool_result") as Array<{ content: string }>).map((e) => e.content);
+  const renderedBefore = JSON.stringify(conversation.renderOpenAiMessages());
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 98304 },
+    timeFn,
+  });
+  assert.equal(outcome.finalText, "done");
+  assert.equal(outcome.compactionEvents.length, 0);
+  assert.equal(outcome.compactionTruncate, 0);
+  assert.equal(outcome.compactionSummarize, 0);
+  const resultsAfter = (conversation.events.filter((e) => e.kind === "tool_result") as Array<{ content: string }>).map((e) => e.content);
+  assert.deepEqual(resultsAfter, resultsBefore);
+  // Append-only history: the loop may add turn notes/newer messages, never
+  // rewrite an earlier one.
+  const renderedAfter = conversation.renderOpenAiMessages() as unknown[];
+  assert.ok(JSON.stringify(renderedAfter).startsWith(renderedBefore));
+  assert.equal(
+    JSON.stringify(renderedAfter.slice(0, 8)),
+    JSON.stringify(JSON.parse(renderedBefore).slice(0, 8)),
+  );
+});
+
+test("#1635: past-watermark compaction keeps the newest N verbatim and stays wire-valid", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("u".repeat(1000));
+  const originals: string[] = [];
+  for (let i = 1; i <= 4; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "read_file", arguments: "{}" }]);
+    const body = `r${i}-`.padEnd(4000, "x");
+    originals.push(body);
+    conversation.addToolResult(`c${i}`, body, { maxBytes: 8000 });
+  }
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 3000, truncatedResultBytes: 100, summarizeKeepNewest: 2 },
+    timeFn,
+  });
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ call_id: string; content: string }>;
+  assert.equal(events[2]!.content, originals[2]!);
+  assert.equal(events[3]!.content, originals[3]!);
+  assert.ok(Buffer.byteLength(events[0]!.content, "utf8") <= 100);
+  assert.ok(Buffer.byteLength(events[1]!.content, "utf8") <= 100);
+  const openai = conversation.renderOpenAiMessages() as Array<{ role: string; tool_call_id?: string; tool_calls?: Array<{ id: string }> }>;
+  const assistantIds = new Set(openai.flatMap((m) => (m.tool_calls ?? []).map((c) => c.id)));
+  const resultIds = new Set(openai.filter((m) => m.role === "tool").map((m) => m.tool_call_id).filter((id): id is string => id !== undefined));
+  assert.equal(resultIds.size, assistantIds.size);
+  for (const id of resultIds) assert.ok(assistantIds.has(id));
+  for (const id of assistantIds) assert.ok(resultIds.has(id));
+  const anthropic = conversation.renderAnthropicMessages() as Array<{ role: string; content: unknown }>;
+  const toolUseIds = new Set<string>();
+  const toolResultIds = new Set<string>();
+  for (const m of anthropic) {
+    if (typeof m.content === "string") continue;
+    for (const block of m.content as Array<Record<string, unknown>>) {
+      if (block.type === "tool_use") toolUseIds.add(String(block.id));
+      if (block.type === "tool_result") toolResultIds.add(String(block.tool_use_id));
+    }
+  }
+  assert.deepEqual([...toolResultIds].sort(), [...toolUseIds].sort());
+  assert.equal(outcome.compactionEvents.length, 1);
+  assert.equal(outcome.compactionEvents[0]!.kind, "truncate");
+  assert.equal(outcome.compactionEvents[0]!.cacheable_prefix_changed, true);
+  assert.equal(outcome.compactionEvents[0]!.results_shortened, 2);
+});
+
+test("#1635: protected overflow is recorded, not silently truncated", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("u".repeat(1000));
+  const originals: string[] = [];
+  for (let i = 1; i <= 2; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "read_file", arguments: "{}" }]);
+    const body = `r${i}-`.padEnd(6000, "x");
+    originals.push(body);
+    conversation.addToolResult(`c${i}`, body, { maxBytes: 8000 });
+  }
+  const { postFn, executeFn, timeFn } = scriptedLoop([openAiText("done")], []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(1, 8, 120), maxConversationTokens: 10, summarizeKeepNewest: 2 },
+    timeFn,
+  });
+  assert.ok(outcome.compactionTruncate >= 1);
+  assert.equal(outcome.compactionOverflowProtected, true);
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ content: string }>;
+  assert.deepEqual(events.map((e) => e.content), originals);
+  assert.equal(outcome.compactionEvents.at(-1)!.kind, "truncate");
+  assert.equal(outcome.compactionEvents.at(-1)!.results_shortened, 0);
+});
+
+/**
+ * #1635: the deterministic fixture reproducing PR #12090's compaction
+ * signature (home-ops run 43140955629, pinned v3.8.0). The driver's
+ * `approxTokens()` counts system + 16 bytes/event + content bytes, ÷4 rounded
+ * up, so the byte arithmetic below lands on the incident's pair exactly:
+ *
+ * - before: 1 + (16+56,036) + 9×(16+11) + 9×16 + 95,860 = 152,300 bytes
+ *   → ceil(152,300/4) = 38,075 approximate tokens (round 18);
+ * - the v3.8 rail compacted at 25% of the declared window (32,768 for
+ *   131,072), so this exact conversation hit the old blunt pass
+ *   (every result over the cap, none protected); at a 2,000-byte cap with no
+ *   newlines the clip is exact: 1 + 56,052 + 243 + 9×2,016 = 74,440 bytes
+ *   → ceil(74,440/4) = 18,610 approximate tokens (round 19) — the ~51%
+ *   evidence destruction.
+ *
+ * The fixture pins those driver-side numbers only; it claims nothing about
+ * provider-reported tokens or backend latency.
+ */
+function pr12090Fixture(): Conversation {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("c".repeat(56036));
+  for (let i = 1; i <= 9; i++) {
+    conversation.addAssistantToolCalls([{ id: `c${i}`, name: "read_file", arguments: "{}" }]);
+    conversation.addToolResult(`c${i}`, "e".repeat(i === 9 ? 10652 : 10651), { maxBytes: 12000 });
+  }
+  return conversation;
+}
+
+test("#1635: the #12090-shaped 38,075→18,610 fixture compacts under the old rail only", () => {
+  // The old 25% watermark: 32,768 approximate tokens for a 131,072 window.
+  const oldWatermark = Math.floor(131072 * 0.25);
+  const control = pr12090Fixture();
+  assert.equal(control.approxTokens(), 38075, "round-18 size of the incident");
+  assert.ok(38075 > oldWatermark, "the fixture straddles the historical trigger");
+  // v3.8 behavior: cap every oversized result, newest included.
+  const crushed = control.truncateOldestToolResults(2000, { keepNewest: 0 });
+  assert.equal(crushed.shortened, 9);
+  assert.equal(control.approxTokens(), 18610, "the round-19 collapse, byte-for-byte");
+});
+
+test("#1635: the #12090 fixture never compacts under the 75% policy and stays byte-stable across rounds", async () => {
+  const limits = loopContextLimits(
+    { PRIMARY_MODEL_CONTEXT_TOKENS: "131072", TOOL_MAX_TOKENS_PER_TURN: "16384" },
+    "primary",
+  );
+  assert.equal(limits.maxConversationTokens, 98304);
+  const conversation = pr12090Fixture();
+  assert.equal(conversation.approxTokens(), 38075);
+  const responses = [
+    openAiCall("c10", "read_file", '{"path":"x.ts"}'),
+    openAiCall("c11", "read_file", '{"path":"y.ts"}'),
+    openAiText("done"),
+  ];
+  const messageBytes: string[] = [];
+  let responseIndex = 0;
+  const outcome = await driveToolLoop(
+    conversation,
+    async (payload) => {
+      messageBytes.push(JSON.stringify((payload as Record<string, unknown>).messages));
+      return responses[responseIndex++];
+    },
+    async (_name, args) => ({ tool: "read_file", status: "ok", result: { content: String(args.path ?? "") } }),
+    {
+      apiFormat: "openai",
+      model: "m",
+      budgets: {
+        ...adaptiveLoopBudgets(3, 8, 120),
+        maxConversationTokens: limits.maxConversationTokens,
+        truncatedResultBytes: 2000,
+        summarizeKeepNewest: 2,
+      },
+      timeFn: () => 0,
+    },
+  );
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  // Multi-round pre-watermark byte/prefix stability: every serialized request
+  // after the first replays its predecessor's message bytes unchanged, with
+  // only new events appended.
+  assert.equal(messageBytes.length, 3);
+  for (let index = 1; index < messageBytes.length; index++) {
+    assert.ok(
+      messageBytes[index]!.length > messageBytes[index - 1]!.length,
+      `round ${index + 1} appended no events — the prefix check below would be vacuous`,
+    );
+    assert.ok(
+      messageBytes[index]!.startsWith(messageBytes[index - 1]!.slice(0, -1)),
+      `round ${index + 1} rewrote the earlier request bytes below the watermark`,
+    );
+  }
+  assert.equal(outcome.compactionEvents.length, 0, "no destructive compaction before the watermark");
+  assert.equal(outcome.compactionTruncate, 0);
+  assert.equal(outcome.compactionSummarize, 0);
+  assert.equal(outcome.compactionOverflowProtected, false);
+  assert.ok(outcome.peakConversationTokens <= limits.maxConversationTokens);
+  const results = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ content: string }>;
+  assert.deepEqual(
+    results.slice(0, 9).map((e) => Buffer.byteLength(e.content, "utf8")),
+    [...Array.from({ length: 8 }, () => 10651), 10652],
+    "the nine incident-shaped results survive untouched",
+  );
+});
+
+test("anthropic tool_use inputs serialise once at the boundary; text blocks ride along", async () => {
+  const response = {
+    content: [
+      { type: "text", text: "thinking" },
+      { type: "tool_use", id: "a1", name: "read_file", input: { path: "x", b: 2 } },
+    ],
+  };
+  const { calls, text } = extractToolCalls(response, "anthropic");
+  assert.equal(text, "thinking");
+  assert.deepEqual(calls, [{ id: "a1", name: "read_file", arguments: '{"b": 2, "path": "x"}' }]);
+  // The natural pipeline round-trips into the conversation (text and tool_use
+  // ride as separate assistant events; both renderers merge them on the wire).
+  const conversation = new Conversation();
+  conversation.addAssistantText(text);
+  conversation.addAssistantToolCalls(calls);
+  const messages = conversation.renderAnthropicMessages() as Array<{ content: Array<Record<string, unknown>> }>;
+  assert.deepEqual(messages[0]!.content[0], { type: "text", text: "thinking" });
+  assert.deepEqual(messages[1]!.content[0]!.input, { path: "x", b: 2 });
+});
+
+test("openai nested function form and fragmentary arguments are preserved", () => {
+  const { calls } = extractToolCalls(
+    { choices: [{ message: { tool_calls: [{ id: "z", function: { name: "t", arguments: '{"a":' } }] } }] },
+    "openai",
+  );
+  assert.deepEqual(calls, [{ id: "z", name: "t", arguments: '{"a":' }]);
+});
+
+test("streamed anthropic turns reassembled into OpenAI shape still yield tool calls", () => {
+  const { calls, text } = extractToolCalls(
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "Reading.",
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "list_tree", arguments: '{"path": "."}' } }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    },
+    "anthropic",
+  );
+  assert.equal(text, "Reading.");
+  assert.deepEqual(calls, [{ id: "call_1", name: "list_tree", arguments: '{"path": "."}' }]);
+});
+
+test("adaptiveLoopBudgets: rounds double and cap at 12 (explicit override, the default 4th arg)", () => {
+  assert.equal(adaptiveLoopBudgets(2, 5, 30).maxRounds, 4);
+  assert.equal(adaptiveLoopBudgets(6, 5, 30).maxRounds, 12);
+  assert.equal(adaptiveLoopBudgets(7, 5, 30).maxRounds, 12);
+});
+
+// ---------------------------------------------------------------------------
+// #895 — the round cap didn't scale with the #810 size-scaled tool-call
+// budget, so reviews were stopping on max-rounds with roughly half the call
+// budget unspent. `roundsExplicit: false` is what the harness passes when
+// TOOL_MAX_ROUNDS/SMART_TOOL_MAX_ROUNDS was never explicitly set.
+// ---------------------------------------------------------------------------
+
+test("#895: a default (non-explicit) config with a 32-call budget yields at least 16 rounds", () => {
+  const budgets = adaptiveLoopBudgets(4, 32, 600, false);
+  assert.ok(budgets.maxRounds >= 16, `expected >= 16 rounds, got ${budgets.maxRounds}`);
+});
+
+test("#895: an explicit TOOL_MAX_ROUNDS override is respected — the call budget does not widen it", () => {
+  // Same 32-call budget as above, but the caller resolved maxRounds from an
+  // explicit env override: stays at the pre-#895 doubled-and-capped-at-12
+  // value, exactly like adaptiveLoopBudgets(4, 32, 600) with no 4th arg.
+  const budgets = adaptiveLoopBudgets(4, 32, 600, true);
+  assert.equal(budgets.maxRounds, 8);
+});
+
+test("#895: the scaled round cap holds at the TOOL_LOOP_ROUNDS_CEILING for a large budget", () => {
+  const budgets = adaptiveLoopBudgets(4, 50, 600, false);
+  assert.equal(budgets.maxRounds, TOOL_LOOP_ROUNDS_CEILING);
+});
+
+test("#895: a small non-explicit budget still gets at least the doubled-rounds floor", () => {
+  assert.equal(adaptiveLoopBudgets(4, 6, 600, false).maxRounds, 8); // max(4*2, 6)
+});
+
+test("a non-explicit round cap allows one round per tool call", () => {  assert.equal(adaptiveLoopBudgets(4, 24, 600, false).maxRounds, 24);
+  assert.equal(adaptiveLoopBudgets(4, 32, 600, false).maxRounds, 32);
+});
+
+test("#1043 review: the summarizer request advertises no tools in either wire format", () => {
+  // The digest request rides postFn with no executor — a fresh Conversation
+  // inherits the global TOOL_SCHEMAS, so the summarizer must clear them and
+  // the payload must omit the field entirely (an empty array is still a
+  // tools field some providers reject).
+  const summarizer = buildSummarizerConversation("compress these results");
+  const openai = summarizer.toRequestPayload("openai", "m", { stream: false, maxTokens: 128 }) as Record<string, unknown>;
+  assert.equal("tools" in openai, false);
+  const anthropic = summarizer.toRequestPayload("anthropic", "m", { stream: false, maxTokens: 128 }) as Record<string, unknown>;
+  assert.equal("tools" in anthropic, false);
+  assert.match(String(openai.messages ? JSON.stringify(openai.messages) : ""), /compress these results/);
+  // Sanity: the default loop conversation still advertises the tool set.
+  const loopConversation = new Conversation();
+  const loopPayload = loopConversation.toRequestPayload("openai", "m", { stream: false }) as Record<string, unknown>;
+  assert.ok(Array.isArray(loopPayload.tools) && (loopPayload.tools as unknown[]).length > 0);
+});
+
+// ---------------------------------------------------------------------------
+// #1199 — per-round model latency and provider-reported token usage.
+// A dedicated telemetry clock (`nowFn`) keeps per-round measurement independent
+// of the budget clock, so these tests pin latency without touching the
+// scripted wall-clock sequences the reliability tests above rely on.
+// ---------------------------------------------------------------------------
+
+function telemetryLoop(
+  responses: unknown[],
+  execResults: Record<string, unknown>[],
+  nowClock: number[],
+) {
+  let responseIndex = 0;
+  let execIndex = 0;
+  let nowIndex = 0;
+  const postFn = async () => responses[responseIndex++];
+  const executeFn = async () => execResults[execIndex++] ?? { tool: "?", status: "error", result: { error: "none" } };
+  // Budget clock is held constant so no wall-clock stop fires; per-round
+  // latency is measured purely by the separate telemetry clock below.
+  const timeFn = () => 0;
+  const nowFn = () => nowClock[nowIndex++] ?? Number.MAX_SAFE_INTEGER / 2;
+  const rounds: NativeLoopRoundTelemetry[] = [];
+  return { postFn, executeFn, timeFn, nowFn, rounds };
+}
+
+test("#1199: onRound records one bounded telemetry record per model turn", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const turn1 = {
+    ...openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    usage: { prompt_tokens: 18420, completion_tokens: 1330, total_tokens: 19750, prompt_tokens_details: { cached_tokens: 16000 } },
+  };
+  const turn2 = openAiText("done");
+  // nowFn: [telemetryStart, r1 modelStart, modelEnd, toolStart, toolEnd, wall, r2 modelStart, modelEnd, wall]
+  const { postFn, executeFn, timeFn, nowFn, rounds } = telemetryLoop(
+    [turn1, turn2],
+    [{ tool: "read_file", status: "ok", result: { content: "x" } }],
+    [0, 1, 13.4, 13.8, 14.2, 15, 15, 18, 18],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  // one record per model turn, matching outcome.rounds (no double counting).
+  assert.equal(rounds.length, outcome.rounds);
+  assert.equal(rounds.length, 2);
+  const r1 = rounds[0]!;
+  assert.equal(r1.round, 1);
+  assert.equal(r1.model_sec, 12.4);
+  assert.equal(r1.prompt_tokens, 18420);
+  assert.equal(r1.completion_tokens, 1330);
+  assert.equal(r1.cached_tokens, 16000);
+  assert.equal(r1.tools_requested, 1);
+  assert.equal(r1.tools_executed, 1);
+  assert.equal(r1.tools_refused, 0);
+  assert.equal(r1.tools_deduplicated, 0);
+  assert.equal(r1.tool_elapsed_sec, 0.4);
+  assert.equal(r1.requests_remaining, 7);
+  assert.equal(r1.rounds_remaining, 7);
+  assert.equal(r1.wall_clock_remaining_sec, 105);
+  assert.equal(r1.streamed_fallback, false);
+  const r2 = rounds[1]!;
+  assert.equal(r2.round, 2);
+  assert.equal(r2.model_sec, 3);
+  // the stop turn reported no usage block → null, never a synthesized number.
+  assert.equal(r2.prompt_tokens, null);
+  assert.equal(r2.completion_tokens, null);
+  assert.equal(r2.cached_tokens, null);
+  assert.equal(r2.tools_requested, 0);
+  assert.equal(r2.tool_elapsed_sec, 0);
+  assert.equal(r2.rounds_remaining, 6);
+  assert.equal(r2.wall_clock_remaining_sec, 102);
+});
+
+test("#1199: provider usage is accounted in the configured format's convention (Anthropic-shaped body)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const turn1 = {
+    content: [
+      { type: "text", text: "thinking" },
+      { type: "tool_use", id: "t1", name: "read_file", input: { path: "a.ts" } },
+    ],
+    usage: { input_tokens: 500, output_tokens: 40, cache_read_input_tokens: 300 },
+  };
+  const turn2 = { content: [{ type: "text", text: "done" }] };
+  const { postFn, executeFn, timeFn, nowFn, rounds } = telemetryLoop(
+    [turn1, turn2],
+    [{ tool: "read_file", status: "ok", result: { content: "x" } }],
+    [],
+  );
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "anthropic",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(rounds.length, 2);
+  // Anthropic reports the cache read tokens OUTSIDE input_tokens, so the
+  // prompt total is 500 + 300 — the same accounting the loop aggregate folds,
+  // so the persisted records sum to the aggregate (#1199 derivability).
+  assert.equal(rounds[0]!.prompt_tokens, 800);
+  assert.equal(rounds[0]!.completion_tokens, 40);
+  assert.equal(rounds[0]!.cached_tokens, 300);
+  // no telemetry clock → constant → zero latency (not asserted for a real run)
+  assert.equal(rounds[0]!.model_sec, 0);
+});
+
+test("#1199: a streamed→non-streamed fallback is recorded once, never per wire request", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let turns = 0;
+  const postFn = async (_payload: Record<string, unknown>, turn?: ToolTurnSignal) => {
+    turns++;
+    turn?.reportFallback(); // the transport seam reports a fallback for this turn
+    return turns === 1 ? openAiCall("c1", "read_file", '{"path":"a.ts"}') : openAiText("done");
+  };
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop(
+    [],
+    [{ tool: "read_file", status: "ok", result: {} }],
+    [],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  // two turns → two records (a retried turn does NOT emit a second record).
+  assert.equal(rounds.length, outcome.rounds);
+  assert.equal(rounds.length, 2);
+  assert.equal(rounds[0]!.streamed_fallback, true);
+  assert.equal(rounds[1]!.streamed_fallback, true);
+});
+
+test("#1199: executed + refused + deduplicated always equals requested", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // one valid call, a duplicate of it, and an invalid-argument call.
+  const multi = openAiCall("c1", "t", '{"n":1}');
+  const mc = (multi as { choices: Array<{ message: { tool_calls: unknown[] } }> }).choices[0]!.message.tool_calls;
+  mc.push({ id: "c2", type: "function", function: { name: "t", arguments: '{"n":1}' } });
+  mc.push({ id: "c3", type: "function", function: { name: "t", arguments: '{"bad' } });
+  const { postFn, executeFn, timeFn, nowFn, rounds } = telemetryLoop(
+    [multi, openAiText("done")],
+    [{ tool: "t", status: "ok", result: {} }],
+    [],
+  );
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  const r1 = rounds[0]!;
+  assert.equal(r1.tools_requested, 3);
+  assert.equal(r1.tools_executed, 1);
+  assert.equal(r1.tools_deduplicated, 1);
+  assert.equal(r1.tools_refused, 1);
+  assert.equal(r1.tools_executed + r1.tools_refused + r1.tools_deduplicated, r1.tools_requested);
+});
+
+test("#1199: emits exactly one record per turn on a max-rounds stop", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = Array.from({ length: 6 }, (_, i) => openAiCall(`c${i}`, "t", "{}"));
+  const exec = responses.map(() => ({ tool: "t", status: "ok", result: {} }));
+  const { postFn, executeFn, timeFn, nowFn, rounds } = telemetryLoop(responses, exec, []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(3, 50, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  assert.equal(rounds.length, outcome.rounds);
+  assert.deepEqual(rounds.map((r) => r.round), [1, 2, 3, 4, 5, 6]);
+});
+
+test("#1199: records a transport-error turn as a round without incrementing rounds", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const postFn = async () => { throw new Error("connection reset by peer"); };
+  // nowFn: [telemetryStart, modelStart, the catch, the record's wall read]
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], [0, 100, 100.5, 100.6]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(outcome.stopReason, STOP_REQUEST_ERROR);
+  assert.equal(outcome.error, "connection reset by peer");
+  // the errored turn is recorded but does NOT increment outcome.rounds (that
+  // count anchors usage.rounds_used, stop reasons, and budget notes) — so the
+  // persisted records cover every model turn while rounds stays the count of
+  // turns that returned a response.
+  assert.equal(outcome.rounds, 0);
+  assert.equal(rounds.length, 1);
+  const errored = rounds[0]!;
+  // 1-based model-turn index: an errored first turn is still round 1.
+  assert.equal(errored.round, 1);
+  assert.equal(errored.model_sec, 0.5);
+  // no response body exists: null usage, never a synthesized number, and no
+  // tool activity.
+  assert.equal(errored.prompt_tokens, null);
+  assert.equal(errored.completion_tokens, null);
+  assert.equal(errored.cached_tokens, null);
+  assert.equal(errored.tools_requested, 0);
+  assert.equal(errored.tools_executed, 0);
+  assert.equal(errored.tools_refused, 0);
+  assert.equal(errored.tools_deduplicated, 0);
+  assert.equal(errored.tool_elapsed_sec, 0);
+  assert.equal(errored.requests_remaining, 8);
+  // the remaining-budget view for that turn is read on the UNincremented
+  // rounds count.
+  assert.equal(errored.rounds_remaining, 8);
+  assert.equal(errored.streamed_fallback, false);
+});
+
+test("#1199: a transport-error turn records the streamed fallback it attempted", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const postFn = async (_payload: Record<string, unknown>, turn?: ToolTurnSignal) => {
+    turn?.reportFallback(); // fell back from the streamed attempt before the retry also failed
+    throw new Error("reassembly failed");
+  };
+  // nowFn: [telemetryStart, modelStart, the catch, the record's wall read]
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], [0, 7, 7.25, 7.25]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(outcome.stopReason, STOP_REQUEST_ERROR);
+  assert.equal(outcome.rounds, 0);
+  assert.equal(rounds.length, 1);
+  assert.equal(rounds[0]!.round, 1);
+  assert.equal(rounds[0]!.model_sec, 0.25);
+  assert.equal(rounds[0]!.streamed_fallback, true);
+});
+
+// ---------------------------------------------------------------------------
+// #1466 — the per-round transport measurements.
+//
+// The point of these records is to separate "the provider was slow" from
+// "the provider answered fast and the Action was slow afterwards", and to
+// make a streamed→non-streamed fallback separately attributable. Every
+// measurement comes from the transport's own probe; nothing is estimated.
+// ---------------------------------------------------------------------------
+
+/** A body that carries a transport probe, the way the production adapter
+ * attaches one to the body the transport returned. */
+function timedBody(
+  body: Record<string, unknown>,
+  timing: TransportTiming,
+): Record<string, unknown> {
+  return attachTransportTiming(body, timing);
+}
+
+test("#1466: the round record carries the accepted attempt's transport measurements", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // A streamed turn's body: the OpenAI chat projection of an Anthropic
+  // stream, with the cache counters the #910 accounting reads.
+  const timed = timedBody(
+    {
+      choices: [{ message: { content: "done" }, finish_reason: "end_turn" }],
+      usage: {
+        prompt_tokens: 447,
+        completion_tokens: 1330,
+        total_tokens: 1777,
+        prompt_tokens_details: { cached_tokens: 189952 },
+        cache_read_input_tokens: 189952,
+        cache_creation_input_tokens: 25,
+      },
+    },
+    { firstEventSec: 0.2, firstSseEventSec: 0.3, firstContentSec: 1.4, totalSec: 2.71, wireCalls: 1 },
+  );
+  const postFn = async (_payload: Record<string, unknown>, turn?: ToolTurnSignal) => {
+    // The seam reports the probe of the call it made.
+    turn?.reportTiming?.(readTransportTiming(timed));
+    return timed;
+  };
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], []);
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "anthropic",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(rounds.length, 1);
+  const r1 = rounds[0]!;
+  // The timings are the accepted attempt's own instants.
+  assert.equal(r1.ttft_sec, 1.4);
+  assert.equal(r1.first_event_sec, 0.2);
+  // 1330 completion tokens over the 1.31s decode window.
+  assert.equal(r1.decode_tokens_per_sec, 1015.3);
+  // One transport call, one HTTP attempt.
+  assert.equal(r1.attempts, 1);
+  assert.equal(r1.wire_calls, 1);
+  // The provider's stop reason, as a bounded enum token.
+  assert.equal(r1.finish_reason, "end_turn");
+  // The cache breakdown comes from the provider's own reported counters.
+  assert.equal(r1.cache_write_tokens, 25);
+  assert.equal(r1.uncached_prompt_tokens, 447);
+  // …and the prompt total stays the #910 accounting (447 + 189952 + 25).
+  assert.equal(r1.prompt_tokens, 190424);
+  assert.equal(r1.cached_tokens, 189952);
+});
+
+test("#1466: a response without a timing yields null timings, never a fabricated zero", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // No probe on the body: the transport reported nothing.
+  const untimed = {
+    choices: [{ message: { content: "done" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 10, completion_tokens: 4 },
+  };
+  const postFn = async (_payload: Record<string, unknown>, turn?: ToolTurnSignal) => {
+    turn?.reportTiming?.(readTransportTiming(untimed));
+    return untimed;
+  };
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], []);
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  const r1 = rounds[0]!;
+  assert.equal(r1.ttft_sec, null, "no measurement is null, never a zero");
+  assert.equal(r1.first_event_sec, null);
+  assert.equal(r1.decode_tokens_per_sec, null);
+  // The provider's own figures still ride the record.
+  assert.equal(r1.prompt_tokens, 10);
+  assert.equal(r1.completion_tokens, 4);
+  // OpenAI reports no cache writes and no separate uncached count.
+  assert.equal(r1.cache_write_tokens, null);
+  assert.equal(r1.uncached_prompt_tokens, null);
+  // The turn still made one transport call.
+  assert.equal(r1.attempts, 1);
+  assert.equal(r1.wire_calls, 1);
+  assert.equal(r1.finish_reason, "stop");
+});
+
+test("#1466: a streamed→non-streamed fallback reports the ACCEPTED attempt's measurements", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // The streamed attempt answered (with a body the seam judged unusable) and
+  // the non-streamed fallback produced the response the turn returned.
+  const streamed = timedBody(
+    { choices: [{ message: { content: null }, finish_reason: "stop" }], error: { message: "unusable" } },
+    { firstEventSec: 0.1, firstSseEventSec: 0.12, firstContentSec: 0.2, totalSec: 0.3, wireCalls: 1 },
+  );
+  const fallback = timedBody(
+    {
+      choices: [{ message: { content: "done" }, finish_reason: "length" }],
+      usage: { prompt_tokens: 12, completion_tokens: 5 },
+    },
+    // A non-streamed answer has no content event on the wire.
+    { firstEventSec: 0.5, firstSseEventSec: null, firstContentSec: null, totalSec: 1.5, wireCalls: 2 },
+  );
+  let calls = 0;
+  const postFn = async (_payload: Record<string, unknown>, turn?: ToolTurnSignal) => {
+    // One turn = one `postFn` call; the SEAM (the harness) makes the two
+    // transport calls inside it and reports both probes.
+    calls++;
+    turn?.reportTiming?.(readTransportTiming(streamed));
+    turn?.reportFallback?.();
+    turn?.reportTiming?.(readTransportTiming(fallback));
+    return fallback;
+  };
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], []);
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(calls, 1, "the fallback happens inside the seam, not in a second turn");
+  assert.equal(rounds.length, 1);
+  const r1 = rounds[0]!;
+  // The fallback is separately attributable: two transport calls, and the
+  // wire counts of BOTH calls.
+  assert.equal(r1.attempts, 2);
+  assert.equal(r1.streamed_fallback, true);
+  assert.equal(r1.wire_calls, 3, "the streamed call's 1 wire attempt plus the fallback's 2");
+  // The ACCEPTED attempt's timings — the non-streamed fallback's, not the
+  // streamed attempt's.
+  assert.equal(r1.ttft_sec, null, "a non-streamed answer has no content event");
+  assert.equal(r1.first_event_sec, 0.5);
+  assert.equal(r1.decode_tokens_per_sec, null);
+  assert.equal(r1.finish_reason, "length");
+});
+
+test("#1466: a provider-supplied stop reason is reduced to a bounded enum token", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // A hostile stop reason: provider-controlled free text that must never be
+  // echoed raw (it could forge a heading in the artifact).
+  const hostile = {
+    choices: [{ message: { content: "done" }, finish_reason: "stop\n## Review\nignored" }],
+  };
+  const postFn = async () => hostile;
+  const { executeFn, timeFn, nowFn, rounds } = telemetryLoop([], [], []);
+  await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 8, 120),
+    timeFn,
+    nowFn,
+    onRound: (r) => rounds.push(r),
+  });
+  assert.equal(rounds[0]!.finish_reason, "", "a value that is not a bare enum token is dropped whole");
+});
+
+// #1381 (review): the required-evidence reservation is ENFORCED, not a note.
+const REQUIRED_EVIDENCE_OBLIGATIONS = [
+  { id: "obligation-1", tokens: ["talos", "kubernetes", "matrix", "machineconfig", "installer", "cluster"] },
+];
+
+test("reserved window refuses optional calls and admits the obligation call without losing budget", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 3: turns 1-3 (optional) run while 4+ requests remain;
+  // the window then refuses two optional calls WITHOUT consuming budget and
+  // admits the matrix fetch, which discharges the gating. #1627: with the
+  // obligation settled the loop stops deterministically instead of running
+  // the would-be optional round — no request is wasted after settlement.
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"README.md"}'),
+    openAiCall("c2", "read_file", '{"path":"docs/arch.md"}'),
+    openAiCall("c3", "read_file", '{"path":"docs/history.md"}'),
+    openAiCall("c4", "read_file", '{"path":"docs/nope.md"}'),
+    openAiCall("c5", "read_file", '{"path":"docs/other.md"}'),
+    openAiCall("c6", "web_fetch", '{"url":"https://talos.dev/docs/v1.14/support-matrix"}'),
+  ];
+  const exec = responses.map((_, i) => ({ tool: i === 5 ? "web_fetch" : "read_file", status: "ok", result: { content: String(i) } }));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 6, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: REQUIRED_EVIDENCE_OBLIGATIONS,
+    timeFn,
+  });
+  assert.deepEqual(outcome.executed.map((item) => [item.tool, (item.args as { path?: string; url?: string }).path ?? (item.args as { url?: string }).url]), [
+    ["read_file", "README.md"],
+    ["read_file", "docs/arch.md"],
+    ["read_file", "docs/history.md"],
+    ["web_fetch", "https://talos.dev/docs/v1.14/support-matrix"],
+  ]);
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  // Two refusals consumed nothing: 6 budget − 4 executed = 2 left — the
+  // requests the settled obligations no longer need (#1627 early stop).
+  assert.equal(outcome.requestsRemaining, 2);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  const toolMessages = conversation.renderOpenAiMessages() as Array<{ role: string; content: string }>;
+  assert.ok(toolMessages.filter((m) => m.role === "tool" && m.content.includes("Reserved required-evidence budget")).length === 2);
+});
+
+test("a hostile model spending every turn on optional work cannot consume the reserved budget", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = Array.from({ length: 6 }, (_, i) => openAiCall(`c${i}`, "read_file", `{"path":"misc/${i}.md"}`));
+  const exec = responses.map(() => ({ tool: "read_file", status: "ok", result: { content: "x" } }));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(3, 6, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: REQUIRED_EVIDENCE_OBLIGATIONS,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  // Turns 1-3 executed before the window opened; turns 4-6 were refused and
+  // the three reserved requests survived intact for the obligation evidence.
+  assert.equal(outcome.executed.length, 3);
+  assert.equal(outcome.requiredEvidenceRefusals, 3);
+  assert.equal(outcome.requestsRemaining, 3);
+});
+
+test("schema argument names and non-boundary substrings never satisfy the obligation admission check", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // The obligation names "lockfile". c3 carries only argument-NAME overlap
+  // with a generic word, and c4 contains "lockfile" only INSIDE
+  // "clockfile.md" — neither may pass the word-boundary admission match.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"misc/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"misc/b.md"}'),
+      openAiCall("c3", "read_file", '{"path":"docs/guide.md","offset":1,"limit":40}'),
+      openAiCall("c4", "read_file", '{"path":"docs/clockfile.md"}'),
+      openAiText("done"),
+    ],
+    [
+      { tool: "read_file", status: "ok", result: { content: "a" } },
+      { tool: "read_file", status: "ok", result: { content: "b" } },
+    ],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 5, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: [{ id: "obligation-1", tokens: ["lockfile", "manifest", "schema"] }],
+    timeFn,
+  });
+  assert.deepEqual(outcome.executed.map((item) => (item.args as { path: string }).path), ["misc/a.md", "misc/b.md"]);
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  assert.equal(outcome.requestsRemaining, 3);
+});
+
+test("obligation evidence gathered BEFORE the window keeps the window open afterwards", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // The recommended path: the model resolves the obligation EARLY (turn 1).
+  // The window never re-demands evidence already attempted (nothing is ever
+  // refused) — and #1627: once the row discharges, the loop stops
+  // deterministically instead of running the optional rounds after it.
+  const responses = [
+    openAiCall("c1", "web_fetch", '{"url":"https://talos.dev/docs/v1.14/support-matrix"}'),
+  ];
+  const exec = responses.map(() => ({ tool: "web_fetch", status: "ok", result: { content: "x" } }));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 6, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: REQUIRED_EVIDENCE_OBLIGATIONS,
+    timeFn,
+  });
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.executed.length, 1);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+});
+
+test("catalog commands get no reserved-window exemption: optional run_command is refused without consuming budget", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // #1388 review: run_command is NOT admissible everywhere inside the
+  // reserved window. Its `command` value participates in the same overlap
+  // check as every other argument value, so an optional catalog call
+  // (git_status_short against a Talos-matrix obligation) is refused WITHOUT
+  // consuming budget — the model cannot burn the reserved requests on
+  // cheap baseline calls before attempting the obligation.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"misc/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"misc/b.md"}'),
+      openAiCall("c3", "run_command", '{"command":"git_status_short"}'),
+      openAiCall("c4", "list_tree", "{}"),
+      openAiCall("c5", "read_file", '{"path":"docs/nope.md"}'),
+      openAiText("done"),
+    ],
+    [
+      { tool: "read_file", status: "ok", result: { content: "a" } },
+      { tool: "read_file", status: "ok", result: { content: "b" } },
+    ],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 5, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: REQUIRED_EVIDENCE_OBLIGATIONS,
+    timeFn,
+  });
+  // All three in-window optional calls are refused — the catalog call, a
+  // zero-argument call (no target text at all), and a concretely-targeted
+  // one — so the reserved requests are fully preserved for the obligation
+  // evidence.
+  assert.deepEqual(outcome.executed.map((item) => item.tool), ["read_file", "read_file"]);
+  assert.equal(outcome.requiredEvidenceRefusals, 3);
+  assert.equal(outcome.requestsRemaining, 3);
+});
+
+test("a catalog command whose name is the obligation evidence stays admissible and discharges it", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 5, reserve 3: the window is open from the first call, but the
+  // catalog command's name overlaps the obligation's vocabulary, so it is
+  // admitted, consumes budget, and counts as the obligation's attempt.
+  // #1627: the discharge then settles the surface and the loop stops early.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "run_command", '{"command":"git_diff_stat"}'),
+    ],
+    [
+      { tool: "run_command", status: "ok", result: { stdout: "M x" } },
+    ],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 5, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: [{ id: "obligation-1", tokens: ["diff", "stat"] }],
+    timeFn,
+  });
+  assert.deepEqual(outcome.executed.map((item) => item.tool), ["run_command"]);
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.requestsRemaining, 4);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+});
+
+// #1388: the reservation pairs reserved REQUESTS with reserved ROUNDS.
+test("a complying model stuck on the round ceiling gets extension rounds and spends the reserved requests", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // maxRounds 4 (2×2), budget 8, reserve 2. Rounds 1-2 run optional calls
+  // while the window is closed; round 3's optional call is refused by the
+  // ROUNDS half of the window; round 4 is the last round the old loop had —
+  // it executes the matrix call (progress, one obligation discharged) and
+  // the extension buys round 5, where the model spends a reserved request on
+  // the remaining obligation and the window discharges (pendingEvidence 0).
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"misc/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"misc/b.md"}'),
+      openAiCall("c3", "read_file", '{"path":"docs/nope.md"}'),
+      openAiCall("c4", "web_fetch", '{"url":"https://talos.dev/docs/v1.14/support-matrix"}'),
+      openAiCall("c5", "read_file", '{"path":"docs/lockfile.md"}'),
+    ],
+    [
+      { tool: "read_file", status: "ok", result: { content: "a" } },
+      { tool: "read_file", status: "ok", result: { content: "b" } },
+      { tool: "web_fetch", status: "ok", result: { content: "matrix" } },
+      { tool: "read_file", status: "ok", result: { content: "lock" } },
+    ],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 8, 120),
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: [
+      { id: "obligation-1", tokens: ["matrix"] },
+      { id: "obligation-2", tokens: ["lockfile"] },
+    ],
+    timeFn,
+  });
+  // Without the extension the loop stops on max-rounds at 4 with the
+  // lockfile request still reserved; with it, round 5 runs. #1627: the
+  // round-5 discharge settles the surface, so the loop reports the early
+  // settled stop instead of the round-ceiling exhaustion.
+  assert.equal(outcome.rounds, 5);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.deepEqual(outcome.executed.map((item) => (item.args as { path?: string; url?: string }).path ?? (item.args as { url?: string }).url), [
+    "misc/a.md",
+    "misc/b.md",
+    "https://talos.dev/docs/v1.14/support-matrix",
+    "docs/lockfile.md",
+  ]);
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.equal(outcome.requestsRemaining, 4);
+});
+
+test("a hostile model emitting only refused calls inside the window stops at maxRounds with zero extension", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // maxRounds 2 (1×2) and reserve 3: the ROUNDS half of the window is open
+  // from the first call, so every optional call is refused. No round ever
+  // executes anything, so no ceiling extension is ever earned — the loop
+  // stops exactly at maxRounds with every reserved request intact.
+  const responses = Array.from({ length: 2 }, (_, i) => openAiCall(`c${i}`, "read_file", `{"path":"misc/${i}.md"}`));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, []);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(1, 6, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: REQUIRED_EVIDENCE_OBLIGATIONS,
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  assert.equal(outcome.rounds, 2);
+  assert.equal(outcome.executed.length, 0);
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  assert.equal(outcome.requestsRemaining, 6);
+});
+
+test("round-ceiling extension is hard-bounded at the reservation hint", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // maxRounds 4 (2×2), budget 12, reserve 3 (hint 3) against FOUR
+  // obligations. The model keeps making progress (each round executes one
+  // obligation-overlapping call while a later obligation stays pending), so
+  // extension rounds keep being earned — but never more than `hint` TOTAL:
+  // the loop stops at exactly maxRounds + hint (4 + 3 = 7), never round 8.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"misc/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"misc/b.md"}'),
+      openAiCall("c3", "read_file", '{"path":"docs/nope.md"}'),
+      openAiCall("c4", "web_fetch", '{"url":"https://talos.dev/docs/v1.14/support-matrix"}'),
+      openAiCall("c5", "read_file", '{"path":"docs/lockfile.md"}'),
+      openAiCall("c6", "read_file", '{"path":"docs/manifest.yaml"}'),
+      openAiCall("c7", "read_file", '{"path":"docs/changelog.md"}'),
+    ],
+    [
+      { tool: "read_file", status: "ok", result: { content: "a" } },
+      { tool: "web_fetch", status: "ok", result: { content: "matrix" } },
+      { tool: "read_file", status: "ok", result: { content: "lock" } },
+      { tool: "read_file", status: "ok", result: { content: "manifest" } },
+      { tool: "read_file", status: "ok", result: { content: "changelog" } },
+    ],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(2, 12, 120),
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: [
+      { id: "obligation-1", tokens: ["matrix"] },
+      { id: "obligation-2", tokens: ["lockfile"] },
+      { id: "obligation-3", tokens: ["manifest"] },
+      { id: "obligation-4", tokens: ["changelog"] },
+    ],
+    timeFn,
+  });
+  // #1627: the final extension round's discharge settles the surface, so
+  // the loop reports the settled early stop — the bound below still holds.
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.rounds, 7);
+  assert.ok(outcome.rounds <= 4 + 3, "extension never exceeds the hint");
+  assert.deepEqual(outcome.executed.map((item) => (item.args as { path?: string; url?: string }).path ?? (item.args as { url?: string }).url), [
+    "misc/a.md",
+    "https://talos.dev/docs/v1.14/support-matrix",
+    "docs/lockfile.md",
+    "docs/manifest.yaml",
+    "docs/changelog.md",
+  ]);
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  assert.equal(outcome.requestsRemaining, 7);
+});
+
+// ── #1379: deterministic dependency-evidence budget prioritization ────────
+
+const depRows = (reserve: number): Array<{ id: string; tokens: readonly string[]; obligation: DependencyEvidenceObligation }> =>
+  DEPENDENCY_EVIDENCE_OBLIGATIONS.slice(0, Math.min(DEPENDENCY_EVIDENCE_OBLIGATIONS.length, reserve))
+    .map((obligation) => ({ id: obligation, tokens: [], obligation }));
+
+/** Scripted loop that also records every request payload the driver built,
+ * so the turn-note ordering the driver owns is observable per round. */
+function noteCapturingLoop(responses: unknown[], execResults: Record<string, unknown>[]) {
+  let responseIndex = 0;
+  let execIndex = 0;
+  const payloads: Array<Record<string, unknown>> = [];
+  const postFn = async (payload: Record<string, unknown>) => {
+    payloads.push(payload);
+    return responses[responseIndex++];
+  };
+  const executeFn = async () =>
+    execResults[execIndex++] ?? { tool: "?", status: "error", result: { error: "no scripted result" } };
+  const timeFn = () => Number.MAX_SAFE_INTEGER / 2;
+  return { postFn, executeFn, timeFn, payloads };
+}
+
+function requestTexts(payload: Record<string, unknown>): string {
+  const messages = (payload as { messages?: Array<{ content: unknown }> }).messages ?? [];
+  return messages.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+}
+
+test("#1379: reserve injects the priority note before the first request and redirects inside the reserve window", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 4: rounds 1-2 execute outside the window (requestsLeft
+  // 5 at round 2, 4 at round 3 — the window opens when the tail is reached);
+  // round 3's read_file lands inside the window and is refused, which does
+  // not change the notes the earlier requests carried.
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [
+      openAiCall("c1", "git_status_short", "{}"),
+      openAiCall("c2", "git_diff_stat", "{}"),
+      openAiCall("c3", "read_file", '{"path":"a.txt"}'),
+      openAiText("done — evidence still unverified"),
+    ],
+    Array.from({ length: 3 }, () => ({ tool: "t", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceRequestsHint, 4);
+  // Round 0: the priority note precedes ANY tool call — the deterministic
+  // ordering rule is driver-owned, not prompt-fragment guidance.
+  const firstRequest = requestTexts(payloads[0]!);
+  assert.ok(firstRequest.includes("dependency evidence comes first"));
+  assert.ok(!firstRequest.includes("reserved"));
+  // The round-0 request must not yet carry the regular #701 budget note
+  // either (that starts on round 2+, unchanged when no reserve is set).
+  assert.ok(!firstRequest.includes("of 6 tool request(s)"));
+  // Round 2: requestsLeft (5) is still outside the window — the regular
+  // #701 budget note runs unchanged. Turn notes are append-only, so the
+  // LAST note in the request is the one this round added.
+  const secondRequest = requestTexts(payloads[1]!);
+  assert.ok(secondRequest.includes("[loop budget] 5 of 6 tool request(s)"));
+  // Round 3: requestsLeft (4) entered the reserve window — the budget note
+  // is REPLACED by the dependency-evidence redirect.
+  const thirdRequest = requestTexts(payloads[2]!);
+  assert.ok(thirdRequest.includes("reserved") && thirdRequest.includes("dependency evidence"));
+  const newestNote = (payloads[2]!.messages as Array<{ content: string }>)
+    .map((m) => m.content)
+    .filter((c) => typeof c === "string" && c.startsWith("[loop budget]"))
+    .at(-1)!;
+  assert.ok(newestNote.includes("reserved"));
+  assert.ok(!newestNote.includes("turn(s) remain"));
+  // The redirect names the always-advertised evidence channel and marks
+  // web_search conditional (it is offered only with a search endpoint).
+  assert.ok(newestNote.includes("web_fetch"));
+  assert.match(newestNote, /web_search when that tool is offered/);
+});
+
+test("#1379: no reserve keeps the exact legacy note behavior (no priority or reserve notes)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [openAiCall("c1", "read_file", '{"path":"a.ts"}'), openAiText("done")],
+    [{ tool: "read_file", status: "ok", result: {} }],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 24, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceRequestsHint, 0);
+  assert.ok(!requestTexts(payloads[0]!).includes("dependency evidence comes first"));
+  // Round 2 (after the first executed call) carries the regular budget note.
+  assert.ok(requestTexts(payloads[1]!).includes("[loop budget] 23 of 24 tool request(s)"));
+  assert.ok(!requestTexts(payloads[1]!).includes("dependency evidence"));
+});
+
+test("#1379: a reserve at the low-budget boundary preempts the generic low-budget note", async () => {
+  // Tiny budget (2) with reserve 1: the reserve window opens at
+  // requestsLeft <= 1, which is also the generic LOW_TOOL_REQUESTS_REMAINING
+  // threshold — the dependency redirect must win the ternary.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [openAiCall("c1", "read_file", '{"path":"a.ts"}'), openAiText("done")],
+    [{ tool: "read_file", status: "ok", result: {} }],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 2, 120),
+    timeFn,
+    reserveForRequiredEvidence: 1,
+    requiredEvidence: depRows(1),
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  // Round 2 (requestsLeft 1): the newest note is the dependency redirect,
+  // not the generic "stop broad exploration" low-budget note.
+  const newestNote = (payloads[1]!.messages as Array<{ content: string }>)
+    .map((m) => m.content)
+    .filter((c) => typeof c === "string" && c.startsWith("[loop budget]"))
+    .at(-1)!;
+  assert.ok(newestNote.includes("reserved"));
+  assert.ok(!newestNote.includes("Stop broad exploration"));
+});
+
+// ── #1379 review blocker: the reserve is ENFORCED, not just announced ──────
+
+/** Loop whose executor records every (tool, args) it was actually given, so
+ * refusals are observable as the calls the executor never saw. */
+function recordingLoop(responses: unknown[]) {
+  let responseIndex = 0;
+  const executedCalls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const postFn = async () => responses[responseIndex++];
+  const executeFn = async (tool: string, args: Record<string, unknown>) => {
+    executedCalls.push({ tool, args });
+    return { tool, status: "ok", result: {} };
+  };
+  const timeFn = () => Number.MAX_SAFE_INTEGER / 2;
+  return { postFn, executeFn, timeFn, executedCalls };
+}
+
+test("#1379: the reserve refuses optional calls inside the window until the obligations are met", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 4: rounds 1-2 execute outside the window (left 6, 5);
+  // round 3 requests an optional call inside the window with no evidence
+  // attempt yet — the driver refuses it and the reserved requests survive;
+  // round 4's web_fetch of release notes covers ONLY release_delta
+  // (blocker 5728634290 re-pin: one partial fetch no longer releases the
+  // window), so round 5's optional call is still refused.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "git_status_short", "{}"),
+    openAiCall("c2", "git_diff_stat", "{}"),
+    openAiCall("c3", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c4", "web_fetch", '{"url":"https://example.test/releases"}'),
+    openAiCall("c5", "git_log", "{}"),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  // The refused read_file and git_log never reached the executor; the
+  // reserved tail was spent on the evidence call instead of optional
+  // archaeology.
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["git_status_short", "git_diff_stat", "web_fetch"]);
+  assert.ok(outcome.requiredEvidenceAttempts >= 1);
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  // 3 executed of 6: the refusals consumed nothing.
+  assert.equal(outcome.requestsRemaining, 3);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["release_delta"]);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+  // The refusal is a model-facing error result the model can act on.
+  const transcript = JSON.stringify(conversation.toRequestPayload("openai", "m", {}));
+  assert.ok(transcript.includes("Reserved dependency-evidence budget"));
+});
+
+test("#1379: a model that never attempts evidence can never spend the reserved tail", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 4, one optional call per round. Once the window opens
+  // every call is refused without executing or spending, so the loop runs
+  // out of ROUNDS, not of the request budget: the reserve is fully intact.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+    openAiCall("c3", "git_log", "{}"),
+    openAiCall("c4", "git_blame", "{}"),
+    openAiCall("c5", "git_grep", "{}"),
+    openAiCall("c6", "find_files", "{}"),
+    openAiCall("c7", "list_tree", "{}"),
+    openAiCall("c8", "read_file", '{"path":"c.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  assert.equal(executedCalls.length, 2);
+  assert.equal(outcome.requiredEvidenceAttempts, 0);
+  assert.equal(outcome.requiredEvidenceRefusals, 6);
+  // Blocker 5728634290 re-pin: the per-obligation counters tell the same
+  // story — nothing credited, nothing attempted, the window never opened.
+  assert.equal(outcome.requiredEvidenceRequired, 3);
+  assert.equal(outcome.requiredEvidenceAttempts, 0);
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+  // The exact failure this rule exists to prevent no longer happens: budget
+  // exhaustion with the required evidence unresolved is impossible while the
+  // obligation is unattempted — the tail simply cannot be consumed.
+  assert.equal(outcome.requestsRemaining, 4);
+  // Every refusal tells the model how to unlock the window: web_fetch, the
+  // always-advertised channel (no web_fetch ever executed here, so this text
+  // can only come from the refusal note), with web_search named only
+  // conditionally.
+  const transcript = JSON.stringify(conversation.toRequestPayload("openai", "m", {}));
+  assert.ok(transcript.includes("web_fetch"));
+  assert.match(transcript, /web_search when that tool is offered/);
+});
+
+test("#1379: an evidence call covering every tracked obligation releases the window; a partial one does not", async () => {
+  // Blocker 5728634290 re-pin: the early release now comes from CREDITING
+  // every tracked obligation, not from any single attempt. One call whose
+  // target spans all three obligations (publisher host + security + changelog
+  // tokens) releases the window for optional work…
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://pypi.org/security/changelog"}'),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  // #1627: the settling fetch also ENDS the loop — the rounds the released
+  // window used to leave open for optional work are not spent anymore.
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["web_fetch"]);
+  assert.ok(outcome.requiredEvidenceAttempts >= 1);
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+
+  // …while a single release-notes fetch credits ONLY release_delta: the
+  // optional call inside the window is now refused instead of riding the
+  // old one-bit release.
+  const conversation2 = new Conversation();
+  conversation2.addUser("corpus");
+  const loop2 = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://example.test/releases"}'),
+    openAiCall("c2", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c3", "git_log", "{}"),
+    openAiText("done"),
+  ]);
+  const outcome2 = await driveToolLoop(conversation2, loop2.postFn, loop2.executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome2.stopReason, STOP_MODEL_DONE);
+  // c2 executes (requestsLeft 5, outside the window); c3 lands inside it and
+  // is refused: provenance and security_advisory are still outstanding.
+  assert.deepEqual(loop2.executedCalls.map((c) => c.tool), ["web_fetch", "read_file"]);
+  assert.equal(outcome2.requiredEvidenceRefusals, 1);
+  assert.deepEqual(outcome2.requiredEvidenceCredits, ["release_delta"]);
+  assert.equal(outcome2.requiredEvidenceReleased, false);
+});
+
+test("#1379: a failed evidence call still credits its obligation (no lockout) — and #1627 M1: it must NOT fire the settled early stop", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // The executor refuses every fetch (e.g. host allowlist). Crediting is
+  // attempt-based (blocker 5728634290): each failing fetch still covers the
+  // obligations its own target named, so a model that has done what it can
+  // is never locked out of the reserved tail.
+  let responseIndex = 0;
+  const responses = [
+    openAiCall("c1", "web_fetch", '{"url":"https://blocked.test/security/changelog"}'),
+    openAiCall("c2", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c3", "web_fetch", '{"url":"https://blocked.test/homepage"}'),
+    // #1627 M1: every row here was settled by ERROR-status calls only — the
+    // fold's citation gate needs a cited SUCCESSFUL call, so stopping settled
+    // now would strand the model with an unavoidable `uncited-satisfaction`.
+    // The settled early stop must NOT fire: the loop runs on under the
+    // pre-existing stops and ends on the model's own text-only hand.
+    openAiText("done — the evidence fetches all failed"),
+  ];
+  const executedStatuses: string[] = [];
+  const timeFn = () => Number.MAX_SAFE_INTEGER / 2;
+  const outcome = await driveToolLoop(
+    conversation,
+    async () => responses[responseIndex++],
+    async (tool: string) => {
+      executedStatuses.push(tool);
+      return { tool, status: "error", result: { error: "host not allowed" } };
+    },
+    {
+      apiFormat: "openai",
+      model: "m",
+      budgets: adaptiveLoopBudgets(4, 6, 120),
+      timeFn,
+      reserveForRequiredEvidence: 4,
+      requiredEvidence: depRows(4),
+    },
+  );
+  assert.ok(outcome.requiredEvidenceAttempts >= 1);
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.executed.length, 3);
+  // c1 credited security_advisory + release_delta and c3 credited
+  // provenance — all from ERROR-status calls — so the window released. But
+  // #1627 M1: rows settled with only FAILED executions never fire the
+  // settled early stop (the citation gate would strand the verdict); the
+  // loop continues and ends on the model's text-only hand instead.
+  assert.equal(outcome.requiredEvidenceAttempts, 2);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceSettledStop, false);
+  assert.deepEqual(executedStatuses, ["web_fetch", "read_file", "web_fetch"]);
+});
+
+// #1627 M1 paired pin: the SAME shape with a SUCCESSFUL settling call keeps
+// the settled early stop — the suppression is exactly the stranding case.
+test("#1627 M1: a settled row with a successful attempt among its calls still fires the settled early stop", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://blocked.test/security/changelog"}'),
+    openAiCall("c2", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c3", "web_fetch", '{"url":"https://blocked.test/homepage"}'),
+    openAiText("never reached — the loop stopped settled first"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.requiredEvidenceAttempts, 2);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+});
+
+test("#1595: the scoped lockfile-only advisory row is claimed by one executed fetch; optional calls stay refused until then", async () => {
+  // A #1595 lockfile-only low-risk dependency refresh tracks exactly ONE
+  // obligation (security_advisory — the aggregate advisory must_check row)
+  // and reserves the tracked set plus one SPARE attempt (reserve 2: a
+  // zero-slack tail would deactivate the row after a single non-crediting
+  // evidence attempt and permanently void the credit path). Inside the
+  // window an optional read is REFUSED without consuming budget; the FIRST
+  // in-window evidence call is provenance-shaped — it does not credit the
+  // tracked row, and the row must SURVIVE it (the spare) — and the following
+  // advisory-shaped fetch credits and discharges the obligation.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 2: rounds 1-4 run optional reads outside the window
+  // (the window opens when the last two requests are reached); round 5's
+  // optional read is refused and spends nothing; round 6's provenance-shaped
+  // fetch executes as the spare attempt; round 7's advisory fetch credits
+  // and discharges the row, after which the budget ends the loop.
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"a.md"}'),
+    openAiCall("c2", "read_file", '{"path":"b.md"}'),
+    openAiCall("c3", "read_file", '{"path":"c.md"}'),
+    openAiCall("c4", "read_file", '{"path":"d.md"}'),
+    openAiCall("c5", "read_file", '{"path":"nope.md"}'),
+    openAiCall("c6", "web_fetch", '{"url":"https://blocked.test/provenance"}'),
+    openAiCall("c7", "web_fetch", '{"url":"https://blocked.test/security"}'),
+  ];
+  const exec = [
+    { tool: "read_file", status: "ok", result: { content: "a" } },
+    { tool: "read_file", status: "ok", result: { content: "b" } },
+    { tool: "read_file", status: "ok", result: { content: "c" } },
+    { tool: "read_file", status: "ok", result: { content: "d" } },
+    { tool: "web_fetch", status: "ok", result: { content: "provenance" } },
+    { tool: "web_fetch", status: "ok", result: { content: "advisories" } },
+  ];
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: [{ id: "security_advisory", tokens: [], obligation: "security_advisory" }],
+  });
+  assert.equal(outcome.stopReason, STOP_BUDGET);
+  assert.deepEqual(outcome.executed.map((item) => (item.args as { path?: string; url?: string }).path ?? (item.args as { url?: string }).url), [
+    "a.md",
+    "b.md",
+    "c.md",
+    "d.md",
+    "https://blocked.test/provenance",
+    "https://blocked.test/security",
+  ]);
+  // The refusal consumed nothing: 6 budget − 6 executed = 0 left.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.equal(outcome.requiredEvidenceRequired, 1);
+  // Both in-window evidence attempts count; the provenance-shaped FIRST one
+  // did not void the row — the advisory fetch still credited it.
+  assert.equal(outcome.requiredEvidenceAttempts, 2);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.requestsRemaining, 0);
+  // The in-window refusal names the still-outstanding obligation (the
+  // aggregate advisory row's own label) and nothing else.
+  const refusals = (conversation.renderOpenAiMessages() as Array<{ role: string; content: string }>)
+    .filter((m) => m.role === "tool" && m.content.includes("Reserved dependency-evidence budget"));
+  assert.equal(refusals.length, 1);
+  assert.ok(refusals[0]!.content.includes("still owes upstream security advisories,"));
+  assert.ok(!refusals[0]!.content.includes("publisher/source provenance"));
+  assert.ok(!refusals[0]!.content.includes("release delta"));
+});
+
+test("#1595 (review): lead claim — the scoped plan's obligation window opens from the loop's FIRST request", async () => {
+  // The scoped plan (one tracked advisory obligation, reserve 2 = tracked +
+  // 1 spare) with requiredEvidenceLeadClaim set enforces the window from the
+  // loop's first request: the opening optional read is REFUSED without
+  // spending (AC1 — the mandatory obligation gets its disposition before
+  // optional requests consume the budget; only 2 of the 6 requests are spent
+  // when the row discharges). The spare provenance-shaped fetch executes
+  // without crediting; the advisory-shaped fetch credits and discharges.
+  // #1627: the discharge also settles the surface and ends the loop — the
+  // released window no longer keeps running optional rounds afterward.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"a.md"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://blocked.test/provenance"}'),
+    openAiCall("c3", "web_fetch", '{"url":"https://blocked.test/security"}'),
+  ];
+  const exec = [
+    { tool: "web_fetch", status: "ok", result: { content: "provenance" } },
+    { tool: "web_fetch", status: "ok", result: { content: "advisories" } },
+  ];
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: [{ id: "security_advisory", tokens: [], obligation: "security_advisory" }],
+    requiredEvidenceLeadClaim: true,
+  });
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  assert.deepEqual(outcome.executed.map((item) => (item.args as { path?: string; url?: string }).path ?? (item.args as { url?: string }).url), [
+    "https://blocked.test/provenance",
+    "https://blocked.test/security",
+  ]);
+  // The refusal consumed nothing: 6 budget − 2 executed = 4 left, i.e. the
+  // disposition happened while 4 of 6 requests were still unspent.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.equal(outcome.requiredEvidenceRequired, 1);
+  // Both lead-claim evidence attempts count toward the attempts cap; the
+  // provenance-shaped FIRST one did not void the row — the advisory fetch
+  // still credited and discharged it, releasing the gate.
+  assert.equal(outcome.requiredEvidenceAttempts, 2);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.requestsRemaining, 4);
+  // The mid-budget lead-claim refusal names the budget's FIRST claim (and
+  // the outstanding obligation) — never the reserved tail it has not reached.
+  const refusals = (conversation.renderOpenAiMessages() as Array<{ role: string; content: string }>)
+    .filter((m) => m.role === "tool" && m.content.includes("Reserved dependency-evidence budget"));
+  assert.equal(refusals.length, 1);
+  assert.ok(refusals[0]!.content.includes("first claim still owes upstream security advisories,"));
+  assert.ok(!refusals[0]!.content.includes("reserved tail"));
+  // The mid-budget turn note names the outstanding obligation too — not the
+  // tail-worded "Only N tool request(s) remain" (false mid-budget).
+  const notes = conversation.events.filter((e) => e.kind === "turn_note") as Array<{ content: string }>;
+  assert.ok(
+    notes.some((n) => n.content.includes("Required dependency evidence comes first: upstream security advisories is still owed")),
+  );
+  assert.ok(!notes.some((n) => n.content.includes("Only 5 tool request(s)")));
+  assert.ok(!notes.some((n) => n.content.includes("Only 4 tool request(s)")));
+});
+
+test("#1379: within one round, an evidence call that RELEASES releases later optional calls; the reverse order still refuses", async () => {
+  // Evidence FIRST in the same round: both execute (dispositions are decided
+  // in call order, so the obligation state flips before the optional call is
+  // judged). Blocker 5728634290 re-pin: the fetch must cover EVERY tracked
+  // obligation — a partial fetch inside the window no longer releases the
+  // later optional call of the same round.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = [
+    openAiCall("c1", "git_status_short", "{}"),
+    openAiCall("c2", "git_diff_stat", "{}"),
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: "c3", type: "function", function: { name: "web_fetch", arguments: '{"url":"https://pypi.org/security/changelog"}' } },
+              { id: "c4", type: "function", function: { name: "git_log", arguments: "{}" } },
+            ],
+          },
+        },
+      ],
+    },
+    openAiText("done"),
+  ];
+  const { postFn, executeFn } = recordingLoop(responses);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn: () => Number.MAX_SAFE_INTEGER / 2,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.executed.length, 4);
+
+  // Optional FIRST in the same window round: it is refused (the obligations
+  // are unmet at its disposition), and the evidence call in the same round
+  // executes.
+  const conversation2 = new Conversation();
+  conversation2.addUser("corpus");
+  const responses2 = [
+    openAiCall("c1", "git_status_short", "{}"),
+    openAiCall("c2", "git_diff_stat", "{}"),
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: "c3", type: "function", function: { name: "git_log", arguments: "{}" } },
+              { id: "c4", type: "function", function: { name: "web_fetch", arguments: '{"url":"https://pypi.org/security/changelog"}' } },
+            ],
+          },
+        },
+      ],
+    },
+    openAiText("done"),
+  ];
+  const loop2 = recordingLoop(responses2);
+  const outcome2 = await driveToolLoop(conversation2, loop2.postFn, loop2.executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn: () => Number.MAX_SAFE_INTEGER / 2,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome2.requiredEvidenceRefusals, 1);
+  assert.deepEqual(loop2.executedCalls.map((c) => c.tool), ["git_status_short", "git_diff_stat", "web_fetch"]);
+});
+
+test("#1379: a reserve-refused call retried after an evidence attempt executes (never deduped)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // The refusal must not poison the dedup set: the exact same optional call,
+  // retried once the obligation state advanced (blocker 5728634290 re-pin:
+  // the fetch now has to COVER the tracked obligations, not merely be an
+  // attempt), runs for real rather than being answered from a note about a
+  // call that never executed.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "git_status_short", "{}"),
+    openAiCall("c2", "git_diff_stat", "{}"),
+    openAiCall("c3", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c4", "web_fetch", '{"url":"https://pypi.org/security/changelog"}'),
+    openAiCall("c5", "read_file", '{"path":"a.ts"}'),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  // The settling fetch covers every tracked obligation; #1627: the loop then
+  // stops settled instead of running the released-window optional round.
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["git_status_short", "git_diff_stat", "web_fetch"]);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  const transcript = JSON.stringify(conversation.toRequestPayload("openai", "m", {}));
+  assert.ok(!transcript.includes("Duplicate request"));
+});
+
+test("#1379: no reserve keeps every optional call executable in the budget tail", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Same shape as the lockout test but with reserve 0: the legacy loop
+  // executes everything to the last request, refusal-free.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+    openAiCall("c3", "git_log", "{}"),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 2, 120),
+    timeFn,
+  });
+  assert.equal(outcome.requiredEvidenceRequestsHint, 0);
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(executedCalls.length, 2);
+  assert.equal(outcome.stopReason, STOP_BUDGET);
+});
+
+// ── #1379 review blocker 5728634290: per-obligation reserve state ─────────
+
+test("#1379: the reviewer's counterexample — one release-notes fetch no longer unlocks the whole reserved tail", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const executedCalls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  let responseIndex = 0;
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "git_log", "{}"),
+    openAiCall("c3", "web_fetch", '{"url":"https://upstream.test/releases/tag/v1.2.3"}'),
+    openAiCall("c4", "read_file", '{"path":"b.ts"}'),
+    openAiCall("c5", "git_grep", "{}"),
+    openAiCall("c6", "web_fetch", '{"url":"https://osv.dev/vulnerabilities/GHSA-42xa-7z9q"}'),
+    openAiCall("c7", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+    // #1627 M1: the advisories fetch that settled security_advisory FAILED —
+    // the settled early stop must not fire on that stranding shape, so the
+    // loop runs one more round and ends on the model's text-only hand.
+    openAiText("done — advisories fetch kept failing"),
+  ];
+  // The advisories fetch FAILS (host unreachable): a failing fetch is still
+  // an attempt and still credits its obligation.
+  const executeFn = async (tool: string, args: Record<string, unknown>) => {
+    executedCalls.push({ tool, args });
+    if (typeof args.url === "string" && args.url.includes("osv.dev")) {
+      return { tool, status: "error", result: { error: "fetch failed" } };
+    }
+    return { tool, status: "ok", result: {} };
+  };
+  const outcome = await driveToolLoop(
+    conversation,
+    async () => responses[responseIndex++],
+    executeFn,
+    {
+      apiFormat: "openai",
+      model: "m",
+      // Budget 7 (one head request above the 6 the counterexample described,
+      // so the released optional call still fits before the ceiling):
+      // reserve 4, window opens after 3 executed calls.
+      budgets: { ...adaptiveLoopBudgets(4, 7, 120), maxRounds: 20 },
+      timeFn: () => Number.MAX_SAFE_INTEGER / 2,
+      reserveForRequiredEvidence: 4,
+      requiredEvidence: depRows(4),
+    },
+  );
+  // Two optional calls outside the window, then the release-notes fetch
+  // (credits ONLY release_delta), then the two refused local-archaeology
+  // calls, then the failing advisories fetch (credits security_advisory),
+  // then the bare repository root (credits provenance → settled; #1627 ends
+  // the loop there instead of running the released optional call).
+  assert.deepEqual(
+    executedCalls.map((c) => `${c.tool}${typeof c.args.path === "string" ? `:${c.args.path}` : ""}`),
+    ["read_file:a.ts", "git_log", "web_fetch", "web_fetch", "web_fetch"],
+  );
+  // The refused calls never reached the executor.
+  assert.ok(!executedCalls.some((c) => c.args.path === "b.ts"));
+  assert.ok(!executedCalls.some((c) => c.tool === "git_grep"));
+  assert.equal(outcome.requiredEvidenceRefusals, 2);
+  // The refusals spent nothing: 5 executed of 7.
+  assert.equal(outcome.requestsRemaining, 2);
+  // Exhaustion while obligations were open is exactly what the enforcement
+  // makes unreachable: the loop ends on the obligations' own terms.
+  assert.notEqual(outcome.stopReason, STOP_BUDGET);
+  // #1627 M1: security_advisory was settled by the FAILED osv.dev fetch, so
+  // the settled early stop does not fire — the model keeps the retry
+  // opportunity, and the loop ends on its text-only hand (no further calls).
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceSettledStop, false);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome.requiredEvidenceAttempts, 3);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+});
+
+test("#1379: dependencyEvidenceObligationsForCall attributes a call from its own target", () => {
+  // Only the evidence-channel tools attribute at all.
+  assert.deepEqual(dependencyEvidenceObligationsForCall("read_file", { url: "https://pypi.org/project/x" }), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("run_command", { query: "osv" }), []);
+  // web_fetch reads args.url, web_search reads args.query; absent/non-string
+  // targets attribute nothing.
+  assert.deepEqual(dependencyEvidenceObligationsForCall("web_fetch", {}), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("web_fetch", { url: 42 }), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("web_search", {}), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("web_search", { query: "" }), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("web_fetch", { url: "https://upstream.test/status" }), []);
+  // release_delta tokens (and the deep-path pin: a compare page on a source
+  // host is a delta lookup, not a provenance root lookup).
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://upstream.test/releases/tag/v1.2.3" }),
+    ["release_delta"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://github.com/owner/repo/compare/v1...v2" }),
+    ["release_delta"],
+  );
+  // security_advisory tokens.
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://osv.dev/list?q=cve" }),
+    ["security_advisory"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://example.test/security/advisories" }),
+    ["security_advisory"],
+  );
+  // provenance via the source host's CANONICAL repository shape: exactly
+  // owner/repo on github.com/gitlab.com/bitbucket.org, org/project/_git/repo
+  // on dev.azure.com. Trailing slashes and query strings still map to the
+  // same repository.
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://github.com/owner/repo" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://gitlab.com/owner/repo/" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://github.com/owner/repo?tab=readme" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://dev.azure.com/org/project/_git/repo" }),
+    ["provenance"],
+  );
+  // Negative regression (review blocker 5738958165): a profile/user page, a
+  // bare source host, and an Azure org/project identify NO repository, so
+  // none of them credits provenance — the obligation window cannot release
+  // without an owner/repository lookup having been attempted.
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://gitlab.com/owner" }),
+    [],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://github.com" }),
+    [],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://dev.azure.com/org/project" }),
+    [],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://www.npmjs.com/package/left-pad" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://artifacthub.io/packages/helm/foo" }),
+    ["provenance"],
+  );
+  // A deeper path on a source host that also names a provenance TOKEN still
+  // credits provenance (the keyword list, not the path rule).
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://example.test/registry" }),
+    ["provenance"],
+  );
+  // Multi-match, projected in canonical order.
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_fetch", { url: "https://pypi.org/security/changelog" }),
+    ["provenance", "release_delta", "security_advisory"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_search", { query: "is there a CVE or GHSA for the helm chart bump?" }),
+    ["provenance", "security_advisory"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("web_search", { query: "nginx release notes changelog" }),
+    ["release_delta"],
+  );
+  // Ecosystem registries this repo's own dependency kinds reach for
+  // (independent review: rubygems/Maven/ECR lookups credited nothing while
+  // npm/PyPI did, so those PRs burned refusals until the attempts cap).
+  for (const url of [
+    "https://rubygems.org/gems/sidekiq",
+    "https://repo1.maven.org/maven2/com/example/lib/",
+    "https://search.maven.org/artifact/com.example/lib",
+    "https://mvnrepository.com/artifact/com.example/lib",
+    "https://maven.google.com/web/index.html",
+    "https://packagist.org/packages/vendor/pkg",
+    "https://nuget.org/packages/Newtonsoft.Json",
+    "https://pub.dev/packages/http",
+    "https://registry.terraform.io/providers/hashicorp/kubernetes/latest",
+    "https://public.ecr.aws/bitnami/redis",
+    "https://gallery.ecr.aws/nginx/nginx",
+    "https://us.gcr.io/project/image",
+  ]) {
+    assert.deepEqual(dependencyEvidenceObligationsForCall("web_fetch", { url }), ["provenance"], url);
+  }
+});
+
+test("#1726: a gh_api call attributes from its ENDPOINT — the upstream evidence channel a refused registry host leaves available", () => {
+  // The #1721 shape: registry.npmjs.org was not allowlisted, so the run's
+  // successful upstream evidence went through gh_api — which attributed
+  // NOTHING pre-fix, so the acquisitions never discharged their rows and
+  // never produced attributed receipts. The endpoint grammar mirrors the
+  // web rules: keyword tokens over the path, plus the canonical
+  // repos/{owner}/{repo} repository-identity shape for provenance.
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/contents/packages/astro/package.json" }),
+    ["provenance"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/releases/tags/v7.4.13" }),
+    ["release_delta"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/compare/v7.4.12...v7.4.13" }),
+    ["release_delta"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/security-advisories" }),
+    ["security_advisory"],
+  );
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/commits?path=packages/astro" }),
+    ["provenance", "release_delta"],
+  );
+  // Multi-match, canonical order (a changelog read IS release-delta
+  // evidence; a repo-root readme is provenance).
+  assert.deepEqual(
+    dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/withastro/astro/contents/CHANGELOG.md" }),
+    ["release_delta"],
+  );
+  // Negative: endpoints that address no repository and no evidence surface
+  // attribute nothing — issues, users, the reviewed repo's own metadata.
+  assert.deepEqual(dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/owner/repo/issues" }), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("gh_api", { endpoint: "user" }), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("gh_api", { endpoint: "repos/owner/other-repo/issues/1726/comments" }), []);
+  // Absent/non-string endpoints attribute nothing.
+  assert.deepEqual(dependencyEvidenceObligationsForCall("gh_api", {}), []);
+  assert.deepEqual(dependencyEvidenceObligationsForCall("gh_api", { endpoint: 42 }), []);
+});
+
+test("#1726: an upstream gh_api acquisition discharges its dependency-evidence rows and settles the loop before the budget burns", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "gh_api", '{"endpoint":"repos/owner/repo"}'),
+    openAiCall("c2", "gh_api", '{"endpoint":"repos/owner/repo/compare/v1.2.3...v1.2.4"}'),
+    openAiCall("c3", "gh_api", '{"endpoint":"repos/owner/repo/security-advisories"}'),
+    openAiCall("c4", "read_file", '{"path":"a.ts"}'),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(4, 8, 120), maxRounds: 20 },
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  // Every upstream gh_api lookup is admitted against its own shape row and
+  // discharges it — the evidence was gathered through the channel the
+  // source-host allowlist left available (the exact #1721 routing).
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  // The settled stop fires BEFORE the budget burns: three executed calls of
+  // eight, and the optional read (c4) never runs — the reviewer got its
+  // evidence settled without 23 rounds of archaeology.
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  assert.equal(outcome.requestsRemaining, 5);
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["gh_api", "gh_api", "gh_api"]);
+  // #1726 acceptance: the reserved dependency-evidence budget is provably
+  // USED — the canonical per-row settlement record (#1659) shows every
+  // tracked row `acquired` through a successful admitted call, with the
+  // admitting call ids as objective provenance. Never silently open, never
+  // silently cap-released.
+  assert.deepEqual(
+    outcome.requiredEvidenceSettlements.map((row) => [row.id, row.evidenceState, row.acquisition, row.successfulBy]),
+    [
+      ["provenance", "acquired", "available", ["call-1"]],
+      ["release_delta", "acquired", "available", ["call-2"]],
+      ["security_advisory", "acquired", "available", ["call-3"]],
+    ],
+  );
+});
+
+test("#1379: the attempts cap releases the window even with zero credits (no lockout)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Reserve 3, three fetches of UNATTRIBUTED hosts INSIDE the enforced
+  // window (budget 4 reserves 3, so the window gates from the second
+  // disposition on): nothing is credited, but the loop spent the whole
+  // reserve on gated evidence attempts, so the cap fires and optional work
+  // would execute again. The no-lockout counter counts IN-WINDOW attempts
+  // only — see the pre-window counterexample pin below.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://unrelated.test/a"}'),
+    openAiCall("c3", "web_fetch", '{"url":"https://elsewhere.test/b"}'),
+    openAiCall("c4", "web_fetch", '{"url":"https://nowhere.test/c"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    // maxToolCalls 4 with reserve 3: the window gates from the second
+    // disposition on, so c1 is the only pre-window call and c2-c4 are the
+    // three gated attempts the cap counts.
+    budgets: adaptiveLoopBudgets(4, 4, 120),
+    timeFn,
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: depRows(3),
+  });
+  assert.equal(outcome.requiredEvidenceAttempts, 3);
+  assert.equal(outcome.requiredEvidenceWindowAttempts, 3);
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["read_file", "web_fetch", "web_fetch", "web_fetch"]);
+  // The third gated attempt fired the cap exactly as the request budget ran
+  // out: the window released with zero credits, which is the no-lockout
+  // guarantee under the in-window counter.
+  assert.equal(outcome.stopReason, STOP_BUDGET);
+  assert.equal(outcome.requestsRemaining, 0);
+});
+
+test("#1726 (review 5979360208): an unattributed forge-read call inside the reserve window is ADMITTED, counts toward the cap, and discharges nothing", async () => {
+  // The no-lockout hatch admitted unattributed web_fetch/web_search fetches
+  // while a shape row is active, but the forge-read channel (gh_api — the
+  // organic #1721 channel class) was missing from that evidence-channel
+  // recognition: a legitimate forge read that lexically targets no row was
+  // REFUSED inside the window and its windowEvidence bookkeeping stayed
+  // false — a second-class channel exactly where #1379/#1396/#1659 intend
+  // evidence-channel attempts admitted AND bounded. The admission predicate
+  // is the SAME platform seam attribution consumes (forgeReadChannelTarget);
+  // admission only — row discharge still requires the lexical attribution
+  // grammar (pinned by the attributed gh_api tests below).
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // maxRounds 4 with a 12-call budget and reserve 3: round 2 opens the
+  // window through the ROUNDS rule (4 - 1 = 3 <= reserve) while most of the
+  // budget is unspent, so the cap's firing round reaches the settled stop
+  // instead of being masked by the budget check (which runs first).
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    // Round 1 (pre-window): admitted free (no refusal outside the window),
+    // no cap count for the forge read.
+    {
+      choices: [{ message: { content: null, tool_calls: [
+        openAiCall("c1", "read_file", '{"path":"a.ts"}').choices[0]!.message.tool_calls[0]!,
+        openAiCall("c2", "gh_api", '{"endpoint":"repos/withastro/astro/issues/1"}').choices[0]!.message.tool_calls[0]!,
+      ] } }],
+    },
+    // Round 2 (in-window): hatch attempt 1, (b) the SAME window refuses a
+    // non-evidence tool, hatch attempt 2.
+    {
+      choices: [{ message: { content: null, tool_calls: [
+        openAiCall("c3", "gh_api", '{"endpoint":"repos/withastro/astro/issues/2"}').choices[0]!.message.tool_calls[0]!,
+        openAiCall("c4", "read_file", '{"path":"unrelated.ts"}').choices[0]!.message.tool_calls[0]!,
+        openAiCall("c5", "gh_api", '{"endpoint":"repos/withastro/astro/issues/3"}').choices[0]!.message.tool_calls[0]!,
+      ] } }],
+    },
+    // Round 3 (in-window): third hatch attempt fires the attempts cap.
+    openAiCall("c6", "gh_api", '{"endpoint":"repos/withastro/astro/issues/4"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(4, 12, 120), maxRounds: 4 },
+    timeFn,
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: depRows(3),
+  });
+  // (a) ADMITTED: every unattributed forge read executed — only c4 (the
+  // non-evidence tool) never reached the executor.
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["read_file", "gh_api", "gh_api", "gh_api", "gh_api"]);
+  // ...and the three IN-WINDOW attempts hit the no-lockout cap exactly
+  // (c2 rode the free pre-window tail: telemetry, not cap patience).
+  assert.equal(outcome.requiredEvidenceWindowAttempts, 3);
+  assert.equal(outcome.requiredEvidenceAttempts, 4);
+  // (b) in the same window the non-evidence tool was refused exactly once,
+  // without consuming budget (five executed calls of twelve).
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.equal(outcome.requestsRemaining, 7);
+  // (c) execRowTargets.windowEvidence is true for the admitted forge-read
+  // attempts: the cap-release settled stop is NOT stranded by a
+  // window-evidence record of false — it fires with budget left, the exact
+  // treatment an unattributed web_fetch hatch attempt already got.
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  // (d) admission is not attribution: the unattributed forge reads credit
+  // nothing — no row discharged, no row acquired by the settlement record.
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  assert.ok(outcome.requiredEvidenceSettlements.every((row) => row.evidenceState === "cap-released"), JSON.stringify(outcome.requiredEvidenceSettlements));
+  assert.ok(outcome.requiredEvidenceSettlements.every((row) => row.acquisition === "unavailable"), JSON.stringify(outcome.requiredEvidenceSettlements));
+});
+
+test("#1379: the reserve commits only the obligations its tail can pay for", async () => {
+  // Reserve 2: tracked = [provenance, release_delta] — a security_advisory
+  // is never required at this reserve, and covering the two tracked
+  // obligations releases the window (and #1627 stops the loop settled).
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://upstream.test/releases"}'),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 4, 120),
+    timeFn,
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: depRows(2),
+  });
+  assert.equal(outcome.requiredEvidenceRequired, 2);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta"]);
+  // c3 would land inside the window (requestsLeft 2) with every tracked
+  // obligation credited — the #1627 settled stop ends the loop instead.
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(executedCalls.length, 2);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+
+  // Reserve 1: required 1, and ANY single IN-WINDOW evidence call releases —
+  // the historical one-call release is preserved through the attempts cap.
+  // The two-round budget puts round 2 inside the window (rounds remaining
+  // drop to the reserve), so the unattributed fetch spends the one gated
+  // attempt, the cap fires, and the optional read executes again.
+  const conversation2 = new Conversation();
+  conversation2.addUser("corpus");
+  const loop2 = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"pre.ts"}'),
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: "c2", type: "function", function: { name: "web_fetch", arguments: '{"url":"https://unrelated.test/a"}' } },
+              { id: "c3", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+            ],
+          },
+        },
+      ],
+    },
+    openAiText("done"),
+  ]);
+  const outcome2 = await driveToolLoop(conversation2, loop2.postFn, loop2.executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(1, 3, 120),
+    timeFn,
+    reserveForRequiredEvidence: 1,
+    requiredEvidence: depRows(1),
+  });
+  assert.equal(outcome2.requiredEvidenceRequired, 1);
+  assert.deepEqual(outcome2.requiredEvidenceCredits, []);
+  assert.equal(outcome2.requiredEvidenceAttempts, 1);
+  assert.equal(outcome2.requiredEvidenceWindowAttempts, 1);
+  assert.equal(outcome2.requiredEvidenceReleased, true);
+  assert.equal(outcome2.requiredEvidenceRefusals, 0);
+  assert.deepEqual(loop2.executedCalls.map((c) => c.tool), ["read_file", "web_fetch", "read_file"]);
+});
+
+test("#1379: redundant same-obligation fetches do not open the window", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Reserve 4, two DIFFERENT release-notes URLs: the second credits nothing
+  // new, so provenance and security_advisory stay outstanding and the
+  // optional call inside the window is still refused.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://upstream.test/releases/tag/v1.0.0"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://upstream.test/releases/tag/v2.0.0"}'),
+    openAiCall("c3", "read_file", '{"path":"a.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["release_delta"]);
+  assert.equal(outcome.requiredEvidenceAttempts, 2);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+  // c3 lands inside the window (requestsLeft 4) and is refused.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["web_fetch", "web_fetch"]);
+});
+
+test("#1379: requiredEvidenceCredits seeding carries obligations across loops; partial seeds name only the outstanding", async () => {
+  // Full seed (the #1145 repair seam handing a continuation an already
+  // satisfied obligation set): no refusal at all inside the window.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+    openAiCall("c3", "read_file", '{"path":"c.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+    requiredEvidenceCredits: ["bogus-id", "security_advisory", "release_delta", "provenance", "release_delta", 42 as unknown as string],
+  });
+  assert.equal(outcome.requiredEvidenceRefusals, 0);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(executedCalls.length, 3);
+  // #1627: a surface whose every row was seeded discharged was never ACTIVE
+  // this run — the settled early stop never fires for it.
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceSettledStop, false);
+
+  // Partial seed: provenance is already covered, so the window note/refusal
+  // name ONLY the two outstanding obligations and only those calls are
+  // still required.
+  const conversation2 = new Conversation();
+  conversation2.addUser("corpus");
+  const loop2 = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+    openAiCall("c3", "read_file", '{"path":"c.ts"}'),
+    openAiCall("c4", "web_fetch", '{"url":"https://osv.dev/list"}'),
+    openAiCall("c5", "web_fetch", '{"url":"https://upstream.test/releases"}'),
+  ]);
+  const outcome2 = await driveToolLoop(conversation2, loop2.postFn, loop2.executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+    requiredEvidenceCredits: ["provenance"],
+  });
+  // c3 lands inside the window and is refused; the refusal names the two
+  // outstanding obligations joined with "and" — and NOT the seeded
+  // provenance one.
+  assert.equal(outcome2.requiredEvidenceRefusals, 1);
+  const transcript = JSON.stringify(conversation2.toRequestPayload("openai", "m", {}));
+  assert.ok(
+    transcript.includes(
+      "still owes the exact old-to-new upstream release delta and upstream security advisories",
+    ),
+  );
+  assert.ok(!transcript.includes("owes upstream publisher/source provenance"));
+  // After the advisories + release-delta fetches every tracked obligation is
+  // discharged; #1627: the loop stops settled instead of running the
+  // released-window optional read.
+  assert.deepEqual(
+    loop2.executedCalls.map((c) => `${c.tool}${typeof c.args.path === "string" ? `:${c.args.path}` : ""}`),
+    ["read_file:a.ts", "read_file:b.ts", "web_fetch", "web_fetch"],
+  );
+  assert.deepEqual(outcome2.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome2.requiredEvidenceReleased, true);
+  assert.equal(outcome2.stopReason, STOP_OBLIGATIONS_SETTLED);
+});
+
+test("#1396: the repair seam's attempts cap is run-wide — a continuation never re-gates from a reset zero count", async () => {
+  // The #1145 seam threads the main loop's evidence-attempt count and the
+  // ORIGINAL unclamped reserve as the cap: the run already spent 3 of its 4
+  // reserved attempts, so the continuation holds ONE gated attempt, and once
+  // it is spent the window releases RUN-WIDE and the handed tail spends
+  // freely. A continuation that reset the count (the pre-fix seam) would
+  // re-gate for its own full clamped reserve, refusing the optional read
+  // after the cap had already fired run-wide.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://unrelated.test/a"}'),
+    openAiCall("c3", "read_file", '{"path":"b.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(6, 3, 120),
+    timeFn,
+    // The seam's clamp: the continuation holds all 3 of its requests inside
+    // the reserved tail (run reserve 4, clamped to the 3 handed) — but the
+    // CAP stays the original run-wide 4, and the IN-WINDOW attempt count
+    // starts at the main loop's 3 (its window already spent 3 gated
+    // attempts; its pre-window spend, if any, drains nothing).
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: depRows(3),
+    requiredEvidenceAttemptsPrior: 3,
+    requiredEvidenceWindowAttemptsPrior: 3,
+    requiredEvidenceAttemptsCap: 4,
+  });
+  // c1 (optional, in-window) is refused while the run-wide cap has attempts
+  // left; c2 spends that one gated attempt; the cap then fires (4 >= 4),
+  // releasing every shape row — and #1627 stops the settled continuation
+  // instead of running the released optional round.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  assert.deepEqual(
+    executedCalls.map((c) => c.tool),
+    ["web_fetch"],
+  );
+  assert.equal(outcome.requiredEvidenceAttempts, 4);
+  assert.equal(outcome.requiredEvidenceWindowAttempts, 4);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  // And the reverse guard: the same continuation WITHOUT the seam threading
+  // (the pre-fix shape — reset count, clamped cap) keeps its own
+  // full gated reserve, so the optional read stays refused and only the
+  // evidence call executes.
+  const conversation2 = new Conversation();
+  conversation2.addUser("corpus");
+  const loop2 = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://unrelated.test/a"}'),
+    openAiCall("c3", "read_file", '{"path":"b.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome2 = await driveToolLoop(conversation2, loop2.postFn, loop2.executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(6, 3, 120),
+    timeFn,
+    reserveForRequiredEvidence: 3,
+    requiredEvidence: depRows(3),
+  });
+  assert.equal(outcome2.requiredEvidenceRefusals, 2);
+  assert.deepEqual(
+    loop2.executedCalls.map((c) => c.tool),
+    ["web_fetch"],
+  );
+  assert.equal(outcome2.requiredEvidenceAttempts, 1);
+  assert.equal(outcome2.requiredEvidenceWindowAttempts, 1);
+  assert.equal(outcome2.requiredEvidenceReleased, false);
+});
+
+test("#1396 review blocker: pre-window evidence spend cannot deactivate the reserved window", async () => {
+  // The filed counterexample, budget 8 / reserve 4: spend the first four
+  // requests on repeated release-note/unattributed fetches BEFORE the
+  // reserved tail. Under the pre-fix run-wide cap those four attempts alone
+  // reached the cap, every remaining shape row deactivated before the tail
+  // was scarce, and the reserved window did not gate at all — the tail then
+  // went to optional calls while provenance and security stayed unattempted.
+  // The no-lockout counter now counts only IN-WINDOW attempts, so the window
+  // still gates the tail: the optional read is refused, the reserved
+  // requests go to the outstanding evidence, and the cap still fires for a
+  // model that spends the whole reserve on gated attempts without a
+  // discharge.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://upstream.test/releases/tag/v1.0.0"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://upstream.test/releases/tag/v2.0.0"}'),
+    openAiCall("c3", "web_fetch", '{"url":"https://unrelated.test/a"}'),
+    openAiCall("c4", "web_fetch", '{"url":"https://unrelated.test/b"}'),
+    openAiCall("c5", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c6", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+    openAiCall("c7", "web_fetch", '{"url":"https://example.test/security/advisories"}'),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(4, 8, 120), maxRounds: 20 },
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  // The four pre-window fetches execute freely (the window is not enforcing
+  // yet) and count toward the run-wide telemetry only.
+  assert.equal(outcome.requiredEvidenceAttempts, 6);
+  assert.equal(outcome.requiredEvidenceWindowAttempts, 2);
+  // c5 (optional, first in-window call) is REFUSED: provenance and
+  // security_advisory are outstanding and the gated patience is untouched.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  // The tail then pays for the outstanding evidence; once every row is
+  // discharged the loop is settled (#1627) — the released optional read
+  // never runs.
+  assert.deepEqual(
+    executedCalls.map((c) => `${c.tool}${typeof c.args.path === "string" ? `:${c.args.path}` : ""}`),
+    ["web_fetch", "web_fetch", "web_fetch", "web_fetch", "web_fetch", "web_fetch"],
+  );
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance", "release_delta", "security_advisory"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.requestsRemaining, 2);
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+});
+
+test("#1379: the window note names the outstanding obligations; the settling fetch ends the loop", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // #1627: a full-coverage fetch settles the surface, so the loop stops at
+  // that round — the released window never carries another (optional) turn,
+  // and the note-reversion the pre-#1627 loop showed is unreachable by
+  // design. The reserve note is the last note the loop ever adds.
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+      openAiCall("c2", "read_file", '{"path":"b.ts"}'),
+      openAiCall("c3", "web_fetch", '{"url":"https://pypi.org/security/changelog"}'),
+    ],
+    Array.from({ length: 3 }, () => ({ tool: "t", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  const newestNote = (payload: Record<string, unknown>): string =>
+    (payload.messages as Array<{ content: string }>)
+      .map((m) => m.content)
+      .filter((c) => typeof c === "string" && c.startsWith("[loop budget]"))
+      .at(-1)!;
+  // Round 3 opens the window with nothing credited: the note names ALL
+  // three obligation labels.
+  const windowNote = newestNote(payloads[2]!);
+  assert.ok(windowNote.includes("Only 4 tool request(s) remain"));
+  assert.ok(windowNote.includes("upstream publisher/source provenance"));
+  assert.ok(windowNote.includes("the exact old-to-new upstream release delta"));
+  assert.ok(windowNote.includes("upstream security advisories"));
+  // The settling round was the last: no round-4 payload ever exists.
+  assert.equal(payloads.length, 3);
+});
+
+// ── #1396: ONE unified obligation window (review-owned rows + dependency shape rows) ──
+
+/** The harness shape for a dependency-update PR that ALSO carries a
+ * trusted-base guidance obligation: the prose row first, then the canonical
+ * dependency-evidence shape rows — one row list, one reserve. */
+const unifiedRows = (
+  reserve: number,
+  guidanceTokens: readonly string[] = ["compatibility", "matrix"],
+): Array<{ id: string; tokens: readonly string[]; obligation?: DependencyEvidenceObligation }> => [
+  { id: "obligation-1", tokens: guidanceTokens },
+  ...depRows(reserve),
+];
+
+test("#1396: a provenance fetch is admitted against its shape row while prose rows gate everything else (cross-starvation regression)", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 6, reserve 4 (what the harness resolves when the dependency
+  // reserve is the larger half of the max). Rounds 1-2 run outside the
+  // window; the window then refuses one optional read, admits the bare
+  // repository-root fetch (which overlaps NO prose token — #1381's old
+  // vocabulary refused exactly this call) and the advisories/releases
+  // fetches, each crediting its own row.
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"docs/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"docs/b.md"}'),
+      openAiCall("c3", "read_file", '{"path":"docs/optional.md"}'),
+      openAiCall("c4", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+      openAiCall("c5", "web_fetch", '{"url":"https://github.com/owner/repo/security/advisories"}'),
+      openAiCall("c6", "web_fetch", '{"url":"https://github.com/owner/repo/releases"}'),
+      openAiText("done"),
+    ],
+    Array.from({ length: 5 }, () => ({ tool: "t", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: unifiedRows(4),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.deepEqual(outcome.executed.map((item) => [item.tool, (item.args as { path?: string; url?: string; query?: string }).path ?? (item.args as { url?: string }).url ?? (item.args as { query?: string }).query]), [
+    ["read_file", "docs/a.md"],
+    ["read_file", "docs/b.md"],
+    ["web_fetch", "https://github.com/owner/repo"],
+    ["web_fetch", "https://github.com/owner/repo/security/advisories"],
+    ["web_fetch", "https://github.com/owner/repo/releases"],
+  ]);
+  // Exactly ONE refusal over the whole run — the optional read — and it is
+  // the ONE counter that carries it.
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  // The refusal names what the reserved tail still owes (shape vocabulary)
+  // while any shape row is active — the one refusal path.
+  const refusalMessages = (conversation.renderOpenAiMessages() as Array<{ role: string; content: string }>)
+    .filter((m) => m.role === "tool" && m.content.includes("Reserved dependency-evidence budget"));
+  assert.equal(refusalMessages.length, 1);
+  assert.ok(refusalMessages[0]!.content.includes("upstream publisher/source provenance"));
+  // The mixed-run clause: the prose guidance row gates the SAME window, and
+  // the refusal says so instead of pointing only at the dependency debt.
+  assert.ok(refusalMessages[0]!.content.includes("Required Review Evidence"));
+  // Credits follow ROW ORDER and hold only the discharged shape rows; the
+  // prose row stays gating (it discharges on its own vocabulary, pinned by
+  // the #1381 prose tests), so the window is NOT yet released.
+  assert.deepEqual(outcome.requiredEvidenceCredits, [
+    "provenance",
+    "release_delta",
+    "security_advisory",
+  ]);
+  assert.equal(outcome.requiredEvidenceRequired, 4);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+});
+
+test("#1396: a dependency PR carrying both reservation sources gets exactly ONE budget note per round", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [
+      openAiCall("c1", "git_status_short", "{}"),
+      openAiCall("c2", "git_diff_stat", "{}"),
+      openAiCall("c3", "read_file", '{"path":"docs/optional.md"}'),
+      openAiCall("c4", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+      openAiText("done"),
+    ],
+    Array.from({ length: 4 }, () => ({ tool: "t", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: unifiedRows(4),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  const noteCount = (payload: Record<string, unknown>): number =>
+    ((payload.messages ?? []) as Array<{ content: unknown }>)
+      .filter((m) => typeof m.content === "string" && (m.content as string).startsWith("[loop budget]"))
+      .length;
+  // Turn notes are append-only: request i carries exactly i+1 of them —
+  // one note per round, never the two side-by-side reservations produced.
+  payloads.forEach((payload, index) => {
+    assert.equal(noteCount(payload), index + 1, `request ${index} must carry exactly one note per round`);
+  });
+  // Round 1 carries the dependency priority note (a shape row is active).
+  assert.ok(requestTexts(payloads[0]!).includes("dependency evidence comes first"));
+  // Round 3 (inside the window) names the outstanding obligations AND still
+  // references the Required Review Evidence section through the one note —
+  // the prose row is discharged only by a call overlapping its vocabulary.
+  const windowNote = ((payloads[2]!.messages ?? []) as Array<{ content: string }>)
+    .map((m) => m.content)
+    .filter((c) => typeof c === "string" && c.startsWith("[loop budget]"))
+    .at(-1)!;
+  assert.ok(windowNote.includes("reserved"));
+  assert.ok(windowNote.includes("upstream publisher/source provenance"));
+});
+
+test("#1396: a hostile model cannot spend the reserved tail while either family is unattempted", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const responses = Array.from({ length: 6 }, (_, i) => openAiCall(`c${i}`, "read_file", `{"path":"misc/${i}.md"}`));
+  const exec = responses.map(() => ({ tool: "read_file", status: "ok", result: { content: "x" } }));
+  const { postFn, executeFn, timeFn } = scriptedLoop(responses, exec);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(3, 6, 120),
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: unifiedRows(4),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS);
+  // Two optional calls executed before the window opened; the rest were
+  // refused without consuming budget, and zero row discharges bought zero
+  // extension rounds.
+  assert.equal(outcome.executed.length, 2);
+  assert.equal(outcome.requiredEvidenceRefusals, 4);
+  assert.equal(outcome.requestsRemaining, 4);
+  assert.deepEqual(outcome.requiredEvidenceCredits, []);
+  assert.equal(outcome.requiredEvidenceAttempts, 0);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+  assert.equal(outcome.rounds, 6);
+});
+
+test("#1396: a window opened by scarce ROUNDS renders the rounds wording, not the requests wording", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Requests are plentiful (24, reserve 4); the SIX-ROUND ceiling is what
+  // enters the window at round 3 — the note must name turns, not pretend
+  // 22 requests are scarce.
+  const { postFn, executeFn, timeFn, payloads } = noteCapturingLoop(
+    [
+      openAiCall("c1", "read_file", '{"path":"docs/a.md"}'),
+      openAiCall("c2", "read_file", '{"path":"docs/b.md"}'),
+      openAiCall("c3", "read_file", '{"path":"docs/optional.md"}'),
+      openAiText("done"),
+    ],
+    Array.from({ length: 2 }, () => ({ tool: "read_file", status: "ok", result: {} })),
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(3, 24, 120),
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+    timeFn,
+  });
+  assert.equal(outcome.requiredEvidenceRefusals, 1);
+  const newestNote = ((payloads[2]!.messages ?? []) as Array<{ content: string }>)
+    .map((m) => m.content)
+    .filter((c) => typeof c === "string" && c.startsWith("[loop budget]"))
+    .at(-1)!;
+  assert.ok(newestNote.includes("Only 4 loop turn(s) remain"));
+  assert.ok(newestNote.includes("upstream publisher/source provenance"));
+  assert.ok(!newestNote.includes("tool request(s) remain"));
+});
+
+test("#1635: sustained overflow is stable across rounds — no repeated mutation, no cache churn", async () => {
+  const conversation = new Conversation();
+  conversation.system = "s";
+  conversation.addUser("x".repeat(500));
+  conversation.addAssistantToolCalls([{ id: "c1", name: "t", arguments: "{}" }]);
+  conversation.addToolResult("c1", { blob: "e".repeat(6000) }, { maxBytes: 8000 });
+  const { postFn, executeFn, timeFn } = scriptedLoop(
+    [openAiCall("c2", "t", "{}"), openAiText("done")],
+    [{ tool: "t", status: "ok", result: "ok" }],
+  );
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: { ...adaptiveLoopBudgets(2, 8, 120), maxConversationTokens: 10, truncatedResultBytes: 100, summarizeKeepNewest: 0 },
+    timeFn,
+  });
+  const events = conversation.events.filter((e) => e.kind === "tool_result") as Array<{ content: string }>;
+  const firstAfterRoundOne = events[0]!.content;
+  assert.ok(Buffer.byteLength(firstAfterRoundOne, "utf8") <= 100);
+  assert.equal(outcome.compactionEvents.length, 2, "one truncation event per round that ran a pass");
+  assert.equal(outcome.compactionEvents[0]!.results_shortened, 1);
+  assert.equal(outcome.compactionEvents[0]!.cacheable_prefix_changed, true);
+  assert.equal(outcome.compactionEvents[1]!.results_shortened, 0);
+  assert.equal(outcome.compactionEvents[1]!.cacheable_prefix_changed, false, "a pass that mutates nothing invalidates no cache");
+  assert.equal(events[0]!.content, firstAfterRoundOne, "the floored result is byte-identical on the next round");
+  assert.equal(outcome.compactionOverflowProtected, true);
+});
+
+// ── #1627: the deterministic obligations-settled early stop ───────────────
+
+test("#1627: the loop stops settled the round the last obligation row settles — no optional rounds after it", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Budget 12, reserve 2, ONE tracked obligation (provenance). Round 1 runs
+  // outside the window; round 2's fetch discharges the row — the loop stops
+  // THERE with 10 of 12 requests unspent instead of exploring on until the
+  // ceiling.
+  const { postFn, executeFn, timeFn, executedCalls } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiCall("c2", "web_fetch", '{"url":"https://github.com/owner/repo"}'),
+    openAiCall("c3", "git_log", "{}"),
+    openAiText("never reached"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(10, 12, 120),
+    timeFn,
+    reserveForRequiredEvidence: 2,
+    requiredEvidence: depRows(1),
+  });
+  assert.equal(outcome.stopReason, STOP_OBLIGATIONS_SETTLED);
+  assert.equal(outcome.requiredEvidenceSettledStop, true);
+  assert.equal(outcome.rounds, 2);
+  assert.equal(outcome.toolCallsIssued, 2);
+  assert.deepEqual(executedCalls.map((c) => c.tool), ["read_file", "web_fetch"]);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["provenance"]);
+  assert.equal(outcome.requiredEvidenceReleased, true);
+  assert.equal(outcome.requestsRemaining, 10);
+  assert.equal(outcome.degraded, false);
+});
+
+test("#1627: an active row remaining keeps the loop running — the early stop never fires mid-obligation", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  // Two tracked rows; the run credits only release_delta and then stops on
+  // the model's own hand — provenance and security stay active, so the loop
+  // must NOT report the settled stop.
+  const { postFn, executeFn, timeFn } = recordingLoop([
+    openAiCall("c1", "web_fetch", '{"url":"https://upstream.test/releases"}'),
+    openAiText("done — evidence still unverified"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+    reserveForRequiredEvidence: 4,
+    requiredEvidence: depRows(4),
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceSettledStop, false);
+  assert.deepEqual(outcome.requiredEvidenceCredits, ["release_delta"]);
+  assert.equal(outcome.requiredEvidenceReleased, false);
+});
+
+test("#1627: a run with no obligation surface never fires the settled stop", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const { postFn, executeFn, timeFn } = recordingLoop([
+    openAiCall("c1", "read_file", '{"path":"a.ts"}'),
+    openAiText("done"),
+  ]);
+  const outcome = await driveToolLoop(conversation, postFn, executeFn, {
+    apiFormat: "openai",
+    model: "m",
+    budgets: adaptiveLoopBudgets(4, 6, 120),
+    timeFn,
+  });
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE);
+  assert.equal(outcome.requiredEvidenceSettledStop, false);
+  assert.equal(outcome.requiredEvidenceRequired, 0);
+});
+
+test("coverage completion never preempts an exhausted call budget (#1729)", async () => {
+  // #1729: a covered round that spent the last request has no confirmation
+  // turn left, so it reports the ordinary exhaustion stop — never a
+  // completion the model did not confirm.
+  for (const scenario of [
+    { covered: true, status: "ok", reason: STOP_BUDGET },
+    { covered: false, status: "ok", reason: STOP_BUDGET },
+    { covered: true, status: "error", reason: STOP_BUDGET },
+  ]) {
+    const conversation = new Conversation();
+    conversation.addUser("corpus");
+    const outcome = await driveToolLoop(conversation,
+      async () => openAiCall("c", "read_file", '{"path":"src/a.ts"}'),
+      async () => ({ tool: "read_file", status: scenario.status, result: {} }),
+      { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(4, 1, 120), timeFn: () => 0,
+        coverageComplete: () => scenario.covered },
+    );
+    assert.equal(outcome.stopReason, scenario.reason);
+    assert.equal(outcome.executed.length, 1);
+  }
+});
+
+test("coverage completion leaves material evidence outstanding but not advisory attention", async () => {
+  // #1729: both shapes spend the only request, so neither can be confirmed —
+  // the attention row is simply not material, which lands on the same
+  // exhaustion stop.
+  for (const [rowClass, expected] of [["attention", STOP_BUDGET], [undefined, STOP_BUDGET]] as const) {
+    const conversation = new Conversation();
+    conversation.addUser("corpus");
+    const outcome = await driveToolLoop(conversation,
+      async () => openAiCall("c", "read_file", '{"path":"optional.ts"}'),
+      async () => ({ tool: "read_file", status: "ok", result: {} }),
+      { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(4, 1, 120), timeFn: () => 0,
+        reserveForRequiredEvidence: 0, requiredEvidence: [{ id: "p1", tokens: ["mandatory"], ...(rowClass ? { rowClass } : {}) }],
+        coverageComplete: () => true },
+    );
+    assert.equal(outcome.stopReason, expected);
+  }
+});
+
+test("coverage completion waits for a refused call to be repaired", async () => {
+  for (const repair of [false, true]) {
+    const conversation = new Conversation();
+    conversation.addUser("corpus");
+    let turns = 0;
+    const outcome = await driveToolLoop(conversation, async () => {
+      turns++;
+      if (turns === 1) return { choices: [{ message: { content: null, tool_calls: [
+        { id: "good", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+        { id: "bad", type: "function", function: { name: "read_file", arguments: '{"path":' } },
+      ] } }] };
+      if (repair) {
+        // #1729: turn 2 repairs the refusal; turn 3 is the model-confirmed
+        // completion round (the gate armed at the end of turn 2).
+        return turns === 2 ? openAiCall("fixed", "read_file", '{"path":"b.ts"}') : openAiText("confirmed");
+      }
+      return openAiText("stop");
+    }, async (tool) => ({ tool, status: "ok", result: {} }), {
+      apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(4, 4, 120), timeFn: () => 0,
+      coverageComplete: () => true,
+    });
+    assert.equal(turns, repair ? 3 : 2);
+    assert.equal(outcome.stopReason, repair ? "investigation-complete" : STOP_MODEL_DONE);
+    assert.equal(outcome.executed.length, repair ? 2 : 1);
+    assert.equal(outcome.toolCallsRefused, 1);
+  }
+});
+
+test("coverage completion requires a successful attempt for discharged material evidence", async () => {
+  // The successful attempt discharges the material row, coverage completes,
+  // and the #1729 confirmation turn settles the stop.
+  {
+    const conversation = new Conversation();
+    conversation.addUser("corpus");
+    let turn = 0;
+    const outcome = await driveToolLoop(conversation,
+      async () => (turn++ === 0
+        ? openAiCall("c", "read_file", '{"path":"mandatory.ts"}')
+        : openAiText("confirmed")),
+      async () => ({ tool: "read_file", status: "ok", result: {} }),
+      { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(4, 4, 120), timeFn: () => 0,
+        reserveForRequiredEvidence: 1, requiredEvidence: [{ id: "material", tokens: ["mandatory"] }],
+        coverageComplete: () => true },
+    );
+    assert.equal(outcome.stopReason, "investigation-complete");
+    assert.equal(outcome.rounds, 2);
+  }
+  // A failed attempt cannot discharge material evidence: coverage never
+  // completes and the run reads as the budget exhaustion it is.
+  {
+    const conversation = new Conversation();
+    conversation.addUser("corpus");
+    const outcome = await driveToolLoop(conversation,
+      async () => openAiCall("c", "read_file", '{"path":"mandatory.ts"}'),
+      async () => ({ tool: "read_file", status: "error", result: {} }),
+      { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(4, 1, 120), timeFn: () => 0,
+        reserveForRequiredEvidence: 1, requiredEvidence: [{ id: "material", tokens: ["mandatory"] }],
+        coverageComplete: () => true },
+    );
+    assert.equal(outcome.stopReason, STOP_BUDGET);
+  }
+});
+
+// ── #1729: the model-confirmed completion gate ─────────────────────────────
+
+test("#1729: coverage completion with unused budget arms a confirmation round instead of stopping", async () => {
+  // The #1728 review 5963272114 shape: one round covers the changed files,
+  // the model still holds open verification questions, and 38 of 40 requests
+  // remain. The loop must NOT stop `investigation-complete` on the coverage
+  // gate alone: the next round carries the confirmation note, the model
+  // resolves the cheaply-checkable question with the unused budget, and only
+  // its own no-tool-calls reply — after the re-armed second confirmation —
+  // selects the stop.
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const payloads: string[] = [];
+  let turn = 0;
+  const responses = [
+    openAiCall("c1", "read_file", '{"path":"src/a.ts"}'),
+    // The model answers the first confirmation with MORE WORK — the cheap
+    // verification read the review would otherwise have externalized as a
+    // "please confirm" finding.
+    openAiCall("verify", "read_file", '{"path":"values.schema.json"}'),
+    openAiText("confirmed — nothing cheaply checkable remains"),
+  ];
+  const outcome = await driveToolLoop(conversation,
+    async (payload) => {
+      payloads.push(JSON.stringify(payload));
+      return responses[turn++];
+    },
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(6, 40, 120), timeFn: () => 0,
+      coverageComplete: () => true },
+  );
+  assert.equal(outcome.stopReason, STOP_INVESTIGATION_COMPLETE);
+  assert.equal(outcome.rounds, 3, "coverage round + verification round + confirmation round");
+  assert.equal(outcome.executed.length, 2, "the model spent unused budget on the verification read");
+  assert.equal(outcome.requestsRemaining, 38);
+  // The confirmation note rode BOTH armed rounds: the first asking, and the
+  // re-arm after the model answered it with more work.
+  assert.match(payloads[1]!, /\[loop coverage\]/);
+  assert.match(payloads[1]!, /please confirm/);
+  assert.match(payloads[2]!, /\[loop coverage\]/);
+});
+
+test("#1729: a model with nothing cheaply checkable left confirms on the first armed round", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const payloads: string[] = [];
+  let turn = 0;
+  const outcome = await driveToolLoop(conversation,
+    async (payload) => {
+      payloads.push(JSON.stringify(payload));
+      return turn++ === 0 ? openAiCall("c1", "read_file", '{"path":"src/a.ts"}') : openAiText("confirmed");
+    },
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(6, 40, 120), timeFn: () => 0,
+      coverageComplete: () => true },
+  );
+  assert.equal(outcome.stopReason, STOP_INVESTIGATION_COMPLETE,
+    "genuinely-unverifiable questions are a legitimate completion confirmation");
+  assert.equal(outcome.rounds, 2);
+  assert.equal(outcome.executed.length, 1);
+  assert.match(payloads[1]!, /\[loop coverage\]/);
+});
+
+test("#1729: no confirmation round at the round ceiling — the covered run reports max-rounds", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const outcome = await driveToolLoop(conversation,
+    async () => openAiCall("c", "read_file", '{"path":"src/a.ts"}'),
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    // adaptiveLoopBudgets doubles its rounds argument; pin the ceiling at 1
+    // explicitly so round 1 is the last round slot there is.
+    { apiFormat: "openai", model: "m", budgets: { ...adaptiveLoopBudgets(6, 40, 120), maxRounds: 1 }, timeFn: () => 0,
+      coverageComplete: () => true },
+  );
+  // #1729: no confirmation turn is possible, so nobody confirmed a
+  // completion — the covered run reports the ordinary exhaustion stop.
+  assert.equal(outcome.stopReason, STOP_MAX_ROUNDS,
+    "an unconfirmable covered round is an exhausted investigation, not a completion");
+  assert.equal(outcome.rounds, 1);
+});
+
+test("#1729: a covered last-call round reports tool-call-budget-exhausted, not a completion", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const outcome = await driveToolLoop(conversation,
+    async () => openAiCall("c", "read_file", '{"path":"src/a.ts"}'),
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(6, 1, 120), timeFn: () => 0,
+      coverageComplete: () => true },
+  );
+  assert.equal(outcome.stopReason, STOP_BUDGET);
+  assert.equal(outcome.rounds, 1);
+  assert.equal(outcome.toolCallsIssued, 1);
+});
+
+test("#1729: the confirmation round's telemetry record carries completion_confirmation_requested", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  const rounds: NativeLoopRoundTelemetry[] = [];
+  let turn = 0;
+  await driveToolLoop(conversation,
+    async () => (turn++ === 0 ? openAiCall("c1", "read_file", '{"path":"src/a.ts"}') : openAiText("confirmed")),
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(6, 40, 120), timeFn: () => 0,
+      coverageComplete: () => true,
+      onRound: (rec) => rounds.push(rec) },
+  );
+  assert.deepEqual(rounds.map((rec) => rec.completion_confirmation_requested), [false, true]);
+});
+
+test("#1729: a no-tool-calls reply on an ordinary round keeps model-stopped", async () => {
+  const conversation = new Conversation();
+  conversation.addUser("corpus");
+  let turn = 0;
+  const outcome = await driveToolLoop(conversation,
+    async () => (turn++ === 0 ? openAiCall("c1", "read_file", '{"path":"src/a.ts"}') : openAiText("done early")),
+    async (name) => ({ tool: name, status: "ok", result: {} }),
+    { apiFormat: "openai", model: "m", budgets: adaptiveLoopBudgets(6, 40, 120), timeFn: () => 0,
+      coverageComplete: () => false },
+  );
+  assert.equal(outcome.stopReason, STOP_MODEL_DONE,
+    "without a satisfied coverage gate there is no confirmation to give");
+  assert.equal(outcome.rounds, 2);
+});
+

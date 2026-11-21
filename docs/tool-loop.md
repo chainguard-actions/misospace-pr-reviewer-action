@@ -1,0 +1,426 @@
+# The native tool loop (`tool-mode: native_loop`)
+
+`native_loop` is the default (and only non-`off`) value of `tool-mode`. The
+reviewing model uses its provider's native tool-calling API (OpenAI
+`tool_calls` / Anthropic `tool_use`) to gather read-only evidence — file
+contents, git history, GitHub metadata, allowlisted web pages — before the
+verdict turn.
+
+## Repository skills
+
+When `repository-skills: true`, the catalog of eligible trusted-base skills is included as lower-priority repository advice. The model may call `read_skill` for an exact catalog path; only those bytes are read and they remain untrusted guidance. This does not add a model call or grant shell/tool permissions. At most 4 distinct skills can be read per review (enforced at execution; repeat reads of an already-read skill are allowed), and a read returns the complete masked body — a skill is never served truncated. Diagnostics list only successfully read paths and only when a skill was read. If tools are off or unavailable, set `repository-skill-path` to add one exact trusted-base skill to the corpus; diagnostics identify it as operator-selected context, not as a tool read. Fork reviews disable this feature.
+
+## How the loop works
+
+1. The action sends the planning corpus plus the tool schemas in the first
+   user turn, with the repo name, the `gh_api`/`repo_contents` repo allowlist,
+   the `web_fetch` host allowlist, and the current request/round budget.
+2. The model holds the conversation: it issues a tool call, sees the result
+   appended as a real tool-result turn, and decides the next call from what
+   came back. A chain like "read the machineconfig → extract the platform
+   version → fetch that version's published compatibility matrix" is
+   expressed natively — each hop is conditioned on the previous one's content,
+   not guessed up front.
+3. The loop stops when the model replies with no further tool calls, a budget
+   is exhausted, or the wall clock elapses (see **Stop reasons** below).
+4. The verdict turn reuses the same conversation: it swaps in the reviewer
+   system prompt, re-injects the full corpus (the loop only saw the compact
+   planning context), and asks for the final JSON verdict. Corpus sections
+   already sent verbatim in the first planning turn are replaced with a
+   one-line placeholder to avoid re-sending duplicate content.
+
+Malformed tool arguments and duplicate calls are answered with a corrective
+tool-result the model can react to (duplicates don't cost budget); a
+transport error mid-loop keeps whatever evidence was already gathered.
+
+Turns stream by default (`ai-stream`), so a long thinking-model turn doesn't
+time out behind a short-idle proxy. A streamed turn that can't be reassembled
+(truncated/garbled SSE, or a 200 response carrying an `error` body) is
+retried once non-streamed before the loop gives up on that turn.
+
+## Tools
+
+| Tool | Reads | Gated by |
+| --- | --- | --- |
+| `read_file` | A file in the checked-out workspace, optionally a line window (`offset`/`limit`). Path traversal, symlink escapes, and sensitive files (`.env`, `.pem`, `credentials`, `id_rsa`, `.kube/config`, …) are blocked. Output capped at the per-result limit (12 KB by default; see [Context limits](#context-limits)). | workspace path guard; tracked-files filter (see below) |
+| `find_files` | Repository file paths (not contents) matching a glob against the relative path or basename, e.g. `*config*`, `*.toml`, `*/route.ts`. Sorted, capped at `max_results` (default 100, max 300). Never descends into `.git` or follows symlinks. | tracked-files filter |
+| `list_tree` | Repository entries (`{path, type}`, no contents) bounded by `depth` (default 2, clamped 1..4) and `max_entries` (default 200, max 500). A file path returns a one-row listing. | tracked-files filter |
+| `git_grep` | Matching lines (`path:lineno:content`) via `git grep -E`, optionally scoped to a `path` subtree, capped at `max_results` (1..200, default 60). An invalid regex is retried as a fixed string. | workspace path guard; tracked-files filter |
+| `git_log` | Recent commit history (hash, date, author, subject), optionally scoped to a path; no file content. Capped at `max_count` (1..100, default 20). | workspace path guard |
+| `git_blame` | Line-level authorship for a tracked file, optionally a `start`/`end` range. | workspace path guard; sensitive-file block |
+| `run_command` | stdout/stderr of one named command from a fixed allowlist — `git_status_short`, `git_diff_stat`, `git_diff_name_only`. The model supplies only the name; no shell text is ever accepted. | fixed argv catalog |
+| `gh_api` | Structured JSON from a read-only API endpoint (`repos/`, `issues/`, `search/`, `releases/`, `git/` prefixes only; GitHub-REST-shaped paths), for an allowlisted repo. Calls are served through the run's configured forge capability — the same `PlatformAdapter.ghApi` seam every platform read uses — so GitHub runs honor `github-api-url` and non-GitHub forges serve their translated endpoints, refusing unmapped ones in-band. Blob content (`git/blobs`) is refused: this channel has no file path, so it cannot apply the path-aware source masking blob bytes need, and base64-encoded bytes hide credential shapes from the redactor. | `tool-allowed-gh-api-repos`; endpoint allowlist; deny-listed paths (`/actions/secrets`, `/actions/variables`, `/dependabot/secrets`, `/environments/`, `/dispatches`, `/git/blobs/`) |
+| `repo_contents` | Source files or directory listings from an explicitly allowlisted related GitHub repository (file reads go through the blob API and are masked with the path-aware source-safe policy, so a credential in a file never reaches the model in the clear; directories return sorted name/type rows capped at `max_entries`, default 200, max 500). Unsupported on Forgejo. | same allowlist as `gh_api` |
+| `web_fetch` | A URL on an allowlisted host; output capped at ~10 KB of decoded text. Redirects are followed up to 10 hops, each re-validated against the host allowlist. | `allowed-source-hosts` |
+| `web_search` | A ranked `{title, url, snippet}` list from the configured search endpoint — advertised only when `search-url` is set. The model supplies only the query; the host is fixed by the input, and the result count is bounded to 1..15 (`tool-max-search-results`). | `search-url` |
+
+`tool-allowed-gh-api-repos` is a comma-separated `owner/repo` list (`*` allows
+any repo the path allowlist still permits); empty means the current repo
+only. Every result — file reads, grep matches, blame, API JSON, web content —
+passes secret redaction and a byte cap (`tool-max-response-bytes`) before it
+can reach the conversation.
+
+**Tracked-files filter**: inside a git checkout, `read_file`, `find_files`,
+`list_tree`, and `git_grep` only see committed files (`git ls-files
+--cached`). The review pipeline writes its own scratch artifacts into the
+checkout, and a model that lists or reads those spends evidence budget on
+text it already has. Outside a git checkout the filter is inert.
+
+### MCP servers
+
+`tool-mcp-servers` is an optional allowlist of read-only MCP servers, as a
+newline/comma list of `name=url` (e.g. `konflate=https://konflate.example/mcp`).
+Only host-bearing `http(s)` URLs are accepted. A server's tools are advertised
+only when the tool name begins with an allowlisted read verb (`list`, `get`,
+`read`, `search`, `fetch`, `describe`, `show`, `find`, `lookup`, `query`,
+`head`, `stat`, `summary`, `diff`, `status`, `view`) — a write-shaped verb
+(`create`/`update`/`delete`/`set`/`run`/`exec`/…) is refused both at
+advertise time and again at call time, even if the server lists it.
+`tool-mcp-name-prefixes` strips a known workload prefix (e.g. a ToolHive
+`{workload}_` prefix) before that verb check. Advertised tools are namespaced
+as `mcp__<server>__<tool>` so an MCP name can never shadow a built-in tool.
+`tool-mcp-token` is sent as a bearer token to every configured server. A
+server that fails to connect is logged and skipped — it never breaks the
+loop. Empty `tool-mcp-servers` (the default) disables MCP entirely.
+The allowlist approves only the configured URL, so the transport never follows
+a redirect (#1217): every `3xx` is a bounded transport error, the session id
+and JSON-RPC body are never forwarded to an unconfigured origin, and the
+`Location` target is never read or reported.
+
+## Budgets
+
+### Tool-call budget (tier defaults, size scaling)
+
+The ordinary exploration ceiling is tier-aware before route-specific
+overrides:
+
+| Route | Tier floor |
+| --- | --- |
+| primary | 40 |
+| smart | 45 |
+| escalated (smart under post-review escalation) | 50 |
+
+These are the default floors when the operator leaves the route-specific
+inputs empty. `primary-tool-max-requests` / `smart-tool-max-requests` can
+override their own route, while `tool-max-requests` overrides the derived
+tier budget when no route-specific value is set. The hard ceiling remains 50.
+
+Historically (pre-#1658), when primary requirement-trace was active, a post-verdict repair round
+also has a bounded four-request closure allowance. The published effective
+tool budget includes that allowance, so a default 40-call primary review with
+trace enabled could execute at most 44 read-only tool calls. #1658 removed the repair round and its dedicated allowance: the trace is non-certifying, so unresolved requirement rows are disclosed for the disposition layer instead of being repaired into acceptance.
+
+When no explicit override wins, the default is further scaled by PR size
+(#810): one request per 4 changed files, one per 400 changed lines, and 2
+requests per specialist lead (each lead is a hypothesis that needs its own
+verification calls) — floored at the route's tier default (a small PR keeps
+exactly the pre-#810 budget) and capped at the hard ceiling of 50. Size
+signals come from `pr.json`/`pr-files.json` and the per-role specialist lead
+artifacts already in the harness workspace; a workspace without size signals
+just uses the tier default.
+
+#### Low-risk evidence envelope (#1629)
+
+A derived budget (tier-default or size-scaled source only) on the ordinary
+primary/fallback routes is additionally narrowed when the trusted
+deterministic classification proves the low-risk shape: **no risk flags at
+all**, linked-issue metadata **not uncertain** (`linked_metadata_uncertain`
+exactly `false` — the same uncertainty that makes role-selection pick every
+specialist role, because unretrieved GitHub/Linear metadata may conceal
+security, audit, or priority signals), and either a digest-only kind
+(`image_digest_only`, `renovate_digest_only` — a single local verification
+row, no upstream version range to evidence) or a lockfile-only refresh whose
+#1595 triage parsed and found **zero material bumps** (the exact #1618
+scoped-review semantics; `material` must be an actual non-negative integer —
+a coercible `null`/`""`/`false`/`"0"` is no triage). The envelope is
+`4 + 2 × mandatory MATERIAL rows` requests — the gated must_check rows plus
+the derived admission rows the same planner enforces (#1449,
+`DERIVED_OBLIGATIONS=true`) — clamped to **6..12**: mandatory evidence stays
+reachable; the optional archaeology around it is what gets bounded. A
+surface the clamped envelope's reservation window (`floor(cap / 2)`) could
+no longer cover one protected opportunity per row is not the low-risk shape
+either and retains the full budget. Any risk flag retains the full envelope
+(risk escalation outranks proportionality), as do the obligation-bearing
+image/chart families, a material lockfile bump, an unparseable triage, an
+explicit or route-override budget, the deep smart route, and an absent,
+unshaped, or malformed classification artifact — absent or malformed
+`risk_flags`, `must_check`, `linked_metadata_uncertain`, or `pr_kind` is
+never proof of low risk (fail open). The required-evidence and
+dependency-evidence reservations are computed against the effective (capped)
+budget, so the reserved tail can never exceed the envelope. The per-row
+allowance keeps the admission window at or above the counted material
+surface whenever the counted rows fit below the envelope ceiling (before the
+12-clamp, 4 + 2n always leaves floor(cap/2) ≥ n; the retention rule above
+closes the ceiling gap); uncounted advisory guidance rows and heavier mixed
+surfaces stay attemptable within the reservation's patience, and anything
+genuinely left unsettled fails closed the canonical way — a material row
+becomes a named material unknown, never a clean settlement.
+
+The decision rides the artifact and the telemetry as `low_risk_budget`
+(`envelope`: `capped`/`retained`, closed `basis` vocabulary —
+`digest-only`, `low-risk-lockfile`, `risk-flags`, `metadata-uncertain`,
+`material-lockfile`, `unparseable-triage`, `obligation-bearing-kind`,
+`obligation-surface`, `no-signal` — plus `mandatory_rows`, the `cap`, and on
+a capped run the `derived_budget` it was narrowed from), and a capped run
+reports `tool_budget_source: low-risk-cap`. A capped run that stops with a
+MATERIAL
+question unsettled is recorded — through #1659's canonical settlement state,
+not any parallel completion notion — as a named material unknown
+(`investigation_unavailable`), which the authoritative `FinalDisposition`
+publishes as INCOMPLETE/COMMENT, never as a clean attestation. The generic
+`obligations-settled` early stop (#1627) is the completion-aware
+counterpart: once every mandatory row has settled with budget left, the
+loop stops exploring instead of spending the envelope on optional work.
+
+### Round cap
+
+A round is one model turn. `tool-max-rounds` left empty (the default)
+resolves to 4, but the **effective** round cap scales with the resolved
+call budget (#895): one round per tool call, so a model that reads one file
+per turn can still spend the whole size-scaled or tiered call budget. That
+scaled cap is bounded at 32 rounds regardless of how large the call budget
+grows — the wall clock is the real bound past that point.
+
+Setting `tool-max-rounds` explicitly opts back out of that scaling: the loop
+then allows up to `2 × tool-max-rounds`, capped at 12 — the pre-#895
+behavior, which leaves room for one-call-per-turn chains and repair turns
+without tracking the call budget.
+
+The smart tier (the post-review escalation rerun) reads `smart-tool-max-rounds`
+first. Left empty (the default) it inherits `tool-max-rounds`, including its
+scaling or its opt-out. An explicit value gives the smart tier its own round
+count and opts only that tier out of the scaling, under the same rule: up to
+`2 × smart-tool-max-rounds`, capped at 12. The primary tier is unchanged.
+
+### Wall clock and per-turn timeouts
+
+- `tool-loop-wall-clock-sec` (default 600, clamped to 10..900) bounds the whole
+  exchange — every model round-trip plus tool execution.
+- `smart-tool-loop-wall-clock-sec` (default empty, inheriting
+  `tool-loop-wall-clock-sec`, same 10..900 clamp) bounds the smart tier's
+  exchange, and therefore the deadline its per-turn timeouts are clamped to.
+- `tool-turn-timeout-sec` (default 180) bounds each individual model turn. On
+  the smart/escalated tier this is also clamped to whatever remains of the
+  wall-clock deadline, so a slow turn can't single-handedly blow past it.
+- `tool-request-timeout-sec` (default 20) bounds each individual tool
+  execution (file read, grep, API call, fetch). At the loop's per-call seam
+  this is clamped to the remaining wall-clock budget (floor 1s), so a large
+  configured value cannot outlive `tool-loop-wall-clock-sec`.
+
+### Context limits
+
+Three limits bound what the loop holds. Without a declared context window
+they are fixed; declare one per tier (`primary-model-context-tokens`,
+`smart-model-context-tokens`, or `model-context-tokens` for both) and they
+scale with it:
+
+| Limit | No window declared | Window declared (normal range, ceiling) | Input override |
+| --- | --- | --- | --- |
+| Conversation budget (compaction threshold) | 24,000 tokens | ~75% of the window, up to 250k tokens | `tool-max-conversation-tokens` |
+| First-turn corpus | 50 KB | ~15% of the window, up to 600 KB | `tool-corpus-max-bytes` |
+| Each tool result | 12 KB | ~2% of the window, up to 64 KB | `tool-max-response-bytes` |
+
+These ranges are normal values, not minimums: for a small window, reserving
+the per-turn completion, framing and the advertised tool schemas takes
+priority and can push all three below the undeclared defaults (32k window
+with a 16k completion: 12,084 tokens / 21,751 bytes / 2,900 bytes).
+
+A declared window first reserves `tool-max-tokens-per-turn` plus 2,000
+tokens of framing plus 2,300 tokens for the advertised tool schemas, so the
+conversation, each turn's completion and the `tools` field always fit; the
+first-turn corpus stays within ~60% of the conversation budget and each
+result within ~8%. A window too small for the per-turn completion, framing,
+schemas and a 4,000-token conversation is refused at startup. For a
+1M-token model that is 250k tokens / 450 KB / 60 KB; for 262k it is 196k
+tokens / 118 KB / 16 KB.
+The conversation budget is measured against `approxTokens()`, which counts
+the system prompt and every message and tool result — the schemas are not
+part of that count. They ride in the request's `tools` field, so the fit
+calculation reserves them explicitly: the full advertised schema set is
+under 10 KB (~2.3k approximate tokens), and 2,300 tokens come out of the
+window before the conversation budget is derived. A regression test pins
+that the advertised set still fits the reserve. Read-only MCP tools add
+their own schemas beyond it — an operator opt-in for which a small window
+needs a lower `tool-max-conversation-tokens`. Their size is not enforced;
+the budget does not count them, so an over-budget set shows up only at run
+time — `overflow_protected` under `tool_loop_telemetry.compaction` (see
+**Protected overflow** below) or a provider context-window error. Check
+one organic run after enabling a large MCP server.
+`tool-max-conversation-tokens` overrides the derived watermark directly; it
+must be positive and must fit the declared window after those reserves, or
+the run is refused rather than silently capped.
+Explicit byte inputs are operator overrides: they're used as-is, even
+beyond the derived envelope, and fitting the model's window is then up to
+you. The marker's
+`context_budget` and `context_peak` show the budget a run used and how much
+of it the conversation actually reached (see [Telemetry](telemetry.md)).
+
+### Context compaction
+
+When the conversation outgrows its context budget, the oldest tool
+results are compacted before the next turn so the model's view fits back
+under the watermark, with the newest results verbatim (the exception is
+**Protected overflow** below):
+
+- Default: blunt truncation of the oldest results.
+- `tool-loop-summarize: "true"`: the oldest results are folded into a
+  model-generated evidence digest (versions, paths, URLs, findings) instead,
+  at the cost of one extra model call per compaction
+  (`tool-loop-summarize-max-tokens` bounds that call, default 512). If
+  summarization frees nothing or fails, the loop falls back to truncation —
+  truncation is always the backstop.
+- The digest is capped at write time to the same per-result byte budget the
+  truncation passes use (#1638). After a fold, the digest and the short
+  "folded into the digest" placeholders are what the compaction preserved,
+  so neither truncation pass rewrites them — not even the hard floor below.
+  If the kept digests still leave the run over the watermark, the overflow
+  is recorded like any other protected overflow.
+
+Both paths leave the two newest tool results verbatim (#1635) — they are
+what the model is acting on, and rewriting fresh evidence is exactly what
+the pre-#1635 loop did far below the model's real window. If the first
+truncation pass still leaves the conversation over the watermark, a second
+deterministic pass compacts the same old results to a hard floor; results
+already at or below the cap are untouched, so repeated rounds are stable.
+
+A `read_skill` result is never folded into the model-generated digest: it is
+replaced whole by a driver-written marker that says the skill body was
+discarded and can be re-read. A result counts as already discarded because
+the driver discarded it, never because its content looks like the marker, so
+the outcome does not depend on the shape of the content.
+
+**Protected overflow (#1635).** If even the hard-floored old results leave
+the conversation over the watermark, the protected newest results alone do
+not fit. Nothing is dropped or rewritten further: the overflow is recorded
+(`overflow_protected: true` in the harness artifact's
+`tool_loop_telemetry.compaction`) and the request is sent anyway. Such a
+run can therefore fail at the provider with a context-window error instead
+of degrading — an intentional policy: an attributable provider error beats
+silently discarded evidence. Every compaction pass also records a
+content-free event in `compaction.events` (approximate tokens before and
+after, results shortened, bytes freed, and whether the change invalidated
+the provider's prompt cache).
+
+Every turn after the first states the remaining request/round budget
+in-conversation. Once two or fewer requests remain, the note switches from
+status to direction: stop broad exploration and spend what's left on
+unresolved blocker hypotheses and verdict evidence.
+
+The `[loop coverage]` note is the one non-budget note class (#1729): it rides
+the model-confirmed completion gate's confirmation round (see
+**Stop reasons** below) and asks the model to resolve the cheaply-checkable
+verification questions with the unused budget before confirming completion.
+It rides beside — never replaces — the regular budget note; a scarce round
+still carries exactly one budget note. The confirmation round is a real model
+request: a covered review that still has budget and a round slot spends one
+extra request (the model's no-tool-calls confirmation) before it can stop as
+`investigation-complete`; a covered run with no slot left stops on the
+ordinary exhaustion stop (`tool-call-budget-exhausted` / `max-rounds`) and
+spends nothing extra.
+
+## Stop reasons and partial coverage
+
+| Stop reason | Meaning |
+| --- | --- |
+| `model-stopped` | The model replied with no further tool calls after having issued at least one — a deliberate, voluntary stop. |
+| `no-tool-calls` | The model never issued a tool call at all (see **Degrading to corpus-only** below). |
+| `max-rounds` | The round cap (above) was reached before the model stopped on its own. |
+| `tool-call-budget-exhausted` | The resolved tool-call budget was spent. |
+| `wall-clock-exceeded` | `tool-loop-wall-clock-sec` elapsed. |
+| `wall-clock-verdict-reserve` | Exploration stopped at the verdict reserve (#1464): the remaining wall clock fell to the slice reserved for the closing verdict, so no further exploratory round starts. The round that started before the threshold is clamped to the exploration boundary — its model wait (including the transport's retry and repair hops) and its tool execution cannot spend the reserved slice. |
+| `request-error` | A transport error ended the loop mid-exchange. |
+| `investigation-complete` | Successful completion, **confirmed by the model (#1729)**: after a round with no refused or failed calls, all changed files and file-bound specialist leads covered by successful reads or certified complete corpus diffs, and no outstanding material evidence acquisition, the loop does not stop on the coverage gate alone while budget and a round slot remain — the next round carries the completion-confirmation turn note (`[loop coverage]`: resolve every open verification/"please confirm" question an ordinary repository read or search can answer first, then confirm), and only the model's own no-tool-calls reply on that round selects this stop. The confirmation round's telemetry record carries `completion_confirmation_requested: true`. The gate re-arms after every round the model answers with more work, so a review never ends `investigation-complete` while it is still investigating. A covered round with no confirmation turn left — the round's last call also spent the request budget, or the round ceiling is reached — is **not** a completion and reports the ordinary exhaustion stop instead (`tool-call-budget-exhausted` or `max-rounds`), so this stop only ever means the model confirmed it and an exhausted covered run keeps the partial-coverage honesty machinery. It precedes same-round budget exhaustion and proceeds to the in-conversation verdict; it is not a budget stop and does not produce partial coverage. No-file specialist leads remain advisory reviewer context. |
+| `obligations-settled` | The deterministic early stop (#1627): the run carried an active required-evidence obligation surface and every tracked row settled — discharged by an admitted call or cap-released as unprovable — with budget still unspent, so further rounds could only be optional exploration. A normal, verdict-producing completion: never a harness error, never a fallback trigger, and deliberately not a budget stop (no Partial Coverage Notice, no `coverage_stop_reason`). |
+
+`max-rounds`, `tool-call-budget-exhausted`, `wall-clock-exceeded`, and
+`wall-clock-verdict-reserve` are budget stops — the investigation was cut
+off, not finished by choice. On any
+budget stop, the harness folds its own call log against the changed-file
+manifest and the specialist-lead artifacts to compute which changed files
+were never read and which file-bound specialist leads were never resolved. No-file leads remain advisory context rather than file-coverage gaps. If that gap
+is non-empty, the published review carries a **Partial Coverage Notice**
+listing the unread files and unresolved leads (capped at 20 each, with a
+count for the rest), closing with "Absence of findings in the unread paths
+is not evidence they are safe." The metadata marker's `coverage: "partial"`
+and `coverage_stop_reason` fields record the same gap — see
+[`docs/telemetry.md`](telemetry.md).
+
+The stop reason itself is recorded separately and always: the marker's
+`tool_stop_reason` carries the loop's reason on every harness run, so a
+budget stop that left nothing unread (for example, coverage the corpus-diff
+credit completed) is still visible for the #810/#847 exhaustion-rate
+comparison. `coverage`/`coverage_stop_reason` keep their narrower meaning:
+a confirmed coverage gap. Two fail-closed shapes complete that picture:
+a loop that ran but left its harness artifact unreadable synthesizes
+`coverage_stop_reason: "harness-unreadable"` with `coverage: "partial"`
+(#899 — unknown coverage never publishes as complete), and the standalone
+`publish` CLI that could not confirm coverage at all (no run artifact to
+read) publishes `coverage: "unknown"` with no stop reason (#873/#838).
+
+**Partial coverage never approves.** `review-result: partial` means the
+review's own coverage is incomplete; gate merges on both the verdict and the
+review result, never on the verdict alone.
+
+## Verdict wall-clock reserve (#1464)
+
+A deterministic slice of the wall-clock budget is reserved for the closing
+in-conversation verdict, so a slow provider cannot spend the whole budget on
+investigation and leave the verdict turn to fail the pre-request deadline
+check. The reserve is `verdictWallClockReserveSec`'s deterministic function
+of the resolved budget — 25% of it, floored at 30s, capped at half the
+budget, so at least half the clock always remains for investigation — with
+no new Action input. For the default 600s budget the reserve is 150s.
+
+The reserve is actually reserved, not merely checked between rounds: the
+harness derives an exploration boundary (`deadline − reserve`) and the MAIN
+investigation loop's model waits (round calls, their streamed→non-streamed
+retry, compaction digest calls) and tool execution clamp to it, so a round
+that started before the threshold cannot consume the reserved slice. The
+same boundary is threaded to the transport seam as a per-attempt budget
+hook, so the transport's own retry tree — same-request 429/5xx retries and
+the #824/#1047 clamp/strip repair hops — cannot cross it either;
+exploration-clamped waits additionally cap their same-request retries at
+one. The closing verdict turn and the #1503 trace-only repair turn keep the
+whole-run deadline.
+The #1145 trace-gap repair continuation deliberately does not carry the
+reserve: it runs against the whole-run deadline under its own clamped share.
+
+The resolved reserve is logged at loop start, recorded as
+`verdict_reserve_sec` in `tool_loop_meta` and the telemetry marker (see
+[`docs/telemetry.md`](telemetry.md)), and a reserve stop logs an explicit
+"stopped exploratory rounds at the verdict reserve" line. A reserve stop
+joins the #1338 honesty surfaces: the verdict findings body carries the
+interrupted-investigation note, coverage is accounted as partial, and the
+unresolved cause maps to `budget-exhausted`. The reserve is time-based and
+independent of the #1379/#1396 required-evidence window (reserved in
+rounds/requests): a reserve stop can end a run with that window still open.
+
+## Evidence-repair continuation (#1145) — removed by #1658
+
+The #1145/#1447/#1503 evidence-repair continuation — the trace-gap probe, the
+bounded post-verdict repair round with its dedicated request allowance, and the
+trace-only repair turn — was removed by #1658. Its purpose was to redraw trace
+citations until the universal lexical proof-shape validator accepted them; with
+that validator deleted (the trace is non-certifying by default), the machinery
+had no honest work left. An in-scope requirement the reviewer could not settle
+is disclosed on the trace artifact (`unresolved`, reason-coded, with the
+row's materiality and the artifact summary) for the final-disposition layer
+(#1656) instead of being repaired into acceptance — no trace-only model pass is
+required to turn an otherwise adequate review into complete.
+## Fork behavior
+
+By default, the tool harness is **skipped** on cross-repository (fork) pull
+requests — no tool calls are issued, and the harness's own JSON records a
+`fork-pr` skip reason. Set `tool-enable-for-forks: "true"` to allow it to
+run on fork PRs. This gate also covers MCP servers and `web_search`: nothing
+under `tool-mode` runs on a fork PR unless `tool-enable-for-forks` is set.
+
+## Degrading to corpus-only
+
+If the reviewing model never emits a single tool call (unsupported or
+misconfigured tool-calling), the stop reason is `no-tool-calls` and the run
+is reported as **degraded**: the caller falls back to a corpus-only review
+using whatever deterministic context (diff, related-code context, repo map,
+CI status, …) was already assembled. The verdict is still produced — just
+without model-gathered tool evidence — so it's safe to leave `native_loop`
+enabled against a model whose tool-calling support is uncertain.

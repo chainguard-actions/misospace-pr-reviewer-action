@@ -1,0 +1,911 @@
+import { appendFileSync, readFileSync } from "node:fs";
+import type { ChangeAnchorsArtifact } from "../context/change-anchors.js";
+import type { RelatedContext } from "../context/related-context.js";
+import { detectEquivalentPathGroups, renderEquivalentPathsJson, renderEquivalentPathsMarkdown } from "../context/equivalent-paths.js";
+import { runProcess } from "../runtime/subprocess.js";
+import { splitChunks } from "../corpus/diff-priority.js";
+import {
+  buildBoundedRepoMap,
+  buildReviewCorpus,
+  CORPUS_DIFF_SECTION_ARTIFACT,
+  CORPUS_DIFF_SECTION_FALLBACK_ARTIFACT,
+  CORPUS_DIFF_SECTION_SMART_ARTIFACT,
+  prepareStandardsContext,
+  prepareToolHarness,
+  type CorpusBuildResult,
+  type CorpusWorkspace,
+} from "../corpus/assemble.js";
+import { FALLBACK_CORPUS_RETRUNCATION_MAX_BYTES } from "../corpus/budgets.js";
+import type { PlatformReadAdapter } from "../platform/types.js";
+import { deriveIsFork } from "../platform/pr.js";
+import {
+  clipRelatedCodeMarkdown,
+  extractChangeAnchors,
+  extractCompareShas,
+  extractGhcrImages,
+  extractUrls,
+  extractVersionHints,
+  buildRelatedContext,
+  parseAllowedHosts,
+  parseAllowedRepos,
+  relatedContextToArtifact,
+  renderChangeAnchorsJson,
+  renderLinkedSources,
+  renderRelatedContextMarkdown,
+  renderPrThread,
+  selectTargetVersion,
+  defaultLinkedSourcesDeps,
+  type LinkedSourcesInput,
+} from "../context/index.js";
+import { BudgetTracker } from "../context/budget.js";
+import { buildImageProvenanceFromNetwork } from "../context/image-transport.js";
+import {
+  MAX_SYNTAX_BYTES,
+  buildSyntaxContext,
+  clipSyntaxContextMarkdown,
+  renderSyntaxContextJson,
+  renderSyntaxContextMarkdown,
+  resolveSyntaxProvider,
+  syntaxContextToArtifact,
+} from "../context/syntax/index.js";
+import { enforcementView as threadEnforcementView, prepareThreads, renderReviewThreads } from "../context/review-threads.js";
+import { enforcementView as humanEnforcementView, prepareReviews, renderOutstanding } from "../context/human-reviews.js";
+import { pythonJsonStringify } from "../precheck/metadata.js";
+import { pyJsonDumps } from "../evidence/pyjson.js";
+import { runEvidenceProvidersPhase } from "../evidence/index.js";
+import { runToolHarness, type HarnessDeps, type HarnessTransport } from "../tools/harness.js";
+import { GOVERNOR_PRIORITY_AUTHORITATIVE, GOVERNOR_PRIORITY_RECOVERY, GovernorCancelledError, inferenceEndpointKey, sharedRunInferenceGovernor } from "../model/governor.js";
+import { runChatRequest } from "../transport/transport.js";
+import { describedTransportFailure, TransportFailure } from "../transport/http.js";
+import { extraHeadersForEnv } from "../transport/headers.js";
+import { attachSseReassemblyQuality, readSseReassemblyQuality } from "../transport/sse.js";
+import { attachTransportTiming, type TransportTiming } from "../transport/timing.js";
+import type { NormalizedModelResponse, TransportWirePayload } from "../model/types.js";
+import type { TierBudgets } from "../corpus/budgets.js";
+import type { StageEnv } from "./env.js";
+import type { RunWorkspace } from "./workspace.js";
+
+/** Small tolerant readers shared by the stage helpers. */
+
+export function safeJson(bytes: Uint8Array | null | undefined): Record<string, unknown> | null {
+  if (bytes === null || bytes === undefined || bytes.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Array-valued companion to `safeJson`: the enforcement views
+ * (`review-threads.json`, `human-reviews.json`) are JSON arrays, and the
+ * object-only reader above nulls them — which silently disabled the #680
+ * settlements in the v3 pipeline (#812). Null/absent/undecodable reads
+ * return null, exactly like `safeJson`. */
+export function safeJsonArray(bytes: Uint8Array | null | undefined): unknown[] | null {
+  if (bytes === null || bytes === undefined || bytes.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    return Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function joinLines(lines: readonly string[]): string {
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+}
+
+// ---------------------------------------------------------------------------
+// context.sh: pr.json / pr-files.json projections
+// ---------------------------------------------------------------------------
+
+/** The context.sh pr.json projection: review-relevant fields with the same
+ * jq `//` fallbacks. Key names are the v2 artifact's (the corpus projection
+ * and the producers read THIS shape, not the canonical camelCase one). */
+export function projectPr(prObject: unknown, prNumber: string): Record<string, unknown> {
+  const record = (typeof prObject === "object" && prObject !== null ? prObject : {}) as Record<string, unknown>;
+  const head = (typeof record.head === "object" && record.head !== null ? record.head : {}) as Record<string, unknown>;
+  const base = (typeof record.base === "object" && record.base !== null ? record.base : {}) as Record<string, unknown>;
+  const user = (typeof record.user === "object" && record.user !== null ? record.user : {}) as Record<string, unknown>;
+  const author = typeof user.login === "string" && user.login !== "" ? user.login : (typeof record.author === "string" ? record.author : "");
+  return {
+    // JSON has no `NaN`: a non-numeric pull locator (a Tangled pull is
+    // DID/branch-addressed and carries no number, #590) coerced with `Number()`
+    // yields `NaN`, which `pyJsonDumps` writes as the bare `NaN` token that the
+    // corpus metadata projection's `JSON.parse` then rejects. A finite numeric
+    // number is preserved (GitHub unchanged); any non-numeric locator becomes
+    // the `0` sentinel rather than poisoning the persisted projection.
+    number:
+      typeof record.number === "number" && Number.isFinite(record.number)
+        ? record.number
+        : Number.isFinite(Number(prNumber))
+          ? Number(prNumber)
+          : 0,
+    title: typeof record.title === "string" ? record.title : "",
+    body: typeof record.body === "string" ? record.body : "",
+    headRefOid: typeof head.sha === "string" ? head.sha : "",
+    baseRefName: typeof base.ref === "string" ? base.ref : "",
+    headRefName: typeof head.ref === "string" ? head.ref : "",
+    author: { login: author },
+    changedFiles: typeof record.changed_files === "number" ? record.changed_files : 0,
+    additions: typeof record.additions === "number" ? record.additions : 0,
+    deletions: typeof record.deletions === "number" ? record.deletions : 0,
+    url: typeof record.html_url === "string" ? record.html_url : "",
+  };
+}
+
+/** The pr-files.json projection (`jq -c '[.[] | {filename,...}] + note'`):
+ * `patch` is intentionally dropped — it duplicates the raw diff. Key order
+ * matches the jq projection because JSON.stringify preserves insertion
+ * order. */
+export function filesProjection(files: readonly unknown[], totalChangedFiles: number): string {
+  const projected: Array<Record<string, unknown>> = files.map((raw) => {
+    const record = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+    return {
+      filename: record.filename ?? null,
+      status: record.status ?? null,
+      additions: record.additions ?? null,
+      deletions: record.deletions ?? null,
+      changes: record.changes ?? null,
+      previous_filename: record.previous_filename ?? null,
+    };
+  });
+  if (totalChangedFiles > 100) {
+    projected.push({ note: `file list truncated to first 100 of ${totalChangedFiles} changed files` });
+  }
+  return JSON.stringify(projected);
+}
+
+/** Size totals for a seeded ``pr-files.seed.json`` file list (#833): the
+ * pinned-replay counterpart of the live PR's `changed_files`/`additions`/
+ * `deletions`, summed from the same diff the file list came from so a size-
+ * scaled budget reads consistent numbers. Missing/non-numeric per-file
+ * counts contribute 0. */
+export function seededFileTotals(files: readonly unknown[]): { changedFiles: number; additions: number; deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const raw of files) {
+    const record = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+    additions += typeof record.additions === "number" ? record.additions : 0;
+    deletions += typeof record.deletions === "number" ? record.deletions : 0;
+  }
+  return { changedFiles: files.length, additions, deletions };
+}
+
+/** `derive_is_fork_pr` (fail-closed): an unusable PR object conservatively
+ * derives a fork. */
+export function deriveFork(prObject: unknown): string {
+  try {
+    return deriveIsFork(prObject) ? "true" : "false";
+  } catch {
+    return "true";
+  }
+}
+
+/** `linguist-generated` attribute paths for the diff's chunks (v2
+ * prioritize_diff.py): computed only when the raw diff exceeds its budget,
+ * via `git check-attr --stdin -z` in the reviewed checkout. */
+export async function generatedAttributePaths(workspace: string, diffText: string, budget: number): Promise<ReadonlySet<string>> {
+  if (Buffer.byteLength(diffText, "utf8") <= budget) return new Set();
+  const [, chunks] = splitChunks(Buffer.from(diffText, "utf8"));
+  const paths: string[] = [];
+  for (const chunk of chunks) {
+    const text = Buffer.from(chunk[0]).toString("utf8");
+    if (text !== "") paths.push(text);
+  }
+  if (paths.length === 0) return new Set();
+  try {
+    const handle = runProcess({
+      file: "git",
+      args: ["check-attr", "-z", "linguist-generated", "--", ...paths],
+      cwd: workspace,
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    });
+    const result = await handle.result;
+    if (result.status !== "exited" || result.exitCode !== 0) return new Set();
+    const fields = result.stdout.toString("utf8").split("\0");
+    const generated = new Set<string>();
+    for (let index = 0; index + 2 < fields.length; index += 3) {
+      if (fields[index + 2] === "set" || fields[index + 2] === "true") generated.add(fields[index]!);
+    }
+    return generated;
+  } catch {
+    return new Set();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// context.sh: review threads + human reviews sections
+// ---------------------------------------------------------------------------
+
+export async function buildReviewThreadsSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv, supersededCutoff: string | null): Promise<void> {
+  ws.write("review-threads.raw.json", "");
+  ws.write("review-threads.md", "");
+  ws.write("review-threads.json", "");
+  ws.write("review-threads-present.txt", "");
+  if ((env.REVIEW_THREADS_CONTEXT ?? "true").toLowerCase() !== "true") return;
+  let maxBytes = Number(env.REVIEW_THREADS_MAX_BYTES ?? "8000");
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 200000) maxBytes = 8000;
+  const fetched = await adapter.listReviewThreads();
+  if (!fetched.ok) return;
+  ws.write("review-threads.raw.json", pyJsonDumps(fetched.data));
+  try {
+    // #1663: thread origin is decided from the forge's authorship metadata,
+    // never from comment-body wording. The forge's actor type (`Bot` from
+    // GitHub's `author { __typename }`, `user.type` where a Forgejo
+    // deployment reports one) decides everything: only an AUTOMATION-typed
+    // author under this run's authenticated login is the action's own
+    // finding, another automation identity stays a bot finding (a rotated
+    // publisher never becomes a human minor), a `User`-typed root with no
+    // action publication metadata is human even under the run's own shared
+    // PAT identity, and a marker-bearing root on a human-typed or untyped
+    // account is ambiguous provenance — dismissible by no bot disposition,
+    // never re-emitting a blocking severity, the gap riding the material
+    // `unverified_blocking_claim` instead (#1663 review).
+    let botIdentity: string | null = null;
+    try {
+      const resolved = await adapter.authenticatedIdentity();
+      // A forge that answers with something other than a usable login is
+      // unproven, exactly like a failed read (#1663 review).
+      botIdentity = typeof resolved === "string" && resolved.trim() !== "" ? resolved : null;
+    } catch {
+      botIdentity = null;
+    }
+    const threads = prepareThreads(fetched.data, undefined, botIdentity);
+    const [markdown, rendered] = renderReviewThreads(threads, undefined, maxBytes, supersededCutoff);
+    ws.write("review-threads.md", markdown);
+    ws.write("review-threads.json", rendered.length > 0 ? `${pythonJsonStringify(threadEnforcementView(rendered))}\n` : "");
+    ws.write("review-threads-present.txt", rendered.length > 0 ? `${rendered.length}\n` : "");
+  } catch {
+    ws.write("review-threads.md", "");
+    ws.write("review-threads.json", "");
+    ws.write("review-threads-present.txt", "");
+  }
+}
+
+export async function buildHumanReviewsSection(ws: RunWorkspace, adapter: PlatformReadAdapter, headSha: string, env: StageEnv): Promise<void> {
+  ws.write("human-reviews.raw.json", "");
+  ws.write("human-reviews.md", "");
+  ws.write("human-reviews.json", "");
+  ws.write("human-reviews-present.txt", "");
+  if ((env.HUMAN_REVIEWS_CONTEXT ?? "true").toLowerCase() !== "true") return;
+  const fetched = await adapter.listPrReviewsPaginated();
+  if (!fetched.ok) return;
+  ws.write("human-reviews.raw.json", pyJsonDumps(fetched.data));
+  try {
+    const reviews = prepareReviews(fetched.data);
+    const [markdown, rendered] = renderOutstanding(reviews, headSha === "" ? null : headSha);
+    ws.write("human-reviews.md", markdown);
+    ws.write("human-reviews.json", rendered.length > 0 ? `${pythonJsonStringify(humanEnforcementView(rendered))}\n` : "");
+    ws.write("human-reviews-present.txt", rendered.length > 0 ? `${rendered.length}\n` : "");
+  } catch {
+    ws.write("human-reviews.md", "");
+    ws.write("human-reviews.json", "");
+    ws.write("human-reviews-present.txt", "");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// enrichment.sh / run_enrichment.py: extraction + linked sources render
+// ---------------------------------------------------------------------------
+
+export interface EnrichmentExtraction {
+  allUrls: string[];
+  urls: string[];
+  hints: string[];
+  targetVersion: string;
+  ghcrImages: string[];
+  compareShas: [string, string] | null;
+}
+
+export function extractEnrichmentArtifacts(env: StageEnv, ws: RunWorkspace, diffText: string, pr: Record<string, unknown>): EnrichmentExtraction {
+  const body = ws.readText("pr-body.txt") ?? "";
+  const allUrls = extractUrls(body, diffText);
+  const hints = extractVersionHints(diffText);
+  const extraction: EnrichmentExtraction = {
+    allUrls,
+    urls: allUrls.slice(0, 25),
+    hints,
+    targetVersion: selectTargetVersion(typeof pr.title === "string" ? pr.title : null, hints),
+    ghcrImages: extractGhcrImages(hints, diffText),
+    compareShas: extractCompareShas(hints),
+  };
+  ws.write("urls.all.txt", joinLines(allUrls));
+  ws.write("urls.txt", joinLines(extraction.urls));
+  ws.write("version-hints.txt", joinLines(hints));
+  ws.write("version-hints.truncated.txt", joinLines(hints.slice(0, 180)));
+  ws.write("ghcr-images.txt", joinLines(extraction.ghcrImages));
+  ws.write("compare-shas.txt", extraction.compareShas === null ? "" : `${extraction.compareShas[0]} ${extraction.compareShas[1]}\n`);
+  return extraction;
+}
+
+/** run_enrichment.py's render: `render_linked_sources` over the resolved
+ * extraction, with the SSRF-safe fetch stack behind the default deps. */
+export async function renderLinkedSourcesPhase(env: StageEnv, ws: RunWorkspace, extraction: EnrichmentExtraction, now?: () => number): Promise<string> {
+  const allowedHosts = parseAllowedHosts(env.ALLOWED_SOURCE_HOSTS ?? "");
+  const budget = new BudgetTracker(Number(env.ENRICHMENT_BUDGET_SEC ?? "60") || 60, {
+    ...(now !== undefined ? { now } : {}),
+  });
+  const deps = defaultLinkedSourcesDeps({
+    budget,
+    githubAuthorization: env.GH_TOKEN ? `token ${env.GH_TOKEN}` : undefined,
+    ...(env.FORGEJO_API_URL ? { forgejoApiUrl: env.FORGEJO_API_URL } : {}),
+  });
+  const input: LinkedSourcesInput = {
+    urls: extraction.urls,
+    allowedHosts,
+    targetVersion: extraction.targetVersion,
+    ghcrImages: extraction.ghcrImages,
+    compareShas: extraction.compareShas,
+    currentRepo: env.GITHUB_REPOSITORY ?? env.REPO ?? null,
+    allowedRepos: parseAllowedRepos(env.TOOL_ALLOWED_GH_API_REPOS ?? ""),
+  };
+  const markdown = await renderLinkedSources(input, deps);
+  ws.write("linked-sources.md", markdown);
+  return markdown;
+}
+
+// ---------------------------------------------------------------------------
+// classification.sh forks: image digests, evidence providers
+// ---------------------------------------------------------------------------
+
+export async function runImageDigestPhase(ws: RunWorkspace, diffText: string, env: StageEnv, signal?: AbortSignal): Promise<string> {
+  const markdown = await buildImageProvenanceFromNetwork(diffText, env as NodeJS.ProcessEnv, signal !== undefined ? { signal } : {});
+  ws.write("image-digest-context.md", markdown);
+  return markdown;
+}
+
+export async function runEvidencePhase(ws: RunWorkspace, env: StageEnv, forkFlag: string, runDir: string, log?: (line: string) => void, signal?: AbortSignal): Promise<string> {
+  const outcome = await runEvidenceProvidersPhase({
+    env: env as NodeJS.ProcessEnv,
+    cwd: runDir,
+    isForkPr: forkFlag,
+    enableForForks: env.EVIDENCE_ENABLE_FOR_FORKS ?? "false",
+    ...(log !== undefined ? { log } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  // The phase writes evidence-providers.{md,json} itself (v2 cwd
+  // semantics); refresh the bus so the corpus reads this run's values.
+  // The #1517 negative-evidence sidecar is written alongside on every
+  // outcome, so it is always this run's own derivation.
+  for (const name of ["evidence-providers.md", "evidence-providers.json", "evidence-negative-evidence.json"]) ws.refresh(name);
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// corpus.sh: related code + PR thread sections
+// ---------------------------------------------------------------------------
+
+const RELATED_ARTIFACTS = ["change-anchors.json", "related-code.json", "related-code.md", "related-code.truncated.md"] as const;
+
+/** Builds the related-code artifacts and returns the anchors + related
+ * context they came from (the #796 obligation inputs), or null when the
+ * section is disabled, errored or empty. `rawDiffText` (#1154 review round 3)
+ * is the diff as it existed before the ingestion redaction, so the
+ * change-anchor checkout lookups keep the raw header path spelling; it stays
+ * in memory and never reaches an artifact. */
+export async function buildRelatedCodeSection(ws: RunWorkspace, env: StageEnv, workspace: string, rawDiffText?: string): Promise<{ anchors: ChangeAnchorsArtifact; related: RelatedContext } | null> {
+  for (const name of RELATED_ARTIFACTS) ws.write(name, "");
+  if ((env.RELATED_CODE_CONTEXT ?? "true").toLowerCase() !== "true") return null;
+  const reset = (): void => {
+    for (const name of RELATED_ARTIFACTS) ws.write(name, "");
+  };
+  try {
+    const filesBytes = ws.read("pr-files.json");
+    const fileList: readonly unknown[] | null = filesBytes === null ? null : (JSON.parse(Buffer.from(filesBytes).toString("utf8")) as unknown[]);
+    const anchors = extractChangeAnchors(ws.readText("pr.diff"), fileList, { sourceRoot: workspace, rawDiffText });
+    ws.write("change-anchors.json", renderChangeAnchorsJson(anchors));
+    const anchorData: unknown = JSON.parse(Buffer.from(renderChangeAnchorsJson(anchors)).toString("utf8"));
+    const related = await buildRelatedContext(anchorData, workspace, fileList);
+    const artifact = relatedContextToArtifact(related);
+    ws.write("related-code.json", pythonJsonStringify(artifact));
+    const errors = (artifact as { errors?: unknown }).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      reset();
+      return null;
+    }
+    const markdown = renderRelatedContextMarkdown(artifact);
+    ws.write("related-code.md", markdown);
+    ws.write("related-code.truncated.md", clipRelatedCodeMarkdown(Buffer.from(markdown, "utf8"), Number(env.RELATED_CODE_MAX_BYTES ?? "16000") || 16000) ?? new Uint8Array(0));
+    return { anchors: anchorData as ChangeAnchorsArtifact, related };
+  } catch {
+    reset();
+    return null;
+  }
+}
+
+const EQUIVALENT_PATHS_ARTIFACTS = ["equivalent-paths.json", "equivalent-paths.md", "equivalent-paths.truncated.md"] as const;
+
+/** Builds the #875 "equivalent paths to compare" artifacts from the anchors
+ * `buildRelatedCodeSection` already extracted. Off by default
+ * (`EQUIVALENT_PATHS`); a no-op (empty artifacts) when disabled, anchors are
+ * unavailable, or no bounded group can be justified. */
+export function buildEquivalentPathsSection(
+  ws: RunWorkspace,
+  env: StageEnv,
+  workspace: string,
+  anchors: ChangeAnchorsArtifact | null,
+): void {
+  for (const name of EQUIVALENT_PATHS_ARTIFACTS) ws.write(name, "");
+  if ((env.EQUIVALENT_PATHS ?? "false").toLowerCase() !== "true") return;
+  if (anchors === null) return;
+  try {
+    const artifact = detectEquivalentPathGroups(anchors, workspace);
+    if (artifact.groups.length === 0) return;
+    ws.write("equivalent-paths.json", renderEquivalentPathsJson(artifact));
+    const markdown = renderEquivalentPathsMarkdown(artifact);
+    ws.write("equivalent-paths.md", markdown);
+    ws.write(
+      "equivalent-paths.truncated.md",
+      clipRelatedCodeMarkdown(Buffer.from(markdown, "utf8"), Number(env.EQUIVALENT_PATHS_MAX_BYTES ?? "6000") || 6000) ?? new Uint8Array(0),
+    );
+  } catch {
+    for (const name of EQUIVALENT_PATHS_ARTIFACTS) ws.write(name, "");
+  }
+}
+
+const SYNTAX_CONTEXT_ARTIFACTS = ["syntax-context.json", "syntax-context.md", "syntax-context.truncated.md"] as const;
+
+/** Builds the #764 syntax-aware context artifacts from the anchors the
+ * related-code stage already extracted.
+ *
+ * OFF BY DEFAULT (`SYNTAX_CONTEXT`): the issue's acceptance criterion is
+ * measured quality/token benefit, and the measurement is not in yet. The
+ * stage is EVIDENCE, never authority — it emits context, never findings,
+ * severity, obligations or a verdict.
+ *
+ * A no-op (empty artifacts) when the stage is disabled, when the upstream
+ * anchors are unavailable, when the PR is a FORK, or when the build fails:
+ * the review then falls back to the existing lexical related-code context
+ * and never breaks. */
+export async function buildSyntaxContextSection(
+  ws: RunWorkspace,
+  env: StageEnv,
+  workspace: string,
+  anchors: ChangeAnchorsArtifact | null,
+  headRevision: string | null,
+): Promise<void> {
+  for (const name of SYNTAX_CONTEXT_ARTIFACTS) ws.write(name, "");
+  // The fork boundary is enforced IN CODE, not by the workflow pin.
+  //
+  // Why the pin alone is not enough: the contract default of
+  // `syntax-context` is "false" — the same value the fork workflow pins —
+  // and `isOperatorExplicit` (src/config/repository-config.ts) treats an
+  // operator value EQUAL to the contract default as "not explicitly set".
+  // A repository's base-ref `.github/pr-reviewer.yml` could therefore set
+  // `syntax-context: "true"` and the pin would not stop it. (`related-code-context`
+  // has no such hole: its default is "true", so the fork's "false" IS
+  // explicit.)
+  //
+  // Why the stage must not run on a fork at all: the privileged fork job
+  // holds the TRUSTED BASE checkout, not the fork head, so a
+  // worktree-scanning section would describe the wrong tree.
+  //
+  // The comparison is the repository's own: `IS_FORK_PR` is resolved
+  // upstream by `deriveFork`, which fails closed to "true" when the PR
+  // object cannot be parsed.
+  //
+  // The check FAILS CLOSED: the stage runs only for an EXPLICIT
+  // non-fork ("false"). Any other value — "TRUE", "1", a non-canonical
+  // spelling an operator's request JSON carried, or a missing flag — is
+  // UNCERTAIN fork state, and uncertain metadata must refuse rather than
+  // proceed (see AGENTS.md, "Fail closed where required"). Every shipped
+  // lane resolves the flag to exactly "true" or "false" before this point.
+  if (env.IS_FORK_PR !== "false") return;
+  if ((env.SYNTAX_CONTEXT ?? "false").toLowerCase() !== "true") return;
+  if (anchors === null) return;
+  const reset = (): void => {
+    for (const name of SYNTAX_CONTEXT_ARTIFACTS) ws.write(name, "");
+  };
+  try {
+    // The registry resolves the provider and reports what it got: an
+    // unknown id degrades to the default provider with a recorded reason
+    // (never an exception). The provider itself runs in an isolated worker
+    // thread, so a provider that blocks cannot hold the review past the
+    // stage's wall-clock bound.
+    const resolution = resolveSyntaxProvider(env.SYNTAX_CONTEXT_PROVIDER);
+    const context = await buildSyntaxContext({
+      workspace,
+      anchors,
+      providerRegistration: resolution.registration,
+      providerFallback: resolution.fallback,
+      providerFallbackReason: resolution.reason,
+      headRevision,
+      // The artifact budget is the module's own hard cap; the operator's
+      // `syntax-context-max-bytes` bounds the section that enters the
+      // corpus (same shape as RELATED_CODE_MAX_BYTES).
+      maxBytes: MAX_SYNTAX_BYTES,
+    });
+    const artifact = syntaxContextToArtifact(context);
+    // A degraded build (a provider that failed, a malformed anchor
+    // artifact) carries no trustworthy context: the section is dropped
+    // whole, exactly like the lexical stage drops a degraded related-code
+    // artifact, and the review falls back to the lexical context. The
+    // failure never reaches the corpus.
+    //
+    // A per-file SKIP (an unreadable changed file, a binary changed file)
+    // is NOT a degradation of this kind: it is recorded as a note and the
+    // rest of the section is kept — one oversized file must not silence
+    // the evidence the other changed files carry.
+    const errors = (artifact as { errors?: unknown }).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      reset();
+      return;
+    }
+    ws.write("syntax-context.json", renderSyntaxContextJson(artifact));
+    const markdown = renderSyntaxContextMarkdown(artifact);
+    ws.write("syntax-context.md", markdown);
+    ws.write(
+      "syntax-context.truncated.md",
+      clipSyntaxContextMarkdown(Buffer.from(markdown, "utf8"), Number(env.SYNTAX_CONTEXT_MAX_BYTES ?? "8000") || 8000) ?? new Uint8Array(0),
+    );
+  } catch {
+    reset();
+  }
+}
+
+export async function buildPrThreadSection(ws: RunWorkspace, adapter: PlatformReadAdapter, env: StageEnv, supersededCutoff: string | null): Promise<void> {
+  ws.write("pr-thread.json", "");
+  ws.write("pr-thread.md", "");
+  if ((env.PR_THREAD_CONTEXT ?? "true").toLowerCase() !== "true") return;
+  const fetched = await adapter.listPrConversationComments();
+  if (!fetched.ok) return;
+  ws.write("pr-thread.json", pyJsonDumps(fetched.data));
+  try {
+    const markdown = renderPrThread(fetched.data, undefined, undefined, Number(env.PR_THREAD_MAX_BYTES ?? "8000") || 8000, supersededCutoff);
+    ws.write("pr-thread.md", markdown);
+  } catch {
+    ws.write("pr-thread.md", "");
+  }
+}
+
+/** The atomic body snapshot the #812 metadata pass consumes: the body the
+ * corpus presents as the authoritative description, and the one cutoff its
+ * discussion renderers may label with. */
+export interface PrBodyRevision {
+  body: string;
+  editedAt: string | null;
+}
+
+/** #812: the platform's atomic body snapshot (`getPrBodyRevision`; on
+ * GitHub one GraphQL document carries `body` and `lastEditedAt`). Null when
+ * the backend does not provide the seam, the read fails, or the payload is
+ * malformed — the REST-fetched body is then presented and the discussion
+ * renderers label nothing: a cutoff is never paired with a body it does
+ * not describe. */
+export async function authoritativeBodyRevision(adapter: PlatformReadAdapter): Promise<PrBodyRevision | null> {
+  try {
+    const revision = await adapter.getPrBodyRevision?.();
+    if (revision === null || revision === undefined || typeof revision.body !== "string") return null;
+    const editedAt = typeof revision.editedAt === "string" && revision.editedAt !== "" ? revision.editedAt : null;
+    return { body: revision.body, editedAt };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// corpus.sh: build_review_corpus + specialist corpus input
+// ---------------------------------------------------------------------------
+
+export function assembleCorpus(
+  ws: RunWorkspace,
+  env: StageEnv,
+  budgets: { primary: TierBudgets; smart: TierBudgets; fallback?: TierBudgets | null },
+  tier: "primary" | "smart" | "fallback",
+  slot: "primary" | "smart" | "fallback",
+  generatedPaths: ReadonlySet<string>,
+  standards: { resolved: string | null; content: Uint8Array | null; changedInPr?: boolean },
+): CorpusBuildResult {
+  const standardsContext = prepareStandardsContext(standards.resolved ?? "", standards.content, standards.changedInPr ?? false);
+  for (const [name, data] of standardsContext) ws.write(name, data);
+  const harnessArtifacts = prepareToolHarness(env.TOOL_MODE ?? "off", ws.read("tool-harness.md"), ws.read("tool-harness.json"));
+  for (const [name, data] of harnessArtifacts) ws.write(name, data);
+  const repoMapCapped = buildBoundedRepoMap(ws.read("repo-map.md"), Number(env.REPO_MAP_MAX_BYTES ?? "12000") || 12000);
+  ws.write("repo-map.capped.md", repoMapCapped);
+
+  const ciChecksFile = env.CI_CHECKS_FILE ?? "";
+  let ciChecksContent: Uint8Array | null = null;
+  if (ciChecksFile !== "") {
+    try {
+      ciChecksContent = readFileSync(ciChecksFile);
+    } catch {
+      ciChecksContent = null;
+    }
+  }
+  const tierBudgets = tier === "fallback"
+    ? // #1598/#1256: the fallback corpus budget is the #1256 cap — the
+      // historical re-truncation bound — narrowed by a declared fallback
+      // window, never widened past it. Diff/files keep the primary budgets:
+      // the fallback rides the primary-truncated sources (its own corpus
+      // budget caps the body).
+      {
+        maxCorpus: budgets.fallback != null
+          ? Math.min(FALLBACK_CORPUS_RETRUNCATION_MAX_BYTES, budgets.fallback.maxCorpus)
+          : FALLBACK_CORPUS_RETRUNCATION_MAX_BYTES,
+        maxDiff: budgets.primary.maxDiff,
+        maxFiles: budgets.primary.maxFiles,
+      }
+    : budgets[tier];
+  // #1598: the #1256 fallback cap is unconditional policy, not a
+  // declared-window-only guard, so the fallback slot's over-budget check is
+  // always armed — a fallback corpus never silently exceeds the historical
+  // bound the way an undeclared primary window's named-mode budget may.
+  const budgetGuard = tier === "fallback"
+    ? true
+    : tier === "smart" || !!(env.PRIMARY_MODEL_CONTEXT_TOKENS ?? env.MODEL_CONTEXT_TOKENS);
+  const result = buildReviewCorpus(
+    {
+      manifestContextMd: ws.read("manifest-context.md"),
+      prJson: ws.read("pr.json"),
+      classificationJson: ws.read("classification.json"),
+      relatedCodeTruncatedMd: ws.read("related-code.truncated.md"),
+      syntaxContextTruncatedMd: ws.read("syntax-context.truncated.md"),
+      repoMapMd: ws.read("repo-map.md"),
+      prThreadMd: ws.read("pr-thread.md"),
+      reviewThreadsMd: ws.read("review-threads.md"),
+      humanReviewsMd: ws.read("human-reviews.md"),
+      linkedIssuesMd: ws.read("linked-issues.md"),
+      ciChecksContent,
+      versionHintsTruncatedTxt: ws.read("version-hints.truncated.txt"),
+      toolHarnessMd: ws.read("tool-harness.md"),
+      repositorySkillAddendumMd: ws.read("repository-skill-addendum.md"),
+      toolHarnessSmartMd: ws.read("tool-harness.smart.md"),
+      toolHarnessFallbackMd: ws.read("tool-harness.fallback.md"),
+      evidenceProvidersMd: ws.read("evidence-providers.md"),
+      imageDigestContextMd: ws.read("image-digest-context.md"),
+      dependencyCoverageMd: ws.read("dependency-coverage.md"),
+      reReviewScopeMd: ws.read("re-review-scope.md"),
+      reReviewEvidenceMd: ws.read("re-review-evidence.md"),
+      linkedSourcesMd: ws.read("linked-sources.md"),
+      repoImpactTruncatedMd: ws.read("repo-impact.truncated.md"),
+      repoHistoryTruncatedMd: ws.read("repo-history.truncated.md"),
+      prDiff: ws.read("pr.diff"),
+      prFilesJson: ws.read("pr-files.json"),
+      prDiffTruncated: ws.read("pr.diff.truncated"),
+      prFilesTruncatedJson: ws.read("pr-files.truncated.json"),
+      standardsContextMd: ws.read("standards-context.md"),
+      requirementLedgerMd: ws.read("requirement-ledger.md"),
+      claimFalsificationMd: ws.read("claim-falsification.md"),
+      derivedObligationsMd: ws.read("derived-obligations.md"),
+      riskObligationsMd: ws.read("risk-obligations.md"),
+      specialistsMd: ws.read("specialists.md"),
+      requirementLedgerPresent: ws.read("requirement-ledger-present.txt"),
+      specialistLeadsPresent: ws.read("specialist-leads-present.txt"),
+      standardsFileContent: standards.content,
+    },
+    {
+      tier,
+      slot,
+      maxCorpus: tierBudgets.maxCorpus,
+      diffBudget: tierBudgets.maxDiff,
+      filesBudget: tierBudgets.maxFiles,
+      repoMapMaxBytes: Number(env.REPO_MAP_MAX_BYTES ?? "12000") || 12000,
+      standardsFile: standards.resolved ?? "",
+      ciChecksFile,
+      budgetGuard,
+      generatedPaths,
+    },
+  );
+  for (const [name, data] of result.artifacts) ws.write(name, data);
+  // #921/#930: the assembler-certified diff-section payload rides beside the
+  // corpus alias, keyed by the ARTIFACT SLOT it certifies, not the model
+  // tier — the initial harness runs at TOOL_HARNESS_TIER=primary, so keying
+  // by model tier would leave the primary-named sidecar absent on fresh
+  // runs. The harness's tier-keyed read follows the same primary/smart corpus
+  // split: slot=primary builds the review-corpus.truncated.md corpus,
+  // slot=smart the review-corpus.smart.truncated.md one, and #1598's
+  // slot=fallback the review-corpus.fallback.truncated.md one.
+  ws.write(
+    slot === "smart"
+      ? CORPUS_DIFF_SECTION_SMART_ARTIFACT
+      : slot === "fallback"
+        ? CORPUS_DIFF_SECTION_FALLBACK_ARTIFACT
+        : CORPUS_DIFF_SECTION_ARTIFACT,
+    result.corpusDiffPayload,
+  );
+  return result;
+}
+
+/** The specialist corpus builder reads the run workspace by the same v2
+ * filenames plus the `$CI_CHECKS_FILE` sentinel. */
+export function specialistWorkspace(ws: RunWorkspace, ciChecksContent: Uint8Array | null): Record<string, Uint8Array | null> {
+  const record: Record<string, Uint8Array | null> = { __ci_checks_file__: ciChecksContent };
+  for (const [name, data] of ws.snapshot()) record[name] = data;
+  return record;
+}
+
+function ciChecksBytes(env: StageEnv): Uint8Array | null {
+  const path = env.CI_CHECKS_FILE ?? "";
+  if (path === "") return null;
+  try {
+    return readFileSync(path);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// corpus.sh tail: the native tool harness
+// ---------------------------------------------------------------------------
+
+export function harnessTransportAdapter(env: StageEnv, signal?: AbortSignal): HarnessTransport {
+  return async (baseUrl, apiFormat, payload, apiKey, timeoutSec, maxRetryAttempts, attemptBudgetSec) => {
+    // #1037: the tool-harness transport is a provider call like any other.
+    // Parsed per request INSIDE the closure (as pre-fix) so a malformed set
+    // stays fail-soft per request; unset config yields `undefined` and the
+    // key is omitted entirely (byte-identical request, nothing to merge).
+    const extra = extraHeadersForEnv(env.AI_EXTRA_HEADERS ?? "");
+    // #1515: the native loop's model turns are the authoritative review
+    // (class 1) — the smart escalation's loop is the recovery class (3), the
+    // same split the corpus review tier calls use. The turn admits through
+    // the run-wide governor before any wire attempt; the wire format and
+    // model of THIS turn are the scheduling identity (never the credential).
+    // A request cancelled while queued throws here, which the loop treats
+    // exactly like any other thrown transport (degradation, never a crash).
+    const harnessTier = env.TOOL_HARNESS_TIER || "primary";
+    const wireFormat = apiFormat === "anthropic" ? "anthropic" : "openai";
+    const harnessModel = typeof (payload as Record<string, unknown> | undefined)?.model === "string"
+      ? (payload as Record<string, unknown>).model as string
+      : "";
+    // #1598: the fallback tier's evidence loop is recovery class, like the
+    // smart loop (#1515) — it only ever runs after the primary already lost
+    // its investigation to a transport failure.
+    const recoveryTier = harnessTier === "smart" || harnessTier === "fallback";
+    // #1466: count the request's ACTUAL wire calls. The #1200 hook fires once
+    // per wire call — including the ones a 429/5xx backoff, a #824 clamp or a
+    // #1047 strip discarded — so the count is the HTTP attempts the request
+    // really made, not the number of calls the loop believes it made.
+    let wireCalls = 0;
+    const outcome = await sharedRunInferenceGovernor().admit(
+      {
+        priority: recoveryTier ? GOVERNOR_PRIORITY_RECOVERY : GOVERNOR_PRIORITY_AUTHORITATIVE,
+        endpointKey: inferenceEndpointKey({ baseUrl, apiFormat: wireFormat, model: harnessModel }),
+        ...(signal !== undefined ? { signal } : {}),
+      },
+      () => runChatRequest({
+        baseUrl,
+        apiFormat: wireFormat,
+        payload: {
+          endpointPath: apiFormat === "anthropic" ? "/messages" : "/chat/completions",
+          body: payload as unknown as TransportWirePayload["body"],
+        },
+        apiKey,
+        anthropicVersion: env.ANTHROPIC_VERSION ?? "2023-06-01",
+        requestTimeoutSec: Math.max(1, Math.trunc(timeoutSec)),
+        connectTimeoutSec: Number(env.AI_CONNECT_TIMEOUT_SEC ?? "30") || 30,
+        // #1037: unset config omits the key entirely (byte-identical request,
+        // nothing to merge).
+        ...(extra !== undefined ? { extraHeaders: extra } : {}),
+        // #726 (engine cancellation): the harness's model turns bind to the
+        // run's cancellation scope; unset signal keeps the request unchanged.
+        ...(signal !== undefined ? { signal } : {}),
+        ...(maxRetryAttempts !== undefined ? { maxRetryAttempts } : {}),
+        ...(attemptBudgetSec !== undefined ? { attemptBudgetSec } : {}),
+        onWireCall: () => { wireCalls += 1; },
+      }),
+    ).catch((cause: unknown) => {
+      // #1515: the harness transport contract throws plain Errors (the loop
+      // degrades on them, never crashes); a queued cancel becomes one too.
+      // #1628: a queued cancel carries the typed `cancelled` kind so the
+      // loop's per-attempt classifier says "cancelled" instead of "unknown".
+      if (cause instanceof GovernorCancelledError) throw new TransportFailure("cancelled", cause.message);
+      throw cause;
+    });
+    // #846: carry the HTTP status and a redacted body excerpt (plus the
+    // ai-api-format hint on a 404) instead of the bare "model endpoint
+    // returned HTTP <status>" message. `secrets` masks the configured key
+    // unconditionally, on top of `redactText`'s heuristics. #1037: the
+    // configured extra-header VALUES join that list — a provider error body
+    // can quote them back, and they routinely carry proxy tokens.
+    // #1628: `describedTransportFailure` keeps the same message AND carries
+    // the structured kind/status/wire-observation, so the native loop's
+    // per-attempt classifier can say what the discarded attempt was (524?
+    // timeout? closed connection?) without any body ever leaving the seam.
+    if (outcome.status === "failure") throw describedTransportFailure(outcome.failure, { secrets: [apiKey, ...(extra ? Object.values(extra) : [])] });
+    // A streamed turn's `raw` is the reassembled NormalizedModelResponse, not
+    // provider JSON. The loop's tool-call extraction and usage accounting
+    // read the OpenAI chat shape (as v2's reassembler produced), so project
+    // it; a non-streamed turn's raw provider JSON passes through untouched.
+    let body = (payload as Record<string, unknown>).stream === true ? normalizedToOpenAiChat(outcome.response) : outcome.raw;
+    // #1628: the reassembly-quality probe rides the body too, on the same
+    // reasoning as the timing probe below — the streamed projection is a NEW
+    // object, and a malformed-vs-empty verdict made upstream without the
+    // probe would be a guess.
+    const quality = readSseReassemblyQuality(outcome.response);
+    if (quality !== null) body = attachSseReassemblyQuality(body, quality);
+    // #1466: the transport probe rides the body the caller receives, on BOTH
+    // paths. The streamed projection is a NEW object, so the probe the
+    // transport attached to the reassembled response would be lost here —
+    // and a probe that never reaches the caller is a measurement nobody can
+    // attribute. The wire-call count is added on the way out: the transport
+    // measures ONE HTTP turn and does not know how many attempts its caller
+    // made.
+    const timing: TransportTiming | undefined = outcome.timing;
+    if (timing === undefined) return body;
+    return attachTransportTiming(body, { ...timing, wireCalls });
+  };
+}
+
+/** A NormalizedModelResponse in the OpenAI chat-completion shape. */
+export function normalizedToOpenAiChat(response: NormalizedModelResponse): Record<string, unknown> {
+  const message: Record<string, unknown> = { role: "assistant", content: response.content };
+  if (response.toolCalls.length > 0) {
+    message.tool_calls = response.toolCalls.map((call) => ({
+      id: call.id,
+      type: "function",
+      function: { name: call.function.name, arguments: call.function.arguments },
+    }));
+  }
+  const shaped: Record<string, unknown> = {
+    id: response.id,
+    object: "chat.completion",
+    model: response.model,
+    choices: [{ index: 0, message, finish_reason: response.finishReason }],
+  };
+  if (response.usage) {
+    const { cacheReadTokens, cacheWriteTokens } = response.usage;
+    shaped.usage = {
+      prompt_tokens: response.usage.promptTokens,
+      completion_tokens: response.usage.completionTokens,
+      total_tokens: response.usage.totalTokens,
+      // #910: the loop's cache accounting reads these per api format.
+      ...(cacheReadTokens !== undefined ? { prompt_tokens_details: { cached_tokens: cacheReadTokens }, cache_read_input_tokens: cacheReadTokens } : {}),
+      ...(cacheWriteTokens !== undefined ? { cache_creation_input_tokens: cacheWriteTokens } : {}),
+    };
+  }
+  if (response.error) shaped.error = response.error;
+  return shaped;
+}
+
+/** #1145: the probe is threaded through `HarnessDeps` as an additive
+ * optional field (the harness's `RunNativeLoopInput` carries it; the native
+ * loop invokes it at most once after an accepted verdict). Omitting it
+ * keeps the loop byte-for-byte pre-#1145. #1210: likewise `ghApi` — the
+ * run's configured forge read capability, bound to the native loop's
+ * gh_api/repo_contents executors. */
+export async function runToolHarnessPhase(ws: RunWorkspace, env: StageEnv, runDir: string, log: (line: string) => void, signal?: AbortSignal, ghApi?: HarnessDeps["ghApi"], wallClockSecCap?: number, fallbackLane?: HarnessDeps["fallbackLane"], toolIo?: HarnessDeps["toolIo"]): Promise<void> {
+  const deps: HarnessDeps & { signal?: AbortSignal } = {
+    env,
+    cwd: runDir,
+    readText: (name) => ws.readText(name),
+    exists: (name) => ws.isFile(name),
+    writeArtifact: (name, text) => {
+      ws.write(name, text);
+    },
+    deleteArtifact: (name) => ws.remove(name),
+    transport: harnessTransportAdapter(env, signal),
+    ...(signal !== undefined ? { signal } : {}),
+    log,
+    ...(ghApi !== undefined ? { ghApi } : {}),
+    // #1598 (review): the evidence-failover phase passes the remaining share
+    // of the loop wall-clock envelope, so the second investigation can never
+    // start a second full budget. Unset keeps the configured ceiling.
+    ...(wallClockSecCap !== undefined ? { wallClockSecCap } : {}),
+    // #1598 (review): the evidence-failover phase binds the engine's
+    // already-resolved fallback lane, so the loop dials the same endpoint,
+    // credential, and format its fallback verdict came from — never a lane
+    // re-resolved from the route-rebound base keys. Unset keeps env
+    // resolution (direct callers without a resolved profile).
+    ...(fallbackLane !== undefined ? { fallbackLane } : {}),
+    ...(toolIo !== undefined ? { toolIo } : {}),
+  };
+  await runToolHarness(deps);
+}
+
+// ---------------------------------------------------------------------------
+// review.sh tail: outputs
+// ---------------------------------------------------------------------------
+
+export function persistOutputs(outputFilePath: string, formatted: string): void {
+  if (outputFilePath === "" || outputFilePath === "/dev/null" || formatted === "") return;
+  // CodeQL js/http-to-file-access: the formatted assignments carry the
+  // review's step outputs (verdict, model-controlled review_markdown behind
+  // a random delimiter). $GITHUB_OUTPUT is the sanctioned Actions channel
+  // for exactly this data; the random-delimiter heredoc form is what keeps
+  // model text from forging additional output keys.
+  appendFileSync(outputFilePath, formatted);
+}
+
+export { ciChecksBytes };

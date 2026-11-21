@@ -1,0 +1,264 @@
+import { appendFileSync } from "node:fs";
+import { formatResponseDiagnosticsLine } from "../model/response-diagnostics.js";
+import { renderStepSummary, type ReviewStepOutputs } from "../publish/outputs.js";
+import { aspectStatusLookup, describeDependencyCoverageRollup, type DependencyCoverageRollup } from "../model/dependency-coverage.js";
+import { harnessExecutionCounts } from "../tools/execution-counts.js";
+import { publicAnalysisEngine } from "../prompt/index.js";
+import { resolveTierBudgets } from "../corpus/budgets.js";
+import type { HumanReviewRoutingPlan } from "../routing/human-review-routing.js";
+import type { StageEnv } from "./env.js";
+import type { RunWorkspace } from "./workspace.js";
+import { safeJson } from "./stages.js";
+
+/**
+ * Step summary (review.sh `write_step_summary`): the observability table a
+ * debugging user reads instead of raw logs. Extracted from `runReview` so the
+ * rendering contract — findings table, tool telemetry, route/coverage rows —
+ * is testable against a literal `SummaryInput` instead of a full review run.
+ */
+export interface SummaryInput {
+  outputs: ReviewStepOutputs;
+  env: StageEnv;
+  /** The summary reads run artifacts; a full `RunWorkspace` satisfies this. */
+  ws: Pick<RunWorkspace, "read" | "isFile">;
+  reviewRecord: Record<string, unknown>;
+  primaryHarness: Record<string, unknown> | null;
+  smartHarness: Record<string, unknown> | null;
+  /** #1598: the fallback tier's evidence-failover harness record — supplied
+   * only when `tool-harness.fallback.json` exists, so an untriggered
+   * fallback gains no summary row. */
+  fallbackHarness?: Record<string, unknown> | null;
+  coverage: Record<string, unknown> | null;
+  budgets: ReturnType<typeof resolveTierBudgets>;
+  route: string;
+  routeReason: string;
+  analysisEngine: string;
+  fallbackUsed: boolean;
+  /** #1005: the deterministic routing plan, supplied only when routing ran. */
+  reviewRouting?: HumanReviewRoutingPlan;
+}
+
+/** Port of write_step_summary. Appends to `stepSummaryPath`; the summary is
+ * observability, so a write failure never fails the review. */
+export function writeStepSummary(stepSummaryPath: string, input: SummaryInput): void {
+  if (stepSummaryPath === "") return;
+  const { env, ws, reviewRecord, primaryHarness, smartHarness } = input;
+  const fallbackHarness = input.fallbackHarness ?? null;
+  const toolMode = (env.TOOL_MODE ?? "off").toLowerCase();
+  const findings = Array.isArray(reviewRecord.findings) ? reviewRecord.findings as unknown[] : [];
+  // #1606: one shared reader for the execution counters, so the summary row
+  // and the enforcement overlay can never read the same artifact differently.
+  const primaryCounts = harnessExecutionCounts(primaryHarness);
+  const smartCounts = harnessExecutionCounts(smartHarness);
+  const coverageSummary = (input.coverage?.summary ?? {}) as Record<string, unknown>;
+  const total = typeof coverageSummary.total === "number" ? coverageSummary.total : 0;
+  const unknown = typeof coverageSummary.unknown === "number" ? coverageSummary.unknown : 0;
+
+  const profileKey = input.route === "escalated" ? "smart" : "primary";
+  const budget = input.budgets[profileKey];
+  const corpusName = input.route === "escalated" ? "review-corpus.smart.truncated.md" : "review-corpus.truncated.md";
+  const corpusBytes = byteLength(ws.read(corpusName));
+  const diffBytes = byteLength(ws.read("pr.diff"));
+
+  const usageFile = input.route === "escalated" && ws.isFile("ai-response.smart.json")
+    ? "ai-response.smart.json"
+    : input.fallbackUsed && ws.isFile("ai-response.fallback.json")
+      ? "ai-response.fallback.json"
+      : "ai-response.primary.json";
+  const usage = (safeJson(ws.read(usageFile))?.usage ?? {}) as Record<string, unknown>;
+
+  const nativeStatus = String(primaryHarness?.native_loop_verdict_status ?? "");
+  const deepReview = ws.isFile("specialists.json") ? safeJson(ws.read("specialists.json")) : null;
+
+  const table = renderStepSummary({
+    analysisEngine: publicAnalysisEngine(input.analysisEngine),
+    verdict: input.outputs.verdict || "unknown",
+    verdictSource: input.outputs.verdictSource,
+    findingsCount: findings.length,
+    blockersCount: findings.filter((f) => (f as { severity?: string }).severity === "blocker").length,
+    findings,
+    upstreamLinkMode: upstreamLinkModeFromEnv(env),
+    requiredChecksStatus: input.outputs.requiredChecks,
+    // #1003: present only when triage ran (the decision output is "" when the
+    // input is off), so a disabled run's summary gains no row.
+    ...(input.outputs.reviewTriageDecision !== ""
+      ? { reviewTriage: { decision: input.outputs.reviewTriageDecision, reason: input.outputs.reviewTriageReason } }
+      : {}),
+    // #1005: present only when routing ran (mode != off), so a run without
+    // routing gains no row. Action-owned; no model text.
+    ...(input.reviewRouting
+      ? {
+        reviewRouting: {
+          status: input.reviewRouting.status,
+          targetIds: input.reviewRouting.targetIds,
+          users: input.reviewRouting.users,
+          teams: input.reviewRouting.teams,
+        },
+      }
+      : {}),
+    // #1073: present only when the confidence scorer ran (all five outputs
+    // are "" when it is disabled), so a disabled run's summary gains no row.
+    ...(input.outputs.confidenceStatus !== undefined && input.outputs.confidenceStatus !== ""
+      ? {
+        confidence: {
+          status: input.outputs.confidenceStatus,
+          score: input.outputs.confidenceScore ?? "",
+          risk: input.outputs.confidenceRisk ?? "",
+          reason: input.outputs.confidenceReason ?? "",
+          model: input.outputs.confidenceModel ?? "",
+        },
+      }
+      : {}),
+    ...(total > 0 ? { requirementCoverage: { total, unknown } } : {}),
+    // #1337: present only when the model emitted a `dependency_coverage`
+    // answer (the output is "" otherwise), so a run without an answer
+    // gains no row. Deterministic rollup over the persisted records;
+    // never model prose.
+    ...(input.outputs.dependencyCoverageStatus !== undefined && input.outputs.dependencyCoverageStatus !== ""
+      ? {
+        dependencyCoverage: describeDependencyCoverageRollup(
+          input.outputs.dependencyCoverageStatus as DependencyCoverageRollup,
+          aspectStatusLookup(Array.isArray(reviewRecord.dependency_coverage) ? (reviewRecord.dependency_coverage as never) : null),
+        ),
+      }
+      : {}),
+    primaryTools: {
+      // #1597/#1606: the two counts carry their OWN meanings — "executed"
+      // is every call that reached an executor (successful OR failed) and
+      // "successful" is the ok-status subset — so a run whose call failed
+      // renders two DIFFERENT numbers instead of one count that can never
+      // show the failure. One shared reader
+      // (`src/tools/execution-counts.ts`) supplies both, so the row can
+      // never contradict the enforcement overlay.
+      executedRequestCount: primaryCounts.attempted ?? 0,
+      successfulToolCalls: primaryCounts.succeeded ?? 0,
+      rounds: typeof primaryHarness?.rounds === "number" ? primaryHarness.rounds : 0,
+      stopReason: String(primaryHarness?.stop_reason ?? primaryHarness?.skip_reason ?? (toolMode === "native_loop" ? "unknown" : "disabled")),
+    },
+    ...(smartHarness !== null && toolMode === "native_loop"
+      ? {
+        smartTools: {
+          // #1597: the same distinct counts the primary row (and the marker)
+          // carries: executed = attempted executions, successful = the ok
+          // subset, issued = everything the model asked for.
+          executedRequestCount: smartCounts.attempted ?? 0,
+          // #1606: the same shared reader as the primary row.
+          successfulToolCalls: smartCounts.succeeded ?? 0,
+          issuedToolCalls: typeof smartHarness.planned_request_count === "number" ? smartHarness.planned_request_count : 0,
+          rounds: typeof smartHarness.rounds === "number" ? smartHarness.rounds : 0,
+          requests: numberAt(smartHarness.usage, "requests") ?? numberAt(smartHarness.native_loop_usage, "requests") ?? 0,
+          stopReason: String(smartHarness.stop_reason ?? smartHarness.native_loop_degraded ?? smartHarness.skip_reason ?? smartHarness.error ?? "unknown"),
+          verdictStatus: String(smartHarness.native_loop_verdict_status ?? "corpus"),
+        },
+      }
+      : {}),
+    // #1598: present only when the fallback evidence harness wrote its
+    // artifact (the evidence failover ran); an untriggered fallback gains no
+    // row. Same shape and discipline as the smart row.
+    ...(fallbackHarness !== null && toolMode === "native_loop"
+      ? {
+        fallbackTools: {
+          issuedToolCalls: Array.isArray(fallbackHarness.tool_calls) ? (fallbackHarness.tool_calls as unknown[]).length : 0,
+          rounds: typeof fallbackHarness.rounds === "number" ? fallbackHarness.rounds : 0,
+          requests: numberAt(fallbackHarness.usage, "requests") ?? numberAt(fallbackHarness.native_loop_usage, "requests") ?? 0,
+          stopReason: String(fallbackHarness.stop_reason ?? fallbackHarness.native_loop_degraded ?? fallbackHarness.skip_reason ?? fallbackHarness.error ?? "unknown"),
+          verdictStatus: String(fallbackHarness.native_loop_verdict_status ?? "corpus"),
+        },
+      }
+      : {}),
+    ...(nativeStatus !== ""
+      ? {
+        nativeVerdict: {
+          status: nativeStatus,
+          ...(primaryHarness?.native_loop_verdict_transport !== undefined && primaryHarness.native_loop_verdict_transport !== null
+            ? { transport: String(primaryHarness.native_loop_verdict_transport) }
+            : {}),
+          attempts: typeof primaryHarness?.native_loop_verdict_attempts === "number" ? primaryHarness.native_loop_verdict_attempts : 0,
+          retried: primaryHarness?.native_loop_verdict_retried === true,
+          // #1687: WHICH recovery `retried` says — a closed-set re-read of
+          // the harness token, so a transport retry is never read as the
+          // streamed fallback in this artifact. Omitted when no retry ran
+          // or a foreign artifact carries anything else.
+          ...(primaryHarness?.native_loop_verdict_retry_kind === "stream"
+            || primaryHarness?.native_loop_verdict_retry_kind === "transport"
+            ? { retryKind: String(primaryHarness.native_loop_verdict_retry_kind) }
+            : {}),
+          ...(primaryHarness?.native_loop_verdict_reason !== undefined && primaryHarness.native_loop_verdict_reason !== null
+            ? { reason: String(primaryHarness.native_loop_verdict_reason) }
+            : {}),
+          // #1047: content-free failure shape + budget raise, when the
+          // verdict turn recorded them.
+          ...(primaryHarness?.native_loop_verdict_diagnostics !== undefined && primaryHarness.native_loop_verdict_diagnostics !== null
+            && typeof primaryHarness.native_loop_verdict_diagnostics === "object"
+            ? { diagnostics: formatResponseDiagnosticsLine(primaryHarness.native_loop_verdict_diagnostics as Record<string, unknown>) }
+            : {}),
+          ...(typeof primaryHarness?.native_loop_verdict_budget_raised_to === "number"
+            ? { budgetRaisedTo: primaryHarness.native_loop_verdict_budget_raised_to }
+            : {}),
+        },
+      }
+      : {}),
+    route: input.route,
+    ...(input.routeReason !== "" ? { routeReason: input.routeReason } : {}),
+    ...(deepReview !== null
+      ? {
+        deepReview: {
+          leads: String(deepReview.total_leads ?? 0),
+          errors: deepReview.any_errors === true,
+          ...(deepReview.deep_review_mode === "auto" && typeof deepReview.selection === "object" && deepReview.selection !== null
+            ? {
+              autoSelection: {
+                selected: arrayLength((deepReview.selection as Record<string, unknown>).selected_roles),
+                skipped: arrayLength((deepReview.selection as Record<string, unknown>).skipped_roles),
+              },
+            }
+            : {}),
+        },
+      }
+      : {}),
+    budget: /^\d+$/.test(env.MODEL_CONTEXT_TOKENS ?? "") ? `model_context_tokens=${env.MODEL_CONTEXT_TOKENS}` : `context_limit_mode=${env.CONTEXT_LIMIT_MODE ?? "normal"}`,
+    finalContext: `tier=${profileKey}; model_context_tokens=${contextCapacity(env, profileKey)}; corpus_budget=${budget.maxCorpus}B; corpus_actual=${corpusBytes}B; diff_budget=${budget.maxDiff}B; diff_actual=${diffBytes}B; request_shape=${profileKey === "smart" ? env.SMART_REQUEST_SHAPE ?? "default" : env.PRIMARY_REQUEST_SHAPE ?? "default"}`,
+    diffBytes: { actual: `${diffBytes}B`, truncated: diffBytes > budget.maxDiff ? `yes (cap ${budget.maxDiff})` : "no" },
+    corpusBytes: { actual: `${corpusBytes}B`, truncated: corpusBytes > budget.maxCorpus ? `yes (cap ${budget.maxCorpus})` : "no" },
+    promptTokens: stringAt(usage, "prompt_tokens"),
+    completionTokens: stringAt(usage, "completion_tokens"),
+    cacheHitRatio: input.outputs.cacheHitRatio,
+  });
+  try {
+    appendFileSync(stepSummaryPath, table);
+  } catch {
+    // The summary is observability; a write failure never fails the review.
+  }
+}
+
+function byteLength(bytes: Uint8Array | null | undefined): number {
+  return bytes === null || bytes === undefined ? 0 : bytes.length;
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+/** #975: mirror of `entrypoints.ts`' upstream-link-mode normalization — the
+ * step-summary findings table neutralizes links exactly like the published
+ * body does. */
+function upstreamLinkModeFromEnv(env: StageEnv): "inert" | "togithub" {
+  const value = (env.UPSTREAM_LINK_MODE ?? "").trim().toLowerCase();
+  return value === "togithub" ? "togithub" : "inert";
+}
+
+function numberAt(record: unknown, key: string): number | null {
+  if (record === null || typeof record !== "object") return null;
+  const value = (record as Record<string, unknown>)[key];
+  return typeof value === "number" ? value : null;
+}
+
+function stringAt(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  return value === undefined || value === null ? "-" : String(value);
+}
+
+function contextCapacity(env: StageEnv, profileKey: "primary" | "smart"): string {
+  const tier = profileKey === "smart" ? env.SMART_MODEL_CONTEXT_TOKENS : env.PRIMARY_MODEL_CONTEXT_TOKENS;
+  return tier || env.MODEL_CONTEXT_TOKENS || "unset";
+}

@@ -1,0 +1,3156 @@
+/**
+ * Publication dispatcher (#680 port of `scripts/publish.sh` +
+ * `scripts/publish_helpers.sh`).
+ *
+ * The model can run for minutes, so the publication-boundary head re-check
+ * (#451) runs first: nothing — comment, blocking review, or approval — may
+ * land against a head the model never saw. A superseded head skips the
+ * publish silently; an undeterminable head fails closed.
+ *
+ * Publication failure must never be mistaken for a successful review: every
+ * fatal path returns `status: "failed"` (the orchestrator turns that into a
+ * step failure), and approval-specific failures surface the exact remediation
+ * the v2 error text names.
+ */
+import { sanitizeMarkdown, stripReservedMarkers, stripEmptyConditionalSections, type ConditionalSectionPresence, type UpstreamLinkMode } from "./sanitize.js";
+import { publicAnalysisEngine } from "../prompt/index.js";
+import { ACTION_VERSION } from "../version.js";
+import {
+  buildComments, hasPublishablePrescription, INLINE_DISCLAIMER, parseRejectionCarryover, prescriptionKey,
+  prescriptionKeyDigest, recoverPublishedSuggestion, MAX_CARRYOVER_KEYS_PER_RUN, SEVERITY_LABELS,
+} from "./inline-findings.js";
+import { redactText } from "../context/redact.js";
+import { escapeCodeSpan } from "../context/fence.js";
+import { buildReviewHandoff, renderReviewHandoffBlock } from "./handoff.js";
+import { computeReviewDisposition, normalizePublishedRecommendation } from "./disposition.js";
+import { MATERIAL_CODE_CLAUSES, reviewResultFromDisposition, unreadableFinalDisposition, type FinalDisposition, type MaterialDispositionCode } from "../disposition/final.js";
+import { buildReviewObligations, renderReviewObligationsBlock, REVIEW_OBLIGATIONS_MAX_BYTES, type ReviewObligationsInput } from "./obligations.js";
+import { stripRevealedCapNoteTails } from "../confidence/result.js";
+import type { ConfidenceTelemetry } from "../confidence/telemetry.js";
+import { buildRunMetadataMarker, emitReviewMarkers, isManagedBody, parseMetadata, stripPublishedContainerAnchors, type MarkerPreamble, type RunMarkerContext } from "../metadata/markers.js";
+import { FINDING_OUTCOMES_SCHEMA, isProvenHeadSha, MAX_LEDGER_EVENTS, normalizeOutcomeEvent, serializeOutcomeLedger, type OutcomeEvent, type OutcomeLedger } from "../outcomes/schema.js";
+import { parseFindingIdentityMarker } from "../outcomes/identity.js";
+import { deriveOutcomeEvents, type PriorFindingObservation } from "../outcomes/reconcile.js";
+import { aggregateOutcomeEvents } from "../outcomes/report.js";
+import { resolveSupersededThreads, cleanupManagedReviews, resolveCleanupFlag, retireManagedInlineComments, resolvePublishTrustedOwner, selectManagedReviews, hideSupersededManagedReviews, type CleanupLog } from "./cleanup.js";
+import { ownerMatchesIdentity, type TrustedOwnerIdentity } from "../platform/owner-identity.js";
+import { strictReviewResult, hasBlockingOpenFinding } from "../enforcement/verdict-policy.js";
+import type { ReviewObligation } from "../enforcement/review-obligations.js";
+import { escapeTableCell } from "../gates/ci-wait.js";
+import { COVERAGE_NOTICE_MAX_ITEMS, type PartialCoverage } from "../tools/coverage.js";
+import { isIncompleteReason, renderFindingsSummary, severityCountsLabel, MAX_REVIEW_TRIAGE_REASON_CHARS, publishedConfidenceReason, type IncompleteReason } from "./outputs.js";
+import { resolveReviewTriageDecision } from "../model/triage.js";
+import type { HumanReviewRoutingPlan } from "../routing/human-review-routing.js";
+import { MAX_FEEDBACK_COMMENT_IDS } from "../platform/publish-api.js";
+import { FORGE_COMMENT_MAX_BYTES } from "../platform/comment-ceiling.js";
+import type { CollaboratorPermissionReading, NativeReviewComment, NativeReviewRequest, NativeReviewSurface, PublishPlatformApi } from "../platform/publish-api.js";
+
+export type PublishMode = "comment" | "review_comment" | "review_verdict" | "review_blockers";
+
+/**
+ * Whether the action entry's publish step runs for this mode: the single
+ * decision shared by the entry's publish gate and the confidence scorer's
+ * eligibility gate, so a privileged scorer call can only happen when the
+ * review body will actually be published. #1158: the publish mode ALONE
+ * decides — `comment` publishes the sticky PR comment without any legacy
+ * flag, exactly like the publish seam does (the legacy `publish-review-comment`
+ * input is deprecated and inert).
+ */
+export function publishStepRuns(mode: string | undefined): boolean {
+  const value = mode ?? "";
+  return value === "review_comment" || value === "review_verdict" || value === "review_blockers" || value === "comment";
+}
+
+export type NativeReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+
+export interface PublishInput {
+  mode: PublishMode;
+  /** Raw model-produced review markdown (unsanitized). */
+  reviewMarkdown: string;
+  verdict: string;
+  /** The configured `verdict_policy`. "strict" (the v3 default, #811) turns
+   * on the derived review_result (clean/findings/partial/issues), the
+   * findings + coverage-gap rendering at the top of the body, and the
+   * verdict-line counts. Any other value (including undefined) keeps the
+   * v2 body bytes and the binary clean/issues marker exactly as before. */
+  verdictPolicy?: string;
+  analysisEngine: string;
+  baseSha: string;
+  headSha: string;
+  prNumber: string;
+  commentMarker: string;
+  broadFingerprint?: string;
+  /** Required-checks validation status for the metadata marker. */
+  requiredChecks: string;
+  /** #954: why coverage is incomplete (see IncompleteReason). Absent means derive from requiredChecks/partialCoverage (legacy callers). */
+  incompleteReason?: string;
+  reviewRoute: string;
+  escalationReason: string;
+  cacheHitRatio: string;
+  inlineFindings: boolean;
+  inlineFindingsMax: number;
+  /** Structured findings (parsed array or raw). */
+  findings: unknown;
+  /** #1518: the run's review id. It pairs with the head SHA to name THIS
+   * review of THIS head, and it is the id the published handoff carries
+   * (the same value the `review-bundle` output names). */
+  reviewId?: string;
+  /** #1518: the requirement ids the deterministic enforcement pass could not
+   * discharge. They ride the published handoff so a controller can see WHICH
+   * obligation stayed open. */
+  unresolvedRequirementIds?: readonly string[];
+  /** #1518: the required-check ids the deterministic enforcement pass could
+   * not resolve. They ride the published handoff. */
+  unresolvedRequiredChecks?: readonly string[];
+  /** #1521: the review-obligation rows that BLOCKED the review. They ride
+   * the published handoff so a controller sees WHAT blocked the review (the
+   * id, the source, the status, the cause and the obligation's own text),
+   * not only an opaque id. Only the forcing sources ride — a `derived` row
+   * is coverage, never a block. */
+  unresolvedReviewObligations?: readonly ReviewObligation[];
+  /** #1541: the number of DISTINCT requirement ids the enforcement pass
+   * produced BEFORE the shared id cap shortened the list. The published
+   * handoff carries it, so a consumer can tell that the cap dropped ids
+   * instead of reading a shortened list as the whole set. */
+  unresolvedRequirementIdsSourceTotal?: number;
+  /** #1541: the same honest count for the required-check ids. */
+  unresolvedRequiredChecksSourceTotal?: number;
+  cleanupPreviousNativeReviews: string;
+  /** #1161: DEPRECATED and inert. The input stays accepted for backward
+   * compatibility, but it gates nothing and changes no published event —
+   * it is read only to warn the operator that it no longer has an effect. */
+  allowApprove?: boolean;
+  /** #1158: DEPRECATED and inert, like `allowApprove`. Publication is
+   * decided by `mode` alone (`comment` publishes the sticky PR comment with
+   * no legacy flag); the field is read only to warn the operator that the
+   * input no longer has an effect. */
+  publishReviewComment?: boolean;
+  approveForks: boolean;
+  /** Fork-ness from the precheck (fail-closed); null derives from the platform. */
+  isForkPr: boolean | null;
+  upstreamLinkMode: UpstreamLinkMode;
+  /** Per-section presence for the #415 conditional-section backstop. v2
+   * maps its four file signals onto these five keys: TOOL_HARNESS_PRESENT
+   * drives both tool-harness sections (strip_empty_conditional_sections.py). */
+  conditionalPresence: ConditionalSectionPresence;
+  /** When set, removed after publish (the re-review label cleanup). */
+  rerunLabel?: string;
+  priorHeadSha?: string;
+  /** #812: folded external-CI conclusion at headSha ("success" | "failure"
+   * | "pending" | "none"), recorded in the marker so the next diff-unchanged
+   * skip can tell a stale carried request_changes from a live one. Omitted
+   * when the caller did not read CI. */
+  ciState?: string;
+  /** #1449: the run's derived-obligation state ("complete" | "unresolved" |
+   * "unavailable"), present ONLY when the derived-obligation feature is
+   * enabled. It rides the published metadata marker so a reader of the
+   * review can tell that a trusted approve was withheld because a derived
+   * architectural obligation stayed undischarged. Absent when the run has
+   * no state — the marker then keeps its pre-#1449 bytes exactly. */
+  derivedObligationState?: string;
+  /** #1505: the run's required-evidence state, when the review-owned
+   * required-evidence contract was active. Unresolved required evidence is
+   * a coverage state: it reads `partial` and withholds the native APPROVE
+   * (a non-blocking COMMENT), never a manufactured blocking request.
+   * Absent when the contract was inactive. */
+  requiredEvidenceState?: string;
+  /** #1656: the run's authoritative final disposition (the engine's ONE
+   * post-validation object). When present, the published recommendation,
+   * the native review event and the withheld-approval notices are derived
+   * from it and from nothing else. Absent (a legacy run directory or a
+   * direct publish invocation) keeps the pre-#1656 scalar derivation
+   * byte-for-byte. */
+  finalDisposition?: FinalDisposition;
+  /** #1656 audit round 2: a run DIRECTORY was involved but its serialized
+   * disposition record was missing, malformed or incoherent — publication
+   * fails closed to an unavailable abstention instead of re-deriving an
+   * approval from the legacy scalars. Only a caller with NO run-directory
+   * provenance (a direct publish invocation) may use the legacy
+   * derivation. */
+  finalDispositionRefused?: boolean;
+  /** Forgejo inline-comment position backend. */
+  forgejoPositions: boolean;
+  /** #810: deterministic partial-coverage record from the tool harness.
+   * When set, the published body carries the coverage notice near the top
+   * and the metadata marker records `coverage: partial` with the stop
+   * reason. Presentation beyond this notice is #811's. */
+  partialCoverage?: PartialCoverage;
+  /** #873/#838: true when the caller could not determine the tool-loop
+   * coverage state at all (the standalone `publish` CLI path: no explicit,
+   * non-empty `PR_REVIEWER_RUN_DIR`, or its harness artifact was missing or
+   * unreadable — never a fallback to the checkout). Distinct from
+   * `partialCoverage` being absent (a confirmed-complete run): this means
+   * publish could not confirm completeness, so it fails closed exactly like
+   * a confirmed gap — see `markerReviewResult`. */
+  coverageUnknown?: boolean;
+  /** #978: whether the final verdict may bypass fail-on-request-changes. */
+  degradedGateBypass?: boolean;
+  /** #847: the #810/#702 tool-loop request budget this run resolved, so the
+   * size-scaled default can be measured from published reviews alone.
+   * Omitted when no tool harness ran. */
+  toolBudget?: number;
+  /** #847: which source won ("primary-override" | "smart-override" |
+   * "explicit" | "tier-default" | "size-scaled"). */
+  toolBudgetSource?: string;
+  /** #847: tool calls the loop actually executed against that budget. */
+  toolCalls?: number;
+  /** #895: loop rounds used, and the round cap they ran against. */
+  toolRounds?: number;
+  maxRounds?: number;
+  /** #922: the loop's conversation budget and peak (approx tokens). */
+  contextBudget?: number;
+  contextPeak?: number;
+  /** #847 measurement follow-up: the tool loop's stop reason, recorded on
+   * every harness run so budget stops with complete coverage stay visible in
+   * published markers. Omitted when no harness reported one. */
+  toolStopReason?: string;
+  /** #1597: the tool-loop execution partitions beyond `toolCalls` (the
+   * EXECUTED count): issued / successful / refused / deduplicated, under
+   * the invariant issued = executed + refused + deduplicated. Absent when
+   * the harness artifact carries none — the marker then keeps its
+   * pre-#1597 bytes. */
+  toolCallsIssued?: number;
+  toolCallsSuccessful?: number;
+  toolCallsRefused?: number;
+  toolCallsDeduplicated?: number;
+  /** #1003: the human-review triage answer, present ONLY when triage ran
+   * (`review-triage` enabled) and the review produced one. Absent means
+   * "did not run" and renders no section — never a silent "not required". */
+  reviewTriage?: { decision: string; reason: string };
+  /** #1005: the deterministic reviewer-routing plan, present ONLY when
+   * routing ran. Its `status` is action-owned; `users`/`teams` come only from
+   * trusted base-ref configuration. The publish step performs the reviewer
+   * request only for `status: "request"`. */
+  reviewRouting?: HumanReviewRoutingPlan;
+  /** #1073: the independent confidence verifier's result, present ONLY when
+   * the scorer ran (`ai-confidence-model` set). Purely advisory — it renders
+   * a section and marker keys and changes nothing else. */
+  confidence?: {
+    status: string;
+    score: string;
+    risk: string;
+    reason: string;
+    model: string;
+    /** Bounded advisory concerns (scored answers only); never findings.
+     * #1369: `type`/`severity` are closed-vocabulary audit tokens the run
+     * step carries on the canonical concerns; optional because the
+     * standalone publish CLI's env round-trip predates them. */
+    concerns?: Array<{ file: string; line: number | null; evidence: string; type?: string; severity?: string }>;
+  };
+  /** #1455: the verifier's own telemetry — the unscored cause, the measured
+   * latency and the provider's token counts. Advisory telemetry: it rides
+   * the metadata marker and changes nothing else. Absent when the run
+   * measured none of it. */
+  confidenceTelemetry?: ConfidenceTelemetry;
+}
+
+export interface PublishResult {
+  status: "published" | "superseded" | "failed";
+  messages: string[];
+  error?: string;
+  outcomes?: string;
+  /** #1576: the verdict-bearing native review submission, present only when
+   * one was ATTEMPTED (only `review_verdict`/`review_blockers` modes on a
+   * platform with a native review surface submit a verdict event; sticky
+   * comments and inline-findings COMMENT reviews carry no verdict). This is
+   * the record the trusted-review attestation consumes: an advisory
+   * publication and a native approval must be distinguishable without
+   * parsing human-readable messages. `fellBack` marks the body-only
+   * plain-review fallback (#1249): the event landed, but no longer bound to
+   * a commit_id, so head binding rests on the pre-submission exact-head
+   * guard plus the consumer's own head comparison. */
+  native?: { event: NativeReviewEvent; submitted: boolean; fellBack?: true };
+}
+
+/** (#1161) The only two verdicts that can carry a native review event. A
+ * missing or invalid verdict is neither an approval nor a blocking
+ * request. */
+export function isValidPublishVerdict(verdict: string): verdict is "approve" | "request_changes" {
+  return verdict === "approve" || verdict === "request_changes";
+}
+
+/** (#1161) The publish modes whose authoritative published body lives in a
+ * PR review rather than a sticky comment. The precheck reads the previous
+ * run's published body from PR reviews for these modes: a sticky comment
+ * would not carry the verdict, so the mode's own publication would be
+ * invisible to the next run's fingerprint and carry-forward. (`review_comment`
+ * also posts a native review, but only for inline findings — its
+ * authoritative body is the sticky comment.) */
+export function isNativeVerdictMode(mode: string): boolean {
+  const value = (mode ?? "").toLowerCase();
+  return value === "review_verdict" || value === "review_blockers";
+}
+
+/**
+ * Sanitize model output: strip reserved metadata markers (the model can
+ * never forge action-owned markers), neutralize upstream references, and
+ * strip conditional sections the corpus never offered (#415 backstop).
+ */
+export function sanitizeForPublication(
+  reviewMarkdown: string,
+  linkMode: UpstreamLinkMode,
+  presence: ConditionalSectionPresence,
+): string {
+  // The model echoes diff lines: redact on the published body, not only on
+  // finding messages. Redaction last so markdown escaping cannot re-expose
+  // a redacted span; redactText is idempotent on its own marker. Redaction
+  // also runs first so escaping cannot split a secret shape before the outer
+  // pass sees it (idempotent either way).
+  return redactText(
+    stripEmptyConditionalSections(
+      sanitizeMarkdown(stripReservedMarkers(redactText(reviewMarkdown)), linkMode),
+      presence,
+    ),
+  );
+}
+
+/** The metadata marker's review_result, shared by publish and the run
+ * entry. Under verdict_policy=strict (#811): clean / findings / partial /
+ * issues from the still-open findings and required-check coverage, with a
+ * #810 tool-loop coverage gap also reported as `partial`. Any other policy
+ * keeps the binary clean/issues v2 consumers rely on for `verdict:
+ * request_changes` vs everything else, but (#873) still reports `partial`
+ * rather than `clean` when required-check coverage is incomplete or the
+ * tool loop stopped short — coverage honesty is not opt-in to a verdict
+ * policy, only the findings-driven states (findings/clean vs issues) are.
+ * `coverageUnknown` (#838: the standalone `publish` CLI could not confirm
+ * the tool-loop coverage state at all) folds into the same `partial`
+ * bucket — publish never reads "I couldn't check" as "it was clean". Since
+ * #874, a known-`unmet` requirement trace is itself a required-check
+ * coverage stop, so it lands in the same `partial` bucket under every
+ * policy. */
+export function markerReviewResult(input: {
+  verdictPolicy?: string | undefined;
+  verdict: string;
+  findings?: unknown;
+  requiredChecks: string;
+  partialCoverage?: PartialCoverage | undefined;
+  coverageUnknown?: boolean | undefined;
+  /** #1447: a degraded-gate bypass means normal review completeness was not
+   * established, so the marker must read partial even when the surviving
+   * required-check/coverage fields happen to look complete. */
+  degradedGateBypass?: boolean | undefined;
+  /** #1449: the run's derived-obligation state ("complete" | "unresolved" |
+   * "unavailable"). An undischarged derived obligation is missing COVERAGE,
+   * not a defect (#1447), so the review reads `partial` — never `clean`
+   * while a derived obligation stayed open, and never a manufactured
+   * "issues". Absent (the feature is off) changes nothing. */
+  derivedObligationState?: string | undefined;
+  /** #1505: the run's required-evidence state ("complete" | "unresolved" |
+   * "unavailable"). Unresolved required review evidence — the evidence was
+   * never gathered (budget exhausted, tool capability, provider failure) —
+   * is a coverage gap with the same approval semantics: the review reads
+   * `partial`, never `clean`, and never a manufactured "issues". Absent
+   * (the contract was inactive) changes nothing. */
+  requiredEvidenceState?: string | undefined;
+}): string {
+  // #1449: the derived gap is a coverage gap: the review never established
+  // a derived cross-path relationship, so it cannot be published as a clean
+  // review. It is NOT a findings state — the findings list stays untouched.
+  const derivedGap = input.derivedObligationState === "unresolved" || input.derivedObligationState === "unavailable";
+  // #1505: unresolved required review evidence is the same coverage bucket —
+  // an availability failure the review could not finish, never a defect.
+  const requiredEvidenceGap = input.requiredEvidenceState === "unresolved" || input.requiredEvidenceState === "unavailable";
+  const coverageGap =
+    Boolean(input.partialCoverage)
+    || Boolean(input.coverageUnknown)
+    || input.degradedGateBypass === true
+    || derivedGap
+    || requiredEvidenceGap;
+  const coverageIncomplete = input.requiredChecks === "incomplete" || coverageGap;
+  if (input.verdictPolicy !== "strict") {
+    if (input.verdict === "request_changes") return "issues";
+    return coverageIncomplete ? "partial" : "clean";
+  }
+  const result = strictReviewResult(input.verdict, input.findings, input.requiredChecks);
+  return coverageGap && result !== "issues" ? "partial" : result;
+}
+
+/** (#873 / #1447) True when the review's own coverage signals say it did
+ * not finish: `review_result` (the marker state computed by
+ * `markerReviewResult`, above) is `partial`. A partial review is an
+ * abstention, not a trusted approval: comment mode renders an incomplete
+ * recommendation and review_verdict withholds the native APPROVE event as a
+ * non-blocking COMMENT. Concrete blocker/major findings still own
+ * REQUEST_CHANGES; incomplete coverage never manufactures one. */
+export function reviewCoverageIncomplete(reviewResult: string): boolean {
+  return reviewResult === "partial";
+}
+
+export function resolveIncompleteReason(input: {
+  requiredChecks: string;
+  incompleteReason?: string | undefined;
+  partialCoverage?: PartialCoverage | undefined;
+  coverageUnknown?: boolean | undefined;
+}): IncompleteReason {
+  const reason = isIncompleteReason(input.incompleteReason) ? input.incompleteReason : undefined;
+  const trace = reason === "requirement_trace" || reason === "both";
+  const execution = reason === "execution" || reason === "both"
+    || (reason === undefined || reason === "none") && input.requiredChecks === "incomplete"
+    || Boolean(input.partialCoverage)
+    || Boolean(input.coverageUnknown);
+  return execution && trace ? "both"
+    : execution ? "execution"
+    : trace ? "requirement_trace"
+    : "none";
+}
+
+
+/** #1554: the forge's comment-body ceiling — 65,536 characters on GitHub and
+ * Forgejo — applied as a BYTE bound. This guard counts UTF-8 bytes, the
+ * stricter measure for a body carrying multi-byte text: a body within the
+ * character ceiling can still exceed it in bytes, and a publication that
+ * fails past the ceiling publishes nothing at all. The machine documents are
+ * individually bounded (`REVIEW_HANDOFF_MAX_BYTES`,
+ * `REVIEW_OBLIGATIONS_MAX_BYTES`, `FINDINGS_SUMMARY_MAX_BYTES`) and are
+ * RESERVED ahead of the review prose (#1521) — the model-authored review
+ * prose was the one unbounded surface, so the aggregate guard at the
+ * publish boundary trims only that prose and discloses the trim in the
+ * body. A verbose review can therefore never starve the complete
+ * action-owned obligations document out of the published body.
+ *
+ * The bound is derived from the single shared ceiling declaration
+ * (`FORGE_COMMENT_MAX_BYTES` in `src/platform/comment-ceiling.ts`, #1569)
+ * rather than redeclared here. */
+export const MAX_PUBLISHED_BODY_BYTES = FORGE_COMMENT_MAX_BYTES;
+
+/** #1557: thrown by `buildPublishedBody` when the aggregate ceiling cannot be
+ * honored because nothing is trimmable — the action-owned blocks and tail
+ * alone already exceed `MAX_PUBLISHED_BODY_BYTES` and there is no review
+ * prose left to cut. A publication past the ceiling publishes nothing at
+ * all, so the guard fails closed: the run's publish step reports a failure
+ * (`publishReview` catches this) instead of emitting a body the forge
+ * refuses. */
+export class PublishedBodyCeilingError extends Error {}
+
+/** #1554: one fence delimiter line — a line whose trimmed start is a run of
+ * 3+ backticks or 3+ tildes. The `info` field is what follows the run
+ * (whitespace-trimmed): an opener may carry an info string; a closer must
+ * carry none. */
+function fenceDelimiterLine(line: string): { char: "`" | "~"; run: number; info: string } | null {
+  const match = /^(`{3,}|~{3,})(.*)$/.exec(line.trimStart());
+  if (match === null) return null;
+  return { char: match[1]![0] as "`" | "~", run: match[1]!.length, info: match[2]!.trim() };
+}
+
+/** #1554 (review follow-up): the container prefixes a fenced code block can
+ * live behind — blockquote `>` markers and list markers, in any order, each
+ * optionally separated by whitespace. Hostile prose can open a fence from
+ * inside a blockquote (`> ```js`) or a list item (`- ```js`), and a scan
+ * that only recognizes line-start delimiters lets such an opener survive
+ * truncation and swallow the action-owned blocks that follow the prose.
+ *
+ * Returns, for one line: `leadIndent` — the whitespace width BEFORE the
+ * first marker, or the whole leading run when the line has no markers
+ * (spaces count 1, a tab counts 4); `prefix` — the normalized marker
+ * sequence (markers joined by single spaces, whitespace amounts between
+ * markers collapsed); `rest` — the content after the last marker, its
+ * leading whitespace run preserved for the closer's indent checks; and
+ * `deep` — a tab or a >3-space run in any marker-separating whitespace
+ * after the first marker. A blockquote marker consumes exactly one
+ * optional separator character, so the run `rest` measures is exactly the
+ * content indent CommonMark's ≤3-space fence-indent rule applies to. */
+function containerScan(line: string): { leadIndent: number; deep: boolean; prefix: string; rest: string } {
+  let index = 0;
+  const tokens: string[] = [];
+  let deep = false;
+  let leadIndent = -1;
+  for (;;) {
+    const runStart = index;
+    while (index < line.length && (line[index] === " " || line[index] === "\t")) index += 1;
+    const run = line.slice(runStart, index);
+    if (leadIndent < 0) {
+      // Before any marker: this run is the lead indent — or, when the line
+      // ends up having no markers, the top-level indent of the content.
+      if (run.includes("\t")) deep = true;
+      leadIndent = run.includes("\t") ? 4 : run.length;
+    } else if (run.length > 0 && (run.includes("\t") || run.length > 3)) {
+      deep = true;
+    }
+    if (line[index] === ">") {
+      tokens.push(">");
+      index += 1;
+      if (line[index] === " " || line[index] === "\t") {
+        if (line[index] === "\t") deep = true;
+        index += 1;
+      }
+      continue;
+    }
+    const list = /^([-+*]|\d{1,9}[.)])[ \t]+/.exec(line.slice(index));
+    if (list !== null) {
+      tokens.push(list[1]!);
+      index += list[0].length;
+      continue;
+    }
+    return { leadIndent, deep, prefix: tokens.join(" "), rest: line.slice(runStart) };
+  }
+}
+
+/** Leading whitespace width of `rest`: spaces count 1, a tab counts as a
+ * full indent step (4) and is never ≤ 3, matching CommonMark where a tab or
+ * 4+ spaces makes the line indented code, never a fence delimiter. */
+function leadingIndent(rest: string): number {
+  let indent = 0;
+  for (const ch of rest) {
+    if (ch === " ") indent += 1;
+    else if (ch === "\t") return indent + 4;
+    else break;
+  }
+  return indent;
+}
+
+/** #1554: the byte offset where an unclosed fenced code block OPENS in
+ * `text`, or -1 when every fence the text opens is closed. Single-level
+ * fence state (markdown fences do not nest): a delimiter line closes the
+ * open fence only when it uses the same character, a run at least as long
+ * as the opener's, and no info string. A backtick opener whose info string
+ * itself contains a backtick is paragraph text, never a fence (CommonMark),
+ * so it cannot open a block a hostile line could then abuse.
+ *
+ * Fence openers are recognized behind container prefixes too (#1554 review
+ * follow-up): `> ```js` opens a fence inside a blockquote and `- ```js`
+ * inside a list item, so the scan strips `containerScan` prefixes before
+ * matching. Both directions are indent-disciplined, because each direction
+ * has an unsafe failure mode:
+ *
+ * - A false OPENER makes the next real delimiter line close a phantom
+ *   fence, so the scan would call closed what the renderer keeps open. A
+ *   delimiter indented more than 3 spaces (or past a tab) is indented code
+ *   in CommonMark — never a fence at top level or in a blockquote — so an
+ *   opener requires `leadIndent ≤ 3`.
+ * - A false CLOSER hides a live fence behind a "closed" verdict. A fence
+ *   therefore closes only on a bare delimiter behind the same marker
+ *   prefix, indented within 3 spaces of the container markers and never
+ *   LESS indented (before the markers) than the opener itself: an opener
+ *   with a positive indent may live in a container inherited from an
+ *   earlier line (a list-item continuation), where a flush-left delimiter
+ *   is a NEW fence's opener, never this fence's closer.
+ * - Container intactness: a container can END in the middle of what the
+ *   scan models as one fence (a blockquote ends at the first line without
+ *   a legal `>` continuation — blank lines included; a list-item
+ *   continuation fence ends at the first non-blank line less indented
+ *   than the opener). After that, any later delimiter line is a NEW
+ *   opener in the renderer, so the scan stops trusting closers and stays
+ *   open from the original opener — the uncertain state trims back to the
+ *   opener (over-trim, disclosed) and the kept prose can never end inside
+ *   a live fence.
+ * - A fence whose opener line carries a list marker gets NO closer at all:
+ *   a same-marker delimiter at column 0 is a sibling list item's opener,
+ *   and telling it from a real closer needs the full list-item indent
+ *   model. It stays open — over-trim, never under-trim.
+ * - Residual infidelity, closed the same way: a list item's content indent
+ *   is unbounded, so after any list-marker line a delimiter at ANY indent
+ *   could be a fence inside that item. The scan opens such a delimiter as
+ *   a never-closable fence — the prose after it trims back to it instead
+ *   of risking a live fence. */
+function unclosedFenceStart(text: string): number {
+  let open: {
+    char: "`" | "~";
+    run: number;
+    start: number;
+    prefix: string;
+    leadIndent: number;
+    closable: boolean;
+  } | null = null;
+  let listSeen = false;
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    const start = offset;
+    offset += line.length + 1;
+    const { leadIndent, deep, prefix, rest } = containerScan(line);
+    if (/[-+*\d]/.test(prefix)) listSeen = true;
+    const delimiter = fenceDelimiterLine(rest);
+    const openerShape =
+      delimiter !== null && !(delimiter.char === "`" && delimiter.info.includes("`"));
+    if (open === null) {
+      if (openerShape && leadIndent <= 3) {
+        open = {
+          char: delimiter!.char,
+          run: delimiter!.run,
+          start,
+          prefix,
+          leadIndent,
+          closable: !/[-+*\d]/.test(prefix),
+        };
+      } else if (openerShape && listSeen) {
+        open = {
+          char: delimiter!.char,
+          run: delimiter!.run,
+          start,
+          prefix,
+          leadIndent,
+          closable: false,
+        };
+      }
+    } else if (open.closable) {
+      const current: NonNullable<typeof open> = open;
+      const blank = line.trim() === "";
+      let intact: boolean;
+      if (current.prefix === "") {
+        // Top-level or list-item fence: a blank line stays fence content
+        // under every reading; a non-blank line less indented than the
+        // opener ends the list-item container (and is literal fence
+        // content in the top-level reading) — either way, closers stop
+        // being trustworthy from here on.
+        intact = blank || leadIndent >= current.leadIndent;
+      } else {
+        // Blockquote fence: every line — blank ones included — must carry
+        // a legally indented `>` continuation, or the blockquote (and the
+        // fence inside it) has ended.
+        intact = !blank && prefix.startsWith(">") && leadIndent <= 3 && !deep;
+      }
+      if (intact) {
+        const closer =
+          leadIndent >= current.leadIndent && leadingIndent(rest) <= 3
+            ? fenceDelimiterLine(rest)
+            : null;
+        if (
+          closer !== null
+          && prefix === current.prefix
+          && closer.char === current.char
+          && closer.run >= current.run
+          && closer.info === ""
+        ) {
+          open = null;
+        }
+      } else {
+        open = { ...current, closable: false };
+      }
+    }
+  }
+  return open === null ? -1 : open.start;
+}
+
+/**
+ * #1554: fit model-authored review prose into a UTF-8 byte budget for the
+ * publish-boundary aggregate guard.
+ *
+ * Returns the longest prose prefix that fits `maxBytes` bytes, cutting at a
+ * UTF-8 codepoint boundary (a multi-byte codepoint is never split) and —
+ * when the kept prose would otherwise end INSIDE a fenced code block —
+ * cutting back to just before the fence's opening line, so the published
+ * prose never ends inside an open fence. The dropped unfinished block counts
+ * toward the dropped characters. `dropped` is the number of Unicode
+ * codepoints the cut removed, exactly what the body's disclosure note names.
+ */
+export function fitReviewProseToBytes(markdown: string, maxBytes: number): { text: string; dropped: number } {
+  const limit = Math.max(0, maxBytes);
+  if (Buffer.byteLength(markdown, "utf8") <= limit) return { text: markdown, dropped: 0 };
+  const bytes = Buffer.from(markdown, "utf8");
+  let cut = Math.min(limit, bytes.length);
+  // Back up to the last codepoint boundary: `bytes[cut]` is a continuation
+  // byte exactly when the cut splits a multi-byte codepoint.
+  while (cut > 0 && (bytes[cut]! & 0xc0) === 0x80) cut -= 1;
+  let text = bytes.subarray(0, cut).toString("utf8");
+  const openAt = unclosedFenceStart(text);
+  if (openAt >= 0) text = text.slice(0, openAt);
+  const dropped = [...markdown].length - [...text].length;
+  return { text, dropped };
+}
+
+/** #1554: the disclosure note templates. The partial variant's digit run is
+ * filled with the dropped codepoint count at render time; the reserve in
+ * `buildPublishedBody` sizes the worst case so the note can never push the
+ * body back past the ceiling it just enforced. */
+const PROSE_TRUNCATED_NOTE_PREFIX = "_Review prose truncated to fit the forge's comment ceiling: ";
+const PROSE_TRUNCATED_NOTE_SUFFIX = " character(s) dropped. The verdict, coverage notices, and machine documents above are complete._";
+const PROSE_OMITTED_NOTE = "_The review prose did not fit the forge's comment ceiling and was omitted. The verdict, coverage notices, and machine documents above are complete._";
+
+/**
+ * #1521: render the review-obligations container at its own byte budget,
+ * RESERVED ahead of the model-authored review prose.
+ *
+ * The container's own bytes (the anchor, the fence and the payload's own
+ * backtick runs) are measured on the rendered block, not estimated, because
+ * the fence delimiter grows with the payload's own backtick runs. When the
+ * rendered block exceeds the document's own budget, the document's byte
+ * budget is lowered by the overflow and the document is built again.
+ *
+ * The room squeezes the rows' TEXT, never the row LIST: the document carries
+ * the COMPLETE set of blocking rows and discloses the effective text cap it
+ * had to use, so a controller can still name every row that blocked the
+ * review.
+ *
+ * An empty result means no container at all: the run had no qualifying row.
+ * The container is never dropped and never squeezed to make room for review
+ * prose — the aggregate publish-boundary guard (#1554) trims only the prose.
+ */
+function renderObligationsReserved(input: ReviewObligationsInput | undefined): string {
+  if (input === undefined) return "";
+  let budget = REVIEW_OBLIGATIONS_MAX_BYTES;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const json = buildReviewObligations({ ...input, maxBytes: budget });
+    if (json === "") return "";
+    const block = renderReviewObligationsBlock(json);
+    const blockBytes = Buffer.byteLength(block, "utf8");
+    if (blockBytes <= REVIEW_OBLIGATIONS_MAX_BYTES) return block;
+    budget = Math.max(0, budget - (blockBytes - REVIEW_OBLIGATIONS_MAX_BYTES));
+  }
+  return "";
+}
+
+/** Build the published body: marker preamble + engine line + the optional
+ * action-owned #810 coverage notice + the strict state block (#811, when
+ * present) + the optional #1003 human-review triage section + sanitized
+ * review. Every block is action-owned and inserted AFTER sanitization (never
+ * model text) so no stripping pass can drop them, and they sit near the top
+ * so a partial-coverage run cannot read as complete.
+ *
+ * #1518: the optional handoff container is inserted IMMEDIATELY after the
+ * marker preamble, so it is the first anchored block in the body. The
+ * preamble is action-owned and precedes every model-authored surface, so a
+ * consumer that reads the FIRST anchored block always reads this action's
+ * container and never a model-authored copy of it.
+ * #1521: the optional review-obligations container rides IMMEDIATELY AFTER
+ * the handoff container — both machine documents sit in the action-owned
+ * marker preamble, before every model-authored surface, and the handoff
+ * block stays first. The container is RESERVED ahead of the review prose:
+ * it renders at its own byte budget and the aggregate ceiling below trims
+ * only the prose, never the container.
+ *
+ * #1554: `tailBlock` is appended VERBATIM after the review prose — raw
+ * concatenation semantics (`returned body + tailBlock`), never trimmed or
+ * transformed, so a caller that used to append a notice to the finished body
+ * can pass the same string here and get byte-identical output. The whole
+ * body then passes the aggregate publish-boundary guard
+ * (`MAX_PUBLISHED_BODY_BYTES`): a fitting body is byte-identical to the
+ * unguarded build; an overflowing body trims ONLY `sanitizedMarkdown` — the
+ * model-authored review prose — to the bytes left after every action-owned
+ * block and the tail block, cutting UTF-8-safe and never ending inside an
+ * open fence (`fitReviewProseToBytes`), and discloses the trim in a final
+ * action-owned note. The machine documents (the marker preamble, the handoff
+ * container, the review-obligations container) and every action-owned block
+ * are never trimmed: their inputs are individually bounded, so the prose is
+ * the one surface whose trim can always absorb the overflow. #1557: if
+ * action-owned blocks alone already exceed the ceiling and no prose remains
+ * to trim, the builder fails CLOSED instead of publishing an oversized body.
+ * This corner is ordinarily unreachable under the action-owned block caps,
+ * and violating those bounds must be explicit rather than silently published. */
+export function buildPublishedBody(options: {
+  markers: string;
+  /** #1518: the rendered `review-handoff/v1` container (anchor + fenced
+   * JSON). Inserted right after the marker preamble. */
+  handoffBlock?: string;
+  /** #1521: the input of the `review-obligations/v1` container (anchor +
+   * fenced JSON). The container is rendered here at its own byte budget,
+   * RESERVED immediately after the handoff container and ahead of the
+   * review prose; the aggregate ceiling trims only the prose. */
+  obligations?: ReviewObligationsInput | undefined;
+  header?: string;
+  /** #1596: the action-owned recommendation line (the disposition's
+   * wording). Rendered immediately AFTER the header and BEFORE the note, so
+   * it sits above every model-authored surface in the native modes — where
+   * the header alone carries no recommendation and the model prose would
+   * otherwise be the only statement of what the action decided. */
+  recommendation?: string;
+  note?: string;
+  analysisEngine: string;
+  sanitizedMarkdown: string;
+  /** Rendered #810 tool-loop partial-coverage notice. */
+  coverageNotice?: string;
+  /** Rendered coverage-gap notice + findings summary for verdict_policy=strict. */
+  stateBlock?: string | undefined;
+  /** #1003: rendered human-review triage section (only when triage ran). */
+  triageBlock?: string | undefined;
+  /** #1005: rendered reviewer-routing section (only when routing ran and the
+   * status carries a decision). */
+  routingBlock?: string | undefined;
+  /** #1073: rendered independent-confidence section (only when the scorer
+   * ran). */
+  confidenceBlock?: string | undefined;
+  /** #1554: raw suffix appended VERBATIM after the review prose — the exact
+   * string a caller used to `body += …` after the build (leading and trailing
+   * newlines included), never trimmed or transformed. Counts toward the
+   * aggregate ceiling as an action-owned (never-trimmed) byte cost. */
+  tailBlock?: string;
+  /** #915: defaults to the build-time stamp; explicit "" forces unstamped. */
+  actionVersion?: string;
+}): string {
+  // The body is assembled as one prefix of action-owned and model-authored
+  // blocks, then the review prose, then the raw tail block. #1521: the
+  // review-obligations container rides IMMEDIATELY after the handoff
+  // container, rendered at its own byte budget — RESERVED ahead of the
+  // prose, never squeezed by it (#1554 integration).
+  const lines: string[] = [options.markers];
+  if (options.handoffBlock) {
+    lines.push(options.handoffBlock, "");
+  }
+  const obligationsBlock = renderObligationsReserved(options.obligations);
+  if (obligationsBlock) {
+    lines.push(obligationsBlock, "");
+  }
+  if (options.header) {
+    lines.push(options.header, "");
+  }
+  if (options.recommendation) {
+    lines.push(options.recommendation, "");
+  }
+  if (options.note) {
+    lines.push(options.note, "");
+  }
+  const actionVersion = options.actionVersion ?? ACTION_VERSION;
+  const versionSuffix = actionVersion === "" ? "" : ` · pr-reviewer-action ${actionVersion}`;
+  lines.push(`_Analysis engine: ${publicAnalysisEngine(options.analysisEngine)}${versionSuffix}_`, "");
+  if (options.coverageNotice) {
+    lines.push(options.coverageNotice, "");
+  }
+  if (options.stateBlock) {
+    lines.push(options.stateBlock, "");
+  }
+  if (options.triageBlock) {
+    lines.push(options.triageBlock, "");
+  }
+  if (options.routingBlock) {
+    lines.push(options.routingBlock, "");
+  }
+  if (options.confidenceBlock) {
+    lines.push(options.confidenceBlock, "");
+  }
+  lines.push(options.sanitizedMarkdown);
+  // #1554: raw-concatenation tail — the prefix above is exactly the body the
+  // unguarded build returned (`lines.join("\n") + "\n"`), so appending the
+  // tail block to it reproduces a caller's old `body += tail` bytes exactly.
+  const prefix = lines.slice(0, -1).join("\n");
+  const prose = options.sanitizedMarkdown;
+  const tailBlock = options.tailBlock ?? "";
+  const untrimmed = `${prefix}\n${prose}\n${tailBlock}`;
+  const untrimmedBytes = Buffer.byteLength(untrimmed, "utf8");
+  if (untrimmedBytes <= MAX_PUBLISHED_BODY_BYTES) return untrimmed;
+  // #1554 (integrated with #1521): overflow — trim ONLY the model-authored
+  // prose. The byte cost of everything else is fixed: the prefix (marker
+  // preamble, handoff container, the RESERVED review-obligations container,
+  // header, note, engine line, coverage notice, state/triage/routing/
+  // confidence blocks), the two newlines that wrap the prose, the tail
+  // block, and the disclosure note itself (reserved at its worst-case size,
+  // so the note can never push the body back past the ceiling it just
+  // enforced). The +1 covers the final newline after the note. The
+  // obligations container is never trimmed and never squeezed by the prose:
+  // it rendered at its own budget above, and the prose is the one surface
+  // that absorbs the overflow — a verbose review can no longer starve the
+  // complete action-owned obligations document out of the body.
+  const tailSeparator = tailBlock !== "" && !tailBlock.endsWith("\n") ? "\n" : "";
+  const noteReserve = Buffer.byteLength(PROSE_TRUNCATED_NOTE_PREFIX, "utf8")
+    + Buffer.byteLength(PROSE_TRUNCATED_NOTE_SUFFIX, "utf8")
+    // The dropped count never exceeds the prose's own codepoint count, so
+    // this digit run bounds the rendered note exactly.
+    + String([...prose].length).length
+    + 1;
+  const budget = Math.max(0,
+    MAX_PUBLISHED_BODY_BYTES
+      - (Buffer.byteLength(prefix, "utf8") + 2 + Buffer.byteLength(tailBlock, "utf8")
+        + Buffer.byteLength(tailSeparator, "utf8") + noteReserve));
+  const fitted = fitReviewProseToBytes(prose, budget);
+  // #1557: nothing trimmable (no prose at all): the overflow lives entirely
+  // in bytes this guard must never touch, so there is no legal body left.
+  // Fail closed — the forge would refuse this body anyway, and a silent
+  // pass-through would let a future bound regression publish nothing while
+  // reporting success. (In the overflow branch, `dropped === 0` is exactly
+  // the empty-prose corner: any prose that still fit the post-reserve budget
+  // would have kept `untrimmed` at or under the ceiling.)
+  if (fitted.dropped === 0) {
+    throw new PublishedBodyCeilingError(
+      `published body exceeds the forge comment ceiling (${MAX_PUBLISHED_BODY_BYTES} UTF-8 bytes)`
+        + ` with no trimmable review prose: action-owned content alone is ${untrimmedBytes} bytes; refusing to publish`,
+    );
+  }
+  if (fitted.text === "") {
+    // No prose fits at all: the full-omission variant, prose line dropped.
+    const omitted = `${prefix}\n${tailBlock}${tailSeparator}${PROSE_OMITTED_NOTE}\n`;
+    // #1557: the omitted variant is itself bounded by the same fixed bytes —
+    // when the action-owned content plus the note alone exceed the ceiling,
+    // there is nothing left to trim and the guard fails closed.
+    if (Buffer.byteLength(omitted, "utf8") > MAX_PUBLISHED_BODY_BYTES) {
+      throw new PublishedBodyCeilingError(
+        `published body exceeds the forge comment ceiling (${MAX_PUBLISHED_BODY_BYTES} UTF-8 bytes)`
+          + ` even with the review prose omitted whole: action-owned content is too large; refusing to publish`,
+      );
+    }
+    return omitted;
+  }
+  const truncated = `${prefix}\n${fitted.text}\n${tailBlock}${tailSeparator}${PROSE_TRUNCATED_NOTE_PREFIX}${fitted.dropped}${PROSE_TRUNCATED_NOTE_SUFFIX}\n`;
+  // #1557: belt-and-braces on the note-reserve invariant above — the note
+  // reserve is sized worst-case, so this body fits whenever the budget math
+  // holds; a violation means a sizing regression and must be loud.
+  if (Buffer.byteLength(truncated, "utf8") > MAX_PUBLISHED_BODY_BYTES) {
+    throw new PublishedBodyCeilingError(
+      `published body exceeds the forge comment ceiling (${MAX_PUBLISHED_BODY_BYTES} UTF-8 bytes)`
+        + ` after trimming the review prose: the disclosure note reserve no longer bounds the note; refusing to publish`,
+    );
+  }
+  return truncated;
+}
+
+/** #1003: the three literal triage decisions live with the other publish-layer
+ * triage constants in outputs.js, so the published body and the step summary
+ * validate against one set. */
+
+const REVIEW_TRIAGE_LABELS: Record<string, string> = {
+  not_required: "no specialized human review required",
+  required: "specialized human review required",
+  unknown: "unknown — the reviewer could not determine this",
+};
+
+/**
+ * #1003: the compact human-review triage section. Action-owned prose (never
+ * model text), rendered only when triage ran, and it carries the reason for
+ * ALL three decisions — `unknown` in particular must be visible rather than
+ * read as "nothing to do". The reason is model-authored, so it takes the same
+ * discipline as every other untrusted string on this surface: redaction,
+ * link sanitization, whitespace flattening, a length cap and pipe escaping,
+ * none of which can break out of the blockquote line.
+ *
+ * #1269: the triage reason never carries an action-owned cap note, so the
+ * confidence module's reveal strip runs UNCONDITIONALLY after this cut — a
+ * published reason never ends in a model-authored `[deterministic cap: …]`
+ * look-alike, whether it sat at the trailing edge already or the cut dragged
+ * an interior one (complete, or truncated into an unterminated fragment)
+ * onto it. The decision is re-resolved against the STRIPPED reason, so a
+ * `not_required` whose only substantiation was a look-alike fails closed to
+ * `unknown` on this surface too.
+ */
+export function renderReviewTriageBlock(
+  triage: { decision: string; reason: string },
+  linkMode: UpstreamLinkMode,
+): string {
+  const stripped = stripRevealedCapNoteTails(
+    sanitizeMarkdown(redactText(String(triage.reason ?? "")), linkMode).replace(/\s+/g, " ").trim().slice(0, MAX_REVIEW_TRIAGE_REASON_CHARS),
+  );
+  const decision = resolveReviewTriageDecision(triage.decision, stripped);
+  const reason = escapeTableCell(stripped);
+  const label = REVIEW_TRIAGE_LABELS[decision]!;
+  const line = reason === ""
+    ? `> **Human review triage: ${label}**`
+    : `> **Human review triage: ${label}** — ${reason}`;
+  const lines = [
+    "## Human Review Triage",
+    "",
+    line,
+    ">",
+    "_Advisory only: this triage answer does not change the review's verdict or findings, and it requests no reviewer._",
+  ];
+  return lines.join("\n");
+}
+
+/** #1005: labels for the reviewer-routing statuses that render a section.
+ * `off`/`not_required`/`no_targets` render nothing (there is nothing to
+ * report), so a common triage-enabled run's published body stays compact. */
+const REVIEW_ROUTING_LABELS: Record<string, string> = {
+  invalid: "invalid selection — no reviewer requested",
+  advisory: "advisory — no reviewer requested",
+  requested: "configured reviewers requested",
+  request_failed: "reviewer request failed",
+  fork_blocked: "blocked on a fork pull request — no reviewer requested",
+};
+
+/** A single-line code span for a trusted-config value; no `@` so an advisory
+ * block never pings a reviewer that was not actually requested. */
+function routingCodeSpan(value: string, maxChars: number): string {
+  return escapeCodeSpan(value, maxChars);
+}
+
+/**
+ * #1005: the compact reviewer-routing section. Every value is action-owned
+ * (the status label) or trusted base-ref configuration (the logical target ids
+ * and the concrete reviewers) — model text never appears here, and the model
+ * cannot name a concrete identity. Rendered only for statuses that carry a
+ * decision (invalid/advisory/requested/request_failed/fork_blocked).
+ */
+export function renderReviewRoutingBlock(routing: HumanReviewRoutingPlan): string {
+  const label = REVIEW_ROUTING_LABELS[routing.status];
+  if (label === undefined) return "";
+  const targets = routing.targetIds.map((id) => routingCodeSpan(id, 120)).join(", ");
+  const reviewers: string[] = [
+    ...routing.users.map((user) => routingCodeSpan(user, 60)),
+    ...routing.teams.map((team) => routingCodeSpan(`team:${team}`, 120)),
+  ];
+  const lines = ["## Reviewer Routing", "", `> **Reviewer routing: ${label}**`];
+  if (targets !== "") {
+    lines.push(">", `> Configured target(s): ${targets}`);
+  }
+  if (reviewers.length > 0) {
+    lines.push(">", `> Reviewer(s): ${reviewers.join(", ")}`);
+  }
+  lines.push(">", "_Advisory: reviewer routing never changes the review's verdict or findings, and concrete reviewers come only from trusted repository configuration._");
+  return lines.join("\n");
+}
+
+/** #1073: labels for the confidence verifier's outcome. `disabled` never
+ * reaches this renderer (absent input = disabled = no section). */
+const CONFIDENCE_STATUS_LABELS: Record<string, string> = {
+  scored: "scored",
+  unscored: "unscored — the verifier did not produce a usable result",
+};
+
+/**
+ * #1073: the compact independent-confidence section. Rendered only when the
+ * verifier ran. The score/risk/status values are closed-vocabulary or
+ * validated integers; the reason and the concern bullets carry
+ * model-authored text, so every one takes the full untrusted-text
+ * discipline (redaction, link neutralization, whitespace flattening, a
+ * length cap, fence-safe code spans for locations). Purely advisory: the
+ * section states so itself, and nothing downstream reads it as a finding.
+ */
+export function renderIndependentConfidenceBlock(
+  confidence: {
+    status: string;
+    score: string;
+    risk: string;
+    reason: string;
+    model: string;
+    concerns?: Array<{ file: string; line: number | null; evidence: string; type?: string; severity?: string }>;
+  },
+  linkMode: UpstreamLinkMode,
+): string {
+  const status = CONFIDENCE_STATUS_LABELS[confidence.status];
+  if (status === undefined) return "";
+  const scored = confidence.status === "scored" && /^[0-5]$/.test(confidence.score);
+  const head = scored
+    ? `**Independent confidence: ${confidence.score}/5, risk: ${escapeCodeSpan(confidence.risk || "unknown", 40)}**`
+    : `**Independent confidence: ${status}**`;
+  const modelNote = confidence.model !== "" ? ` (model: ${escapeCodeSpan(confidence.model, 120)})` : "";
+  const lines = ["## Independent Confidence", "", `> ${head}${modelNote}`];
+  const reason = escapeTableCell(
+    publishedConfidenceReason(sanitizeMarkdown(redactText(String(confidence.reason ?? "")), linkMode)),
+  );
+  if (reason !== "") {
+    lines.push(">", `> ${reason}`);
+  }
+  // Advisory concern bullets: explicitly NOT findings — bounded, sanitized,
+  // locations rendered as inert code spans, and the bullet text says so.
+  for (const concern of (confidence.concerns ?? []).slice(0, 8)) {
+    const file = escapeTableCell(
+      sanitizeMarkdown(redactText(escapeCodeSpan(String(concern.file ?? ""), 300)), linkMode),
+    );
+    const line = typeof concern.line === "number" && Number.isInteger(concern.line) && concern.line >= 0
+      ? `:${concern.line}`
+      : "";
+    // #1369: `type`/`severity` are closed-vocabulary audit tokens. They are
+    // rendered as plain words ONLY when they match the enum exactly — any
+    // other value (e.g. from the env round-trip) renders nothing, so free
+    // text can never ride the closed vocabulary into the comment.
+    const concernType = concern.type === "missed_issue" || concern.type === "unsupported_finding"
+      ? concern.type
+      : "";
+    const concernSeverity = concern.severity === "blocker" || concern.severity === "major"
+      ? concern.severity
+      : "";
+    const kind = [concernType, concernSeverity].filter((value) => value !== "").join(", ");
+    // #1230: the concern evidence NEVER carries an action-owned note — only
+    // the confidence REASON does — so a note-shaped span at its trailing edge
+    // is always model-authored. The strip is therefore UNCONDITIONAL (unlike
+    // the reason's `publishedConfidenceReason`, which must keep a
+    // reason-fitted action-owned note): the same reveal strip the confidence
+    // module uses (#1166), applied AFTER the cut so a look-alike the cut
+    // reveals — complete, or truncated into an unterminated fragment — cannot
+    // survive at the published trailing edge.
+    const evidence = escapeTableCell(
+      stripRevealedCapNoteTails(
+        sanitizeMarkdown(redactText(String(concern.evidence ?? "")), linkMode).replace(/\s+/g, " ").trim().slice(0, MAX_REVIEW_TRIAGE_REASON_CHARS),
+      ),
+    );
+    const location = file !== "" || line !== "" ? `${file}${line}` : "";
+    const body = evidence !== "" ? ` — ${evidence}` : "";
+    lines.push(">", `> - Advisory concern${kind !== "" ? ` (${kind})` : ""}${location !== "" ? ` at ${location}` : ""}${body}`);
+  }
+  lines.push(">", "_Advisory only: this independent merge-safety verifier audits the completed review against the pull-request diff — it is telemetry from a second model call; it does not change the review's verdict, findings, or approval, and its concerns are not findings._");
+  return lines.join("\n");
+}
+
+/**
+ * #588: the platform's native-review degradation reason, flattened to one
+ * bounded line. It is rendered inside a blockquote notice and inside a step
+ * message, so a reason carrying a newline (or an unbounded length) could
+ * break out of the notice or flood the log. A platform-owned constant today;
+ * this keeps a future one from becoming a rendering hole.
+ */
+function flattenSurfaceReason(reason: string | undefined): string {
+  const flat = (reason ?? "").replace(/\s+/g, " ").trim();
+  if (flat === "") return "this platform has no native pull-review surface";
+  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat;
+}
+
+/**
+ * Render the #810 partial-coverage notice: a short, deterministic section
+ * stating which changed files and specialist leads the tool loop never read
+ * or resolved before it stopped short (a budget or a provider request error,
+ * #1338). Full presentation is #811's; this only makes the gap impossible to
+ * miss (and impossible for a partial-coverage review to pass as a plain
+ * clean approve).
+ */
+export function renderPartialCoverageNotice(coverage: PartialCoverage): string {
+  const lines = [
+    "## Partial Coverage Notice",
+    "",
+    `> **This review is incomplete.** The evidence-gathering tool loop stopped early ` +
+      `(\`${escapeCodeSpan(coverage.stop_reason, 80)}\`) before finishing.`,
+  ];
+  if (coverage.unread_files.length > 0) {
+    const listed = coverage.unread_files.slice(0, COVERAGE_NOTICE_MAX_ITEMS);
+    const more = coverage.unread_files.length - listed.length;
+    lines.push(
+      `> Changed files never read (${coverage.unread_files.length} of ` +
+        `${coverage.changed_files_total}): ` +
+        listed.map((path) => `\`${escapeCodeSpan(path, 200)}\``).join(", ") +
+        (more > 0 ? `, … and ${more} more` : ""),
+    );
+  }
+  if (coverage.unresolved_leads.length > 0) {
+    const listed = coverage.unresolved_leads.slice(0, COVERAGE_NOTICE_MAX_ITEMS);
+    const more = coverage.unresolved_leads.length - listed.length;
+    const items = listed.map((lead) =>
+      `\`${escapeCodeSpan(lead.role, 60)}\`` +
+      (lead.file ? ` (\`${escapeCodeSpan(lead.file, 200)}\`)` : " (no file path)") +
+      (lead.excerpt ? `: ${escapeCodeSpan(lead.excerpt, 120)}` : ""),
+    );
+    lines.push(
+      `> Specialist leads never resolved (${coverage.unresolved_leads.length} of ` +
+        `${coverage.leads_total}): ` +
+        items.join("; ") +
+        (more > 0 ? `; … and ${more} more` : ""),
+    );
+  }
+  lines.push("> Absence of findings in the unread paths is not evidence they are safe.");
+  return lines.join("\n");
+}
+
+/** Build inline review comments from structured findings against the diff.
+ * `max` is clamped to at least 1 here (v2 clamps in main()); this is the one
+ * clamp site so it cannot drift from `parseInlineFindingsMax`. #762:
+ * `rejectedPrescriptions` holds the digests of already-rejected prescriptions
+ * and drops only the replacement block of a matching finding (the finding
+ * itself always posts); `suppressed` counts how many were dropped. #1518:
+ * `published` carries the replacements this build published, keyed by the
+ * finding's identity digest, so the published handoff can carry exactly
+ * those replacements. */
+export function buildInlineComments(options: {
+  findings: unknown;
+  diffText: string;
+  max: number;
+  forgejoPositions: boolean;
+  linkMode: UpstreamLinkMode;
+  rejectedPrescriptions?: ReadonlySet<string>;
+}): { comments: NativeReviewComment[]; suppressed: number; published: Map<string, string> } {
+  const { comments, suppressed, published } = buildComments(options.findings, options.diffText, Math.max(1, options.max), {
+    forgejoPositions: options.forgejoPositions,
+    linkMode: options.linkMode,
+    ...(options.rejectedPrescriptions === undefined ? {} : { rejectedPrescriptions: options.rejectedPrescriptions }),
+  });
+  return { comments: comments as NativeReviewComment[], suppressed, published };
+}
+
+/** #762: the bound on the distinct reaction logins this run will verify. Each
+ * login costs one collaborator request and the logins arrive from untrusted
+ * reaction data, so the count is capped: past the cap this run verifies nobody
+ * and trusts no rejection (fail-open) instead of letting drive-by reactors
+ * drive the run's own request budget. */
+export const FEEDBACK_ACTOR_CAP = 20;
+
+/** #762: the trusted-actor bar for a 👎 suppression — the same bar the
+ * comment-command re-review applies (#914, `src/precheck/decide.ts:170-184`),
+ * duplicated rather than imported so the publish seam takes no dependency on
+ * the precheck policy module: the repository permission levels that authorize
+ * triage-or-higher, plus the un-collapsed `role_name` that is the only proof
+ * when a forge collapses GitHub `triage`/`maintain` into `permission: "read"`.
+ * Everything else — `read`, `none`, and any unrecognized value — fails
+ * closed. */
+const FEEDBACK_AUTHORIZED_PERMISSIONS: ReadonlySet<string> = new Set([
+  "admin",
+  "maintain",
+  "write",
+  "triage",
+  "owner",
+]);
+
+/** #762: `role_name` values that prove triage-or-higher behind a collapsed
+ * `read` permission. Custom roles are deliberately not authorized — an
+ * unrecognizable role cannot prove the bar. */
+const FEEDBACK_AUTHORIZED_ROLE_NAMES: ReadonlySet<string> = new Set([
+  "triage",
+  "triage_plus",
+]);
+
+/** #762: the fail-closed authorization decision for one reaction actor. A
+ * null reading (lookup error, non-200, no usable permission), an unusable or
+ * mismatched response subject, and any permission below the bar are all "not
+ * trusted" — an untrusted reaction stays telemetry. */
+function feedbackActorAuthorized(reading: CollaboratorPermissionReading | null, login: string): boolean {
+  if (reading === null) return false;
+  if (reading.subject === "unusable") return false;
+  if (reading.subject === "named" && reading.subjectLogin !== login.toLowerCase()) return false;
+  if (FEEDBACK_AUTHORIZED_PERMISSIONS.has(reading.permission)) return true;
+  return reading.permission === "read" && FEEDBACK_AUTHORIZED_ROLE_NAMES.has(reading.roleName);
+}
+
+interface RejectionSnapshot {
+  /** Digests of the prescriptions a trusted actor has rejected (directly, or
+   * through a carry marker this action itself published). */
+  keys: ReadonlySet<string>;
+  /** How many prior comments carrying a recoverable prescription were read. */
+  inspected: number;
+  /** How many distinct actors reacted with a negative reaction. */
+  logins: number;
+  /** How many of those actors passed the trusted-actor gate. */
+  trusted: number;
+  /** How many distinct actors exceeded the verification cap and were therefore
+   * never looked up. */
+  overCap: number;
+  /** How many rejection digests were inherited from carry markers this
+   * action's own prior comments published, rather than from live reactions. */
+  carried: number;
+}
+
+/** #1027: one prior published finding observation harvested by the shared
+ * feedback read — the identity from the action-owned marker, reaction
+ * tallies from the same records the suppression gate already reads, and
+ * thread resolution from the bounded state read. Reactions stay
+ * informational telemetry: they authorize nothing and resolve nothing. */
+interface OutcomeObservation {
+  findingId: string;
+  commentId: string;
+  resolved: boolean | null;
+  reactions: { helpful: number; notHelpful: number };
+}
+
+/** #1027: what the shared read returns — the #762 suppression snapshot and,
+ * opportunistically from the very same enumeration and records, the #1027
+ * observations. `enumerated` distinguishes a completed enumeration (a
+ * provably empty or populated prior) from a read that never got there: the
+ * outcome ledger is only derived from provable prior state, never from an
+ * unprovable one (a failed read would mislabel every repeat as a first
+ * report). `priorHeadSha` is the head the prior published review was made
+ * against, read from its metadata marker. */
+interface FeedbackRead {
+  snapshot: RejectionSnapshot;
+  observations: OutcomeObservation[];
+  enumerated: boolean;
+  priorHeadSha: string | null;
+}
+
+/** #1116: one trusted-owner resolution per publish run, shared by every
+ * consumer that needs to prove an ownership identity in it.
+ *
+ * Three reads in a single publish run each need that proof — the #762
+ * carry-marker read, the #1027 finding-identity read (and the prior-head read
+ * it feeds), and the #1093 cleanup retirement path. Resolving per read meant
+ * up to three identity proofs per run, and on a Forgejo deployment whose
+ * token has no `/user` scope — the exact configuration #1093 exists to serve
+ * — every proof ends in `reactionSelfAttestation()`, which POSTs an `eyes`
+ * reaction on the PR issue and best-effort DELETEs it: three probes per run
+ * is three notification/webhook cycles on a watched PR, and a probe that
+ * fails on its way out leaves a visible 👀 behind.
+ *
+ * The memo caches the in-flight PROMISE, not the settled value, so consumers
+ * single-flight onto one proof (`resolvePublishTrustedOwner` never rejects,
+ * but caching the promise keeps the property if that ever changes).
+ * Resolution stays LAZY — no consumer calls the resolver until it has
+ * something to authorize, so sharing must not add a probe where there was
+ * none — and fail-closed: a `null` owner authorizes nothing at any consumer,
+ * each consumer still emits its own bounded `identity reason:` WARN, and the
+ * per-item ownership re-checks still run independently (only the identity
+ * PROOF is shared). Scope is one publish run in one process; nothing is
+ * cached across the precheck/publish boundary — those are separate processes
+ * holding independent proofs. */
+type RunTrustedOwnerResolver = () => Promise<Awaited<ReturnType<typeof resolvePublishTrustedOwner>>>;
+
+function createRunTrustedOwnerResolver(api: PublishPlatformApi): RunTrustedOwnerResolver {
+  let pending: Promise<Awaited<ReturnType<typeof resolvePublishTrustedOwner>>> | undefined;
+  return () => {
+    pending ??= resolvePublishTrustedOwner(api);
+    return pending;
+  };
+}
+
+/** #762: read the usefulness feedback for the prescriptions a previous run
+ * published, and turn trusted 👎 into the keys of the prescriptions they
+ * reject.
+ *
+ * The whole read is FAIL-OPEN: any thrown error, an unsupported forge, an
+ * incomplete enumeration, or an incomplete reaction read contributes no
+ * reaction-derived key, i.e. exactly today's behavior (every prescription is
+ * posted). The bot-self exclusion, however, is REQUIRED PROOF: if the
+ * authenticated identity cannot be resolved (absent seam, thrown read, or a
+ * non-login result), no reaction can be distinguished from the bot's own, so
+ * nobody is authorized from reactions — a fail-open read with fail-closed
+ * trust. Nothing here can skip, resolve, retire, or de-duplicate a finding,
+ * and nothing can change the verdict. Reaction logins and comment bodies are
+ * never returned, rendered, or logged — only counts are.
+ *
+ * DURABLE CARRY (review round on #1101): the reaction lives on the comment
+ * cleanup retires, so a rejection read from reactions alone lasts exactly one
+ * re-review. The prior run therefore embeds the SHA-256 digest of each
+ * suppressed prescription key in a hidden HTML carry marker on the
+ * replacement comment it publishes. A carry marker is trusted only with
+ * provenance: a top-level comment of a marker-managed review whose author
+ * matches the trusted owner identity the retirement path itself proves —
+ * never a body from an actor this run cannot authenticate. Its effect remains
+ * withhold-only: digest matching can drop a replacement block and nothing
+ * else. The marker grammar is reserved against model-authored content (the
+ * carry line is stripped from every assembled finding body and listed among
+ * the reserved publication markers), so a rejection can only ever originate
+ * from a trusted 👎 this action itself observed. */
+async function readFeedbackState(
+  api: PublishPlatformApi,
+  marker: string,
+  /** #762: false when no current finding could post a prescription — the
+   * reaction read (and its permission requests) is skipped entirely, exactly
+   * as the pre-#1027 gate did; only the outcome enumeration runs. */
+  readReactions: boolean,
+  /** #1116: the run's single shared trusted-owner resolution — this read must
+   * not re-prove what an earlier consumer (or cleanup) already proved. */
+  trustedOwnerForRun: RunTrustedOwnerResolver,
+): Promise<FeedbackRead> {
+  const noneSnapshot: RejectionSnapshot = { keys: new Set<string>(), inspected: 0, logins: 0, trusted: 0, overCap: 0, carried: 0 };
+  const none: FeedbackRead = { snapshot: noneSnapshot, observations: [], enumerated: false, priorHeadSha: null };
+  // #1027/#762: the enumeration (and therefore the outcome observations) is
+  // forge-agnostic; only the reaction read and its permission verification
+  // need both seams. A forge without the collaborator-permission read still
+  // gets outcome observations — with zeroed tallies, since reactions are
+  // informational telemetry and are never fetched for outcomes alone.
+  const canVerifyReactions = typeof api.reviewCommentFeedback === "function" && typeof api.collaboratorPermission === "function";
+  readReactions = readReactions && canVerifyReactions;
+  try {
+    const reviews = await api.listReviews();
+    // Same managed-review derivation the cleanup path uses (marker-prefixed
+    // bodies, never author matching).
+    const reviewIds = selectManagedReviews(reviews, marker, []).map((review) => review.id);
+    // #1027: an enumeration that COMPLETED and proves no managed review of
+    // ours exists is a positive reading of the prior set — provably empty —
+    // not an uncertain one. Only a thrown read or an
+    // unsupported/incomplete inline-comment enumeration is
+    // `enumerated: false`. The first-ever publication on a repository must
+    // still derive its `reported` events and write the artifact; treating
+    // "no prior" as "no proof" made the whole contract invisible exactly
+    // where it has the least prior state to reason about.
+    if (reviewIds.length === 0) return { snapshot: noneSnapshot, observations: [], enumerated: true, priorHeadSha: null };
+    const listed = await api.listManagedInlineComments(reviewIds);
+    if (!listed.supported || !listed.complete) return none;
+    const candidates: Array<{ id: string; key: string | null; identity: string | null; path: string | null; user: { id?: number | string; login?: string } | null }> = [];
+    const carried = new Set<string>();
+    // The carry-marker authority is the run's single shared trusted-owner
+    // resolution (#1116), asked lazily and only because some comment actually
+    // carries a marker to authenticate.
+    let carryOwner: Awaited<ReturnType<typeof resolvePublishTrustedOwner>>["owner"] | undefined;
+    for (const comment of listed.comments) {
+      const id = String(comment.id ?? "");
+      if (!/^[1-9]\d*$/.test(id)) continue;
+      // A reply inherits its parent review's id, so only a TOP-LEVEL comment
+      // of ours can carry the prescription region this action published — and
+      // equally, only a top-level comment can carry its rejection marker.
+      if (comment.in_reply_to_id != null || comment.inReplyToId != null) continue;
+      const body = typeof comment.body === "string" ? comment.body : "";
+      // Same own-comment shape proof the prescription recovery demands: the
+      // disclaimer trailer must be present before any line is read as state.
+      const disclaimed = body.includes(INLINE_DISCLAIMER);
+      const digests = disclaimed ? parseRejectionCarryover(body) : [];
+      // #1027: the finding identity marker is action-owned state on the same
+      // comment — but like the carry marker it counts only with PROVENANCE:
+      // a body any repo reader could have authored must not mint outcome
+      // identities, so the observation keeps the same trusted-owner bar the
+      // carry marker applies (#1116: one resolution shared by the whole
+      // publish run, however many consumers need it).
+      const identity = disclaimed ? parseFindingIdentityMarker(body) : null;
+      if (digests.length > 0) {
+        if (carryOwner === undefined) carryOwner = (await trustedOwnerForRun()).owner;
+        // Provenance, not body text: the marker counts only on a comment
+        // this run can prove its own identity published. Unprovable author,
+        // unprovable identity — the marker carries nothing.
+        if (carryOwner !== null && ownerMatchesIdentity(comment.user ?? null, carryOwner)) {
+          for (const digest of digests) {
+            if (carried.size >= MAX_CARRYOVER_KEYS_PER_RUN) break;
+            carried.add(digest);
+          }
+        }
+      }
+      const path = comment.path;
+      // A published range is reported with its END as `line` and its start as
+      // `start_line`: reconstruct the exact range the key describes, and skip
+      // the comment rather than guess when any part of it is unusable.
+      const end = comment.line;
+      let key: string | null = null;
+      let keyedPath: string | null = null;
+      if (typeof path === "string" && path !== "" && typeof end === "number" && Number.isInteger(end) && end > 0) {
+        const start = comment.start_line ?? end;
+        if (Number.isInteger(start) && start > 0 && start <= end) {
+          // Only our own previously published suggestion region is parsed; an
+          // unrecoverable one simply carries no prior prescription.
+          const replacement = recoverPublishedSuggestion(body);
+          if (replacement !== null) {
+            key = prescriptionKeyDigest(prescriptionKey(path, start, end, replacement));
+            keyedPath = path;
+          }
+        }
+      }
+      // #1027: an identity-bearing comment is an outcome observation even
+      // when its prescription is unrecoverable (a suppressed replacement, or
+      // a finding published without one).
+      if (key === null && identity === null) continue;
+      candidates.push({ id, key, identity, path: keyedPath, user: comment.user ?? null });
+    }
+    if (candidates.length === 0) {
+      // Carry-only survival: the reacted-to comment was retired and only a
+      // replacement comment's marker remains — no reaction request is needed.
+      // #1027: a completed enumeration with no candidates is a provably
+      // empty prior, so the outcome ledger may still derive from it.
+      if (carried.size === 0) {
+        return { snapshot: noneSnapshot, observations: [], enumerated: true, priorHeadSha: null };
+      }
+      return { snapshot: { keys: new Set(carried), inspected: 0, logins: 0, trusted: 0, overCap: 0, carried: carried.size }, observations: [], enumerated: true, priorHeadSha: null };
+    }
+    // Newest first, so the bounded reads cover the comments most likely to
+    // still be on screen.
+    candidates.sort((a, b) => (a.id === b.id ? 0 : BigInt(a.id) > BigInt(b.id) ? -1 : 1));
+    // #1027: the prescription and observation candidate sets are bounded
+    // INDEPENDENTLY, so a flood of one kind can never displace the other
+    // from its window.
+    const bounded = candidates.filter((candidate) => candidate.identity !== null).slice(0, MAX_FEEDBACK_COMMENT_IDS);
+    const prescriptionCandidates = candidates
+      .filter((candidate) => candidate.key !== null)
+      .slice(0, MAX_FEEDBACK_COMMENT_IDS);
+    // #1027: reactions are read ONLY when the suppression gate needs them —
+    // the outcome tallies are a passive byproduct of the same records, never
+    // an independent request.
+    if (prescriptionCandidates.length === 0 || !readReactions) {
+      const snapshot: RejectionSnapshot = carried.size === 0
+        ? noneSnapshot
+        : { keys: new Set(carried), inspected: 0, logins: 0, trusted: 0, overCap: 0, carried: carried.size };
+      const outcomeRead = await collectOutcomeObservations(api, reviewIds, marker, bounded, new Map(), trustedOwnerForRun);
+      return { snapshot, observations: outcomeRead.observations, enumerated: true, priorHeadSha: outcomeRead.priorHeadSha };
+    }
+    const feedback = await api.reviewCommentFeedback!(prescriptionCandidates.map((candidate) => candidate.id));
+    if (!feedback.supported || !feedback.complete) {
+      const snapshot = carried.size === 0
+        ? noneSnapshot
+        : { keys: new Set(carried), inspected: 0, logins: 0, trusted: 0, overCap: 0, carried: carried.size };
+      // #1027: the reaction read failed, but the thread-state read is a
+      // different seam and the observations themselves (identity + resolution)
+      // came from the enumeration above — keep them, with zeroed tallies.
+      const outcomeRead = await collectOutcomeObservations(api, reviewIds, marker, bounded, new Map(), trustedOwnerForRun);
+      return { snapshot, observations: outcomeRead.observations, enumerated: true, priorHeadSha: outcomeRead.priorHeadSha };
+    }
+    const rejections = feedback.records.filter((record) => record.content === "-1");
+    const distinct = [...new Set(rejections.map((record) => record.login))].filter((login) => login !== "");
+    // Untrusted reaction data must never control the request budget: past the
+    // cap, verify nobody and trust no rejection (carried digests need no
+    // lookup and keep standing).
+    if (distinct.length > FEEDBACK_ACTOR_CAP) {
+      const outcomeRead = await collectOutcomeObservations(api, reviewIds, marker, bounded, tallyReactions(feedback.records), trustedOwnerForRun);
+      return {
+        snapshot: { keys: new Set(carried), inspected: prescriptionCandidates.length, logins: distinct.length, trusted: 0, overCap: distinct.length, carried: carried.size },
+        observations: outcomeRead.observations,
+        enumerated: true,
+        priorHeadSha: outcomeRead.priorHeadSha,
+      };
+    }
+    const keys = new Set(carried);
+    let trusted = 0;
+    let self: string | null = null;
+    let selfResolved = false;
+    for (const login of distinct) {
+      if (!selfResolved) {
+        selfResolved = true;
+        // Resolved at most once, and only because there is at least one
+        // distinct reacting login to authorize. An absent seam, a thrown
+        // read, or a non-login result makes the bot-self exclusion
+        // unprovable, so nobody is authorized from reactions.
+        try {
+          const identity = typeof api.authenticatedIdentity === "function"
+            ? await api.authenticatedIdentity()
+            : null;
+          self = typeof identity === "string" && identity.trim() !== "" ? identity : null;
+        } catch { self = null; }
+        if (self === null) {
+          const outcomeRead = await collectOutcomeObservations(api, reviewIds, marker, bounded, tallyReactions(feedback.records), trustedOwnerForRun);
+          return {
+            snapshot: { keys: new Set(carried), inspected: prescriptionCandidates.length, logins: distinct.length, trusted: 0, overCap: 0, carried: carried.size },
+            observations: outcomeRead.observations,
+            enumerated: true,
+            priorHeadSha: outcomeRead.priorHeadSha,
+          };
+        }
+      }
+      // The bot's own reaction is never a rejection signal — it is the
+      // publisher of the prescription, not a reviewer of it.
+      if (self !== null && self.trim().toLowerCase() === login.toLowerCase()) continue;
+      let reading: CollaboratorPermissionReading | null;
+      try { reading = await api.collaboratorPermission!(login); }
+      catch { reading = null; }
+      if (!feedbackActorAuthorized(reading, login)) continue;
+      trusted += 1;
+      for (const record of rejections) {
+        if (record.login !== login) continue;
+        const prior = prescriptionCandidates.find((candidate) => candidate.id === record.commentId);
+        if (prior !== undefined && prior.key !== null) keys.add(prior.key);
+      }
+    }
+    const outcomeRead = await collectOutcomeObservations(api, reviewIds, marker, bounded, tallyReactions(feedback.records), trustedOwnerForRun);
+    return {
+      snapshot: { keys, inspected: prescriptionCandidates.length, logins: distinct.length, trusted, overCap: 0, carried: carried.size },
+      observations: outcomeRead.observations,
+      enumerated: true,
+      priorHeadSha: outcomeRead.priorHeadSha,
+    };
+  } catch {
+    return none;
+  }
+}
+
+/** #1027: tally one comment's 👍/👎 counts from the reaction records the
+ * suppression read already fetched. All actors count — drive-by reactions
+ * stay informational telemetry, and no login ever leaves this module. */
+function tallyReactions(records: readonly { commentId: string; content: "+1" | "-1"; login: string }[]): Map<string, { helpful: number; notHelpful: number }> {
+  const tallies = new Map<string, { helpful: number; notHelpful: number }>();
+  for (const record of records) {
+    const tally = tallies.get(record.commentId) ?? { helpful: 0, notHelpful: 0 };
+    if (record.content === "+1") tally.helpful += 1;
+    else tally.notHelpful += 1;
+    tallies.set(record.commentId, tally);
+  }
+  return tallies;
+}
+
+/** #1027: assemble the outcome observations from the enumerated comments and
+ * the bounded thread-state read, plus the prior published head used to
+ * classify a resolved thread.
+ *
+ * Two provenance rules keep a hostile body from minting outcome state:
+ * - An identity marker counts only on a comment whose author matches the
+ *   trusted owner identity the run proved (#1116: the run's single shared
+ *   resolution, asked lazily through `trustedOwnerForRun` and only because
+ *   some comment actually carries an identity to authenticate) — the same
+ *   bar the rejection carry marker applies, because `selectManagedReviews`
+ *   matches by body prefix and any repo reader can post a marker-shaped
+ *   comment.
+ * - The prior head comes only from an OWNED managed sticky comment's metadata
+ *   marker (action-owned state, proven by the same trusted owner), never from
+ *   forge-supplied review metadata.
+ *
+ * The thread-state query and the sticky read are the new requests this
+ * feature adds, both made only when identity-bearing observations survive
+ * the provenance bar, and both degrade to "unprovable" (no resolution claim,
+ * no head-advanced claim) rather than to a failed publish. */
+async function collectOutcomeObservations(
+  api: PublishPlatformApi,
+  reviewIds: readonly string[],
+  marker: string,
+  bounded: readonly { id: string; identity: string | null; path: string | null; user: { id?: number | string; login?: string } | null }[],
+  tallies: ReadonlyMap<string, { helpful: number; notHelpful: number }>,
+  /** #1116: the run's single shared trusted-owner resolution. */
+  trustedOwnerForRun: RunTrustedOwnerResolver,
+): Promise<{ observations: OutcomeObservation[]; priorHeadSha: string | null }> {
+  const observations: OutcomeObservation[] = [];
+  // The trusted-owner authority is the run's shared resolution (#1116), asked
+  // lazily and only because some comment actually carries an identity to
+  // authenticate.
+  let trustedOwner: Awaited<ReturnType<typeof resolvePublishTrustedOwner>>["owner"] | undefined;
+  for (const candidate of bounded) {
+    if (candidate.identity === null) continue;
+    if (trustedOwner === undefined) trustedOwner = (await trustedOwnerForRun()).owner;
+    // Unprovable author, unprovable identity — the comment carries nothing.
+    if (trustedOwner === null || !ownerMatchesIdentity(candidate.user, trustedOwner)) continue;
+    observations.push({
+      findingId: candidate.identity,
+      commentId: candidate.id,
+      resolved: null,
+      reactions: tallies.get(candidate.id) ?? { helpful: 0, notHelpful: 0 },
+    });
+  }
+  if (observations.length === 0) return { observations, priorHeadSha: null };
+  const priorHeadSha = await readPriorPublishedHead(api, marker, trustedOwner ?? null);
+  if (typeof api.reviewThreadStates !== "function") return { observations, priorHeadSha };
+  try {
+    const states = await api.reviewThreadStates(reviewIds);
+    if (states.supported && states.complete) {
+      const resolvedByComment = new Map(states.threads.map((thread) => [thread.firstCommentId, thread.resolved]));
+      for (const observation of observations) {
+        observation.resolved = resolvedByComment.get(observation.commentId) ?? null;
+      }
+    }
+  } catch {
+    // Thread state unprovable: leave every `resolved` null — the reconcile
+    // layer emits no resolution claim for an unprovable state.
+  }
+  return { observations, priorHeadSha };
+}
+
+/** #1027: the head sha of the prior published review, read from the managed
+ * sticky comment's metadata marker (the same marker the precheck reads).
+ *
+ * Provenance, not body text: a marker-shaped sticky comment is visible to
+ * every reader of the repository, so the head counts ONLY on a comment the
+ * trusted owner identity (already resolved once by the caller) proves this
+ * action authored. Without that bar a foreign contributor could forge a
+ * `head_sha` and turn a head-unverified `dismissed` into a `resolved`.
+ *
+ * Selection is the same policy the sticky upsert uses to find the live
+ * publication (`upsertStickyComment` in `src/platform/publish-api.ts`): among
+ * comments this owner proved it authored, the NEWEST one is the authoritative
+ * publication and an older one — a legacy-marker comment, or one left behind
+ * by a marker change — is history, not a competing candidate. (Requiring
+ * global agreement instead would silently degrade every resolved thread to
+ * `thread_resolved_head_unverified` on any repository that still carries an
+ * older owned sticky.) A missing marker, an unparseable body, a non-hex value,
+ * an unprovable owner, or a thrown read all yield null, and an unusable head on
+ * the newest owned candidate never falls back to an older one.
+ *
+ * #1027: the enumeration must be PROVEN complete. "Newest owned sticky" is a
+ * claim about absence — it says no newer publication exists — so a page that
+ * failed or truncated silently is indistinguishable from a complete list and
+ * would let the reader select an OLDER owned sticky and claim a `resolved`
+ * "the head advanced" for a finding never re-reviewed on a newer head. A read
+ * through `listIssueCommentsResult` that is absent, throws, is incomplete, or
+ * is malformed therefore yields no head at all (never a fallback to the
+ * untyped `listIssueComments`). */
+async function readPriorPublishedHead(
+  api: PublishPlatformApi,
+  marker: string,
+  owner: TrustedOwnerIdentity | null,
+): Promise<string | null> {
+  if (owner === null) return null;
+  try {
+    if (typeof api.listIssueCommentsResult !== "function") return null;
+    const enumeration = await api.listIssueCommentsResult();
+    if (enumeration === null || typeof enumeration !== "object" || enumeration.complete !== true) return null;
+    const comments = enumeration.comments;
+    if (!Array.isArray(comments)) return null;
+    let newest: { updatedAt: string; id: string; body: string } | null = null;
+    for (const comment of comments) {
+      if (!ownerMatchesIdentity(comment.user, owner)) continue;
+      const body = typeof comment.body === "string" ? comment.body : "";
+      if (!isManagedBody(body, marker)) continue;
+      const updatedAt = typeof comment.updated_at === "string" ? comment.updated_at : "";
+      const id = String(comment.id ?? "");
+      if (newest === null || newerPublishedComment(updatedAt, id, newest.updatedAt, newest.id)) {
+        newest = { updatedAt, id, body };
+      }
+    }
+    if (newest === null) return null;
+    const head = parseMetadata(newest.body)?.head_sha;
+    return isProvenHeadSha(head) ? head : null;
+  } catch { return null; }
+}
+
+/** Order two managed sticky candidates newest-first: `updated_at` decides,
+ * and a numeric comment id breaks the tie deterministically (ids only compare
+ * when both are decimal, so an unusable id never decides anything). */
+function newerPublishedComment(
+  updatedAt: string,
+  id: string,
+  bestUpdatedAt: string,
+  bestId: string,
+): boolean {
+  if (updatedAt !== bestUpdatedAt) return updatedAt > bestUpdatedAt;
+  const numeric = /^[1-9]\d*$/;
+  return numeric.test(id) && numeric.test(bestId) ? BigInt(id) > BigInt(bestId) : false;
+}
+
+/** Resolve the cleanup flag exactly like `resolve_cleanup_flag`. */
+export { resolveCleanupFlag } from "./cleanup.js";
+export { renderFindingsSummary, severityCountsLabel, FINDINGS_SUMMARY_MAX_ROWS, FINDINGS_SUMMARY_MAX_BYTES } from "./outputs.js";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** One rendered line for the outside-diff appendix — the same severity
+ * label/category/redaction/sanitization discipline as `findingToBody`
+ * (`./inline-findings.js`), minus the per-comment disclaimer, since this
+ * renders as one bullet in a shared section rather than a standalone
+ * comment.
+ *
+ * #1518/#1521: the message is model-authored text on a published surface, and
+ * this section is appended AFTER the review markdown was sanitized, so it
+ * never passes through the reserved-marker strip. The published containers'
+ * anchors (the handoff's and the review-obligations document's) are stripped
+ * here for the same reason the inline finding body strips them: no
+ * model-authored surface may carry an anchor that names the action's own
+ * container. */
+function renderOutsideDiffLine(finding: Record<string, unknown>, linkMode: UpstreamLinkMode): string {
+  const severity = typeof finding.severity === "string" ? finding.severity : "info";
+  const label = Object.hasOwn(SEVERITY_LABELS, severity) ? SEVERITY_LABELS[severity]! : severity;
+  const category = finding.category;
+  const suffix = category && category !== "other" ? ` (${String(category)})` : "";
+  const message = stripPublishedContainerAnchors(String(finding.message || "").replace(/\s+/g, " ").trim());
+  const prefix = finding.pre_existing === true ? "(pre-existing, outside this diff)" : "(outside this diff)";
+  const line = `- **${label}${suffix}:** ${prefix} ${message}`;
+  return sanitizeMarkdown(redactText(line), linkMode);
+}
+
+/**
+ * Render an appendix for findings the deterministic outside-diff pass tagged.
+ * Inline comments can never anchor these — the anchor line isn't in any
+ * diff hunk — so without this section they would otherwise vanish from the
+ * published review the moment the model's own prose doesn't happen to
+ * mention them. Returns "" when there is nothing to render (no section is
+ * added). v3-only, content-level: never touches verdict or any other
+ * policy-relevant output.
+ */
+export function renderOutsideDiffSection(findings: unknown, linkMode: UpstreamLinkMode): string {
+  if (!Array.isArray(findings)) return "";
+  const flagged = findings.filter(
+    (item): item is Record<string, unknown> => isRecord(item) && item.outside_diff === true,
+  );
+  if (flagged.length === 0) return "";
+  const lines = flagged.map((finding) => renderOutsideDiffLine(finding, linkMode));
+  return `\n\n## Findings Outside This Diff\n${lines.join("\n")}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// #752 rendering, as adopted by #811: the normalized still-open findings and
+// the coverage gap are rendered near the top of every review published under
+// verdict_policy=strict, so an approve with findings never reads as clean.
+// Opt-out policies keep today's bodies byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/** The deterministic coverage-gap notice rendered above the findings, with
+ * separate prose for execution incompleteness and requirement traceability. */
+export function renderCoverageGapNotice(reason: string): string {
+  const execution = "\n\n> **Partial coverage**: required-check coverage is incomplete — this review did not resolve every required check and must not be read as a complete pass.\n";
+  const trace = "\n\n> **Requirement traceability gap**: the review itself completed, but one or more in-scope requirements could not be verified against enforcement or test evidence. This review must not be read as a clean pass until that requirement is covered.\n";
+  const both = "\n\n> **Partial coverage and requirement traceability gap**: required-check coverage is incomplete, and one or more in-scope requirements could not be verified against enforcement or test evidence. This review must not be read as a clean pass until both gaps are addressed.\n";
+  switch (reason === "incomplete" ? "execution" : reason) {
+    case "execution": return execution;
+    case "requirement_trace": return trace;
+    case "both": return both;
+    default: return "";
+  }
+}
+
+/** The top-of-body state block for verdict_policy=strict: coverage gap first
+ * (it qualifies the whole review), then the findings summary. */
+function renderStrictStateBlock(options: {
+  incompleteReason: string;
+  findings: unknown;
+  linkMode: UpstreamLinkMode;
+}): string {
+  return renderCoverageGapNotice(options.incompleteReason)
+    + renderFindingsSummary(options.findings, options.linkMode);
+}
+
+/**
+ * #1656: the human-readable reason text for a disposition's withholding —
+ * the material unknowns' own clauses, so the notice, the recommendation
+ * line and the machine surfaces all name the same reasons.
+ */
+function dispositionReasonText(disposition: { materialUnknowns: ReadonlyArray<{ code: string }> }): string {
+  const first = disposition.materialUnknowns[0];
+  if (first === undefined) return "material review questions remain unresolved";
+  return MATERIAL_CODE_CLAUSES[first.code as MaterialDispositionCode] ?? "material review questions remain unresolved";
+}
+
+/**
+ * Evaluate the native approval guardrails (#1161): the final verdict
+ * decides whether an approval is possible at all, and the cross-repository
+ * scope policy (`approve_forks`) decides whether it is allowed. The
+ * deprecated `allow_approve` input no longer gates anything. Missing
+ * fork-ness fails closed (treated as a fork: approval needs
+ * approve_forks). A clean verdict withheld by the scope policy stays
+ * advisory — a blocking REQUEST_CHANGES would invent an issue the model
+ * did not find.
+ *
+ * #1449: the run's derived-obligation state joins the guardrails. An
+ * `unresolved` or `unavailable` state means a derived architectural
+ * obligation was never discharged, so a native approval must not
+ * certify this review — the publish boundary cannot be a way around the
+ * obligation contract. The withholding stays ADVISORY (the native event
+ * becomes a COMMENT, never a blocking REQUEST_CHANGES), exactly like the
+ * scope-blocked case: an incomplete review must not invent an issue.
+ * With the state absent (the common case) the result is byte-identical to
+ * the pre-#1449 one.
+ */
+export function evaluateApprovalGuardrails(options: {
+  verdict: string;
+  approveForks: boolean;
+  isForkPr: boolean | null;
+  /** #1449: the run's derived-obligation state, when the feature is on. */
+  derivedObligationState?: string;
+  /** #1505: the run's required-evidence state, when the review-owned
+   * required-evidence contract was active. Unresolved required evidence is
+   * a coverage state: it reads `partial` and withholds the native APPROVE
+   * (a non-blocking COMMENT), never a manufactured blocking request — the
+   * same withholding semantics the derived state carries. */
+  requiredEvidenceState?: string;
+}): {
+  canApprove: boolean;
+  scopeBlocked: boolean;
+  verdictAllowsApproval: boolean;
+  isForkPr: boolean | null;
+  /** #1449: present only when the derived state withheld the approval. */
+  derivedBlocked?: boolean;
+  /** #1505: present only when the required-evidence state withheld the
+   * approval. */
+  requiredEvidenceBlocked?: boolean;
+} {
+  const verdictAllowsApproval = options.verdict === "approve";
+  const isFork = options.isForkPr ?? true;
+  const scopeBlocked = verdictAllowsApproval && isFork && !options.approveForks;
+  const derivedBlocked = verdictAllowsApproval
+    && (options.derivedObligationState === "unresolved" || options.derivedObligationState === "unavailable");
+  const requiredEvidenceBlocked = verdictAllowsApproval
+    && (options.requiredEvidenceState === "unresolved" || options.requiredEvidenceState === "unavailable");
+  return {
+    canApprove: verdictAllowsApproval && !scopeBlocked && !derivedBlocked && !requiredEvidenceBlocked,
+    scopeBlocked,
+    verdictAllowsApproval,
+    isForkPr: options.isForkPr,
+    ...(derivedBlocked ? { derivedBlocked: true } : {}),
+    ...(requiredEvidenceBlocked ? { requiredEvidenceBlocked: true } : {}),
+  };
+}
+
+/**
+ * Submit the native review bound to the reviewed commit, attaching inline
+ * comments when present. If the platform rejects the JSON payload (e.g. an
+ * anchor raced a new push), fall back to the body-only review so publishing
+ * never breaks because of inline findings or commit binding. #1581: a
+ * rejected payload and a thrown transport/API failure are the same failed
+ * submission — both produce a result record (with `fellBack` and the error),
+ * so the caller's event-aware failure handling never sees a raw throw. #1249: the
+ * body-only fallback can carry a `fallbackBody` — under a non-strict verdict
+ * policy the findings table is not part of the native review body, so the
+ * plain retry would otherwise drop every finding the inline comments carried.
+ * The caller supplies the compensated body only when the findings are not
+ * already in `body` (strict renders them itself), so no policy duplicates the
+ * findings table; the summary is the same bounded renderer the body uses
+ * (at most 50 rows, capped messages).
+ */
+export async function submitNativeReview(
+  api: PublishPlatformApi,
+  options: {
+    event: NativeReviewEvent;
+    body: string;
+    /** #1249: the body used by the body-only fallback when the findings are
+     * not already part of `body`; omitted keeps the fallback byte-identical
+     * to `body`. */
+    fallbackBody?: string;
+    commitId: string;
+    comments: NativeReviewComment[];
+  },
+): Promise<{ ok: boolean; inlineCount: number; fellBack: boolean; error?: string; reviewId?: number | string }> {
+  if (options.event !== "APPROVE" && options.event !== "REQUEST_CHANGES" && options.event !== "COMMENT") {
+    return { ok: false, inlineCount: 0, fellBack: false, error: `Unsupported native review event: ${options.event}` };
+  }
+  const inlineCount = options.comments.length;
+  const request: NativeReviewRequest = {
+    body: options.body,
+    event: options.event,
+  };
+  if (options.commitId !== "") {
+    request.commit_id = options.commitId;
+  }
+  if (inlineCount > 0) {
+    request.comments = options.comments;
+  }
+  // #1581: a createReview that THROWS is a failed submission exactly like an
+  // `ok: false` return (the #1518 pattern at the inline-findings site). The
+  // record-based flow below — the body-only fallback retry, the `fellBack`
+  // flag, and the caller's event-aware failure reporting — must run for it
+  // too; letting the throw escape into publishReview's outer catch would
+  // skip the fallback attempt and lose the attempted-event context.
+  // "Failed submission" is only what the client knows: a transport error can
+  // also arrive AFTER the server accepted the primary review, so the retry
+  // carries the same double-submit window as the existing `ok: false` retry
+  // semantics — no dedup is introduced here.
+  let created: { ok: boolean; error?: string; reviewId?: number | string };
+  try {
+    created = await api.createReview(request);
+  } catch (error) {
+    created = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (created.ok) {
+    return { ok: true, inlineCount, fellBack: false, ...(created.reviewId !== undefined ? { reviewId: created.reviewId } : {}) };
+  }
+  let plain: { ok: boolean; error?: string; reviewId?: number | string };
+  try {
+    plain = await api.createReview({ body: options.fallbackBody ?? options.body, event: options.event });
+  } catch (error) {
+    plain = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (plain.ok) {
+    return { ok: true, inlineCount, fellBack: true, ...(plain.reviewId !== undefined ? { reviewId: plain.reviewId } : {}) };
+  }
+  const error = plain.error ?? created.error;
+  return error === undefined
+    ? { ok: false, inlineCount, fellBack: true }
+    : { ok: false, inlineCount, fellBack: true, error };
+}
+
+/** The approval-failure guidance the v2 publish step prints verbatim. */
+export const APPROVAL_FAILURE_GUIDANCE = [
+  "ERROR: Native approval failed.",
+  "This may be caused by the 'Allow GitHub Actions to create and approve pull requests' setting being disabled.",
+  "Enable this setting at: Repository Settings → Actions → General → Allow GitHub Actions to create and approve pull requests",
+  "Or at the organization level: Organization Settings → Actions → Organization permissions → Allow GitHub Actions to create and approve pull requests",
+];
+
+/**
+ * Publish the review. Runs the three v2 publish modes with the exact
+ * ordering: sanitize → head re-check → per-mode cleanup/flag resolution →
+ * sticky/native publication → optional inline findings → label cleanup.
+ */
+export async function publishReview(
+  input: PublishInput,
+  api: PublishPlatformApi,
+  options: { diffText: string },
+): Promise<PublishResult> {
+  const messages: string[] = [];
+  // #588: the platform's native pull-review surface, read ONCE for the whole
+  // publication. An ABSENT capability (an untyped caller, an `as unknown as`
+  // cast) keeps the historical behavior — the platform is assumed to have a
+  // native review surface — while a platform that DECLARES no native surface
+  // takes the managed-record path: the review body is published as the
+  // platform's managed top-level record, no native approval, blocking
+  // request, or inline comment is created, and the degradation is stated
+  // explicitly in the body and in the step messages.
+  const nativeSurface: NativeReviewSurface = api.nativeReviewSurface ?? { supported: true };
+  if (api.nativeReviewSurface === undefined) {
+    // #588: an undeclared capability is an untyped caller. The historical
+    // behavior is kept (the platform is assumed to have a native review
+    // surface), but the gap is reported: a platform that FORGOT to declare
+    // the capability must not fail silently.
+    messages.push("WARN: the publish platform did not declare a native review surface; assuming it has one");
+  }
+  // #1161: `allow-approve` is deprecated and inert — it changes no
+  // published event. It is read here only to tell the operator that the
+  // input no longer has an effect. `undefined` means the operator never
+  // set it; an explicit value (true OR false) warns, because an operator
+  // who set it to "false" to suppress approvals has to learn that the
+  // input no longer does that.
+  if (input.allowApprove !== undefined) {
+    messages.push(`WARN: 'allow-approve' is deprecated and no longer affects publication (value: ${input.allowApprove}); use 'publish-mode: review_verdict' to publish the verdict, or 'publish-mode: review_blockers' for blockers-only behavior.`);
+  }
+  // #1158: `publish-review-comment` is deprecated and inert for the same
+  // reason — the publish mode alone decides what is published
+  // (`publishStepRuns` above). It is read here only to tell the operator
+  // that the input no longer has an effect. The projected value is
+  // `true` in practice: the runner merges the contract default, so only a
+  // value that differs from "false" reaches this seam.
+  if (input.publishReviewComment !== undefined) {
+    messages.push(`WARN: 'publish-review-comment' is deprecated and no longer affects publication (value: ${input.publishReviewComment}); the publishing behavior is decided by 'publish-mode' alone — use 'publish-mode: comment' to publish or update the sticky PR comment.`);
+  }
+  let outcomes: string | undefined;
+  // #1116: the tally line is emitted only with the artifact it describes —
+  // a later drop (failed submission, #588 managed record) must not leave the
+  // run claiming counts it no longer exports.
+  let outcomesSummary: string | undefined;
+  // #1116: one trusted-owner proof for the whole publish run, shared lazily
+  // by the carry-marker read, the outcome-identity/prior-head read, and the
+  // cleanup retirement path below.
+  const trustedOwnerForRun = createRunTrustedOwnerResolver(api);
+  let nativeReviewId: number | string | undefined;
+  // #1576: the verdict-bearing native submission record for this run
+  // (attempted event + whether it landed). Absent when no verdict-bearing
+  // submission was attempted; the attestation reads it through the outcome.
+  let nativeSubmission: PublishResult["native"];
+  // #1093: the sticky summary comment as the replacement checkpoint when
+  // review_comment mode publishes no inline findings review (a clean re-review
+  // must not emit an empty native "Inline findings" review just to anchor
+  // cleanup). The PATCH/POST response timestamp anchors it.
+  let stickyCommentId: number | string | undefined;
+  let stickyUpdatedAt: string | undefined;
+  // #1093: the exact sticky body this run published — the checkpoint's
+  // body anchor, so a same-second re-publication by an overlapping run
+  // (refreshed timestamp equal to the checkpoint) with a DIFFERENT body
+  // cannot pass for this run's own sticky state.
+  let stickyBody: string | undefined;
+  // #1093: the sticky is a complete replacement only when the run had no
+  // inline findings to post or that findings review was actually created;
+  // a failed findings submission leaves the previous set un-replaced.
+  let stickyCheckpointUsable = true;
+
+  if (!input.prNumber) {
+    return { status: "failed", messages, error: `publish_${input.mode} requires a pull_request event or explicit pr_number` };
+  }
+
+  // Publication-boundary head re-check (#451): fail closed.
+  const currentHead = await api.getHeadSha();
+  if (!currentHead) {
+    // #588: a platform that knows WHY the current head is unavailable (it
+    // has no trustworthy current-head source) says so; a platform whose read
+    // simply failed keeps the generic wording. The native path's wording is
+    // unchanged.
+    const headReason = api.currentHeadUnavailableReason;
+    return {
+      status: "failed",
+      messages,
+      error: headReason === undefined || headReason === ""
+        ? `Could not re-fetch the current head of the pull request; refusing to publish a potentially stale review.`
+        : `Could not determine the current head of the pull request: ${headReason}. Refusing to publish a potentially stale review.`,
+    };
+  }
+  if (currentHead !== input.headSha) {
+    messages.push(`A newer push superseded reviewed commit ${input.headSha}; not publishing this review.`);
+    return { status: "superseded", messages };
+  }
+
+  // #1005: perform the additive reviewer request for a "request" plan. Runs
+  // only after the head-sha guard, so a stale review never requests a
+  // reviewer. The boundary re-checks the plan's own invariants rather than
+  // trusting a carried-forward artifact: the mode must itself be `request`,
+  // and a fork PR (or an unknown fork state, `null`) never mutates. A failure
+  // is surfaced clearly and never substitutes another reviewer; it does not
+  // fail the review publication (the request is auxiliary, and the published
+  // section reports the outcome).
+  let reviewRouting = input.reviewRouting;
+  if (reviewRouting && reviewRouting.status === "request") {
+    if (reviewRouting.mode === "request" && input.isForkPr === false) {
+      const request = await api.requestReviewers(reviewRouting.users, reviewRouting.teams);
+      if (request.ok) {
+        const sent = [
+          ...request.requestedUsers,
+          ...request.requestedTeams.map((team) => `team:${team}`),
+        ];
+        const already = [
+          ...request.alreadyRequestedUsers,
+          ...request.alreadyRequestedTeams.map((team) => `team:${team}`),
+        ];
+        messages.push(
+          `Reviewer routing: requested ${sent.length > 0 ? sent.join(", ") : "(none new)"}`
+          + (already.length > 0 ? `; already requested: ${already.join(", ")}` : ""),
+        );
+        reviewRouting = { ...reviewRouting, status: "requested" };
+      } else {
+        messages.push(`WARN: reviewer routing failed (${request.supported ? "request" : "unsupported platform"}): ${request.error ?? "unknown error"}`);
+        reviewRouting = { ...reviewRouting, status: "request_failed" };
+      }
+    } else {
+      // A carried-forward/tampered artifact claims a request while its mode is
+      // not `request` or the PR is a fork/unknown: refuse to mutate and report
+      // the inconsistency rather than a phantom request.
+      messages.push("WARN: reviewer routing plan is inconsistent at the publish boundary; no reviewer was requested");
+      reviewRouting = { ...reviewRouting, status: "invalid" };
+    }
+  }
+
+  // The marker's review_result. Under verdict_policy=strict (#811) it
+  // distinguishes the non-blocking states (clean / findings / partial) from
+  // issues, from the same still-open findings and coverage the strict
+  // mapping decided the verdict on; a #810 tool-loop coverage gap is also
+  // `partial`. Every other policy keeps the binary clean/issues consumers
+  // rely on; the unchanged-diff carry-forward reads this field
+  // (findings/partial carry an approve).
+  const strict = input.verdictPolicy === "strict";
+  const incompleteReason = resolveIncompleteReason(input);
+  // #1656: the authoritative disposition. A run that computed one (every
+  // run of this action version writes `final-disposition.json` and passes
+  // the object) consumes it directly — the recommendation, the native event
+  // and the withheld-approval notices below all read from it and from
+  // nothing else. A caller without one (a legacy run directory, or a direct
+  // publish invocation) keeps the #1596 scalar derivation, byte-compatible
+  // with the pre-#1656 publish behavior.
+  // #1656 audit round 2: resolution order — (1) the explicit authoritative
+  // object; (2) a REFUSED record (run dir present, artifact missing/
+  // malformed/incoherent) → the canonical unavailable abstention, never a
+  // legacy approval; (3) the legacy scalar derivation, only for callers
+  // with no run-directory provenance.
+  // The objective scope guardrails are a pure function of the publish input;
+  // they are computed once here and read by BOTH disposition paths — the
+  // legacy scalar derivation's certification check below and the withheld-
+  // approval notices further down. They no longer choose the event.
+  const guardrails = evaluateApprovalGuardrails({
+    verdict: input.verdict,
+    approveForks: input.approveForks,
+    isForkPr: input.isForkPr,
+    ...(input.derivedObligationState !== undefined ? { derivedObligationState: input.derivedObligationState } : {}),
+    ...(input.requiredEvidenceState !== undefined ? { requiredEvidenceState: input.requiredEvidenceState } : {}),
+  });
+  const disposition = input.finalDisposition ?? (input.finalDispositionRefused === true
+    ? unreadableFinalDisposition()
+    : (() => {
+    const legacyReviewResult = markerReviewResult(input);
+    const legacyCompleteCoverage = !input.partialCoverage && !input.coverageUnknown
+      && legacyReviewResult !== "partial" && incompleteReason === "none" && input.degradedGateBypass !== true;
+    return computeReviewDisposition({
+      verdict: input.verdict,
+      validVerdict: isValidPublishVerdict(input.verdict),
+      reviewResult: legacyReviewResult,
+      coverageIncomplete: reviewCoverageIncomplete(legacyReviewResult),
+      approvalCertified: input.mode === "review_verdict" && guardrails.canApprove && legacyCompleteCoverage && input.degradedGateBypass !== true,
+      verdictBearing: isNativeVerdictMode(input.mode),
+      incompleteReason,
+      blockingFindingOpen: hasBlockingOpenFinding(input.findings),
+    });
+  })());
+  // #1656: the marker's review_result is a PROJECTION of the disposition on
+  // the authoritative path, so the marker can never disagree with it; the
+  // legacy path keeps the pre-#1656 rollup.
+  const reviewResult = input.finalDisposition !== undefined
+    ? reviewResultFromDisposition(input.finalDisposition, {
+      strict,
+      openFindings: Array.isArray(input.findings) ? input.findings.length : 0,
+    })
+    : markerReviewResult(input);
+  const validVerdict = isValidPublishVerdict(input.verdict);
+  // #1656: coverage is incomplete exactly when the disposition abstained —
+  // a material unknown withheld certification, or the review was
+  // unavailable. An advisory-only diagnostic never reads as a gap.
+  const coverageIncomplete = disposition.kind === "incomplete" || disposition.kind === "unavailable";
+  // Sanitize model output first — the same pipeline for every mode. Any
+  // outside-diff findings are appended as their own section: unlike inline
+  // comments (which can only anchor in-diff findings), every publish mode
+  // renders review_markdown, so this is the one place that never drops them.
+  //
+  // #1596: the sanitized prose is then reconciled with the disposition: a
+  // model-authored actionable recommendation that contradicts the
+  // authoritative disposition is rewritten into a non-actionable sentence
+  // BEFORE it reaches any published body. The reconciliation runs on the
+  // sanitized text (so it can never be used to smuggle a directive past the
+  // sanitizer) and before the outside-diff section is appended (that section
+  // is action-rendered findings, never a recommendation).
+  const sanitizedProse = sanitizeForPublication(input.reviewMarkdown, input.upstreamLinkMode, input.conditionalPresence);
+  const sanitized = normalizePublishedRecommendation(sanitizedProse, disposition)
+    + renderOutsideDiffSection(input.findings, input.upstreamLinkMode);
+  const coverageNotice = input.partialCoverage ? renderPartialCoverageNotice(input.partialCoverage) : "";
+  // #588: the platform's degradation reason, flattened to ONE bounded line:
+  // it is rendered inside a blockquote notice and inside a step message, so
+  // a reason carrying a newline could otherwise break out of both.
+  const surfaceReason = flattenSurfaceReason(nativeSurface.reason);
+  // #588: the structured findings this run carries. On a platform WITHOUT a
+  // native review surface they have no native channel (no inline review
+  // comments), so the published body is the only place they can reach the
+  // reader — the count drives the explicit degradation note.
+  const findingCount = Array.isArray(input.findings) ? input.findings.length : 0;
+  /** The deterministic state section of the body.
+   *
+   * Under the strict policy (#811) it is the coverage-gap notice plus the
+   * findings table. On a platform WITHOUT a native review surface the
+   * findings table is published even under a non-strict policy — but only
+   * for the modes whose forge counterpart publishes the findings as native
+   * inline review comments (`review_comment`, `review_verdict`,
+   * `review_blockers`). There the body is the only remaining channel, so
+   * the findings are never silently dropped (#588) — within the findings
+   * table's own bounds (at most 50 rows; the overflow is disclosed in the
+   * body, exactly as the strict policy discloses it). The `comment` mode
+   * publishes no findings natively on any platform, so it compensates
+   * nothing and its body is unchanged.
+   * `platformNotice` is the action-owned notice for such a platform; it
+   * precedes the untrusted review text so no model content can swallow it. */
+  const stateSection = (platformNotice = "", compensateFindings = true): string | undefined => {
+    const parts: string[] = [];
+    if (platformNotice !== "") parts.push(platformNotice);
+    if (strict) {
+      parts.push(renderStrictStateBlock({ incompleteReason, findings: input.findings, linkMode: input.upstreamLinkMode }));
+    } else if (!nativeSurface.supported && compensateFindings) {
+      parts.push(renderFindingsSummary(input.findings, input.upstreamLinkMode));
+    }
+    return parts.length === 0 ? undefined : parts.join("");
+  };
+  /** #588: what this publication IS on this platform. A forge with a comment
+   * surface publishes a comment; a platform without a native review surface
+   * publishes a managed review record. Only the non-native wording differs —
+   * the native path's bytes are unchanged. */
+  const advisoryNoun = nativeSurface.supported ? "advisory comment" : "advisory review record";
+  // #1003: rendered only when triage ran; the three modes share the one
+  // block so a triage answer can never differ by publish mode.
+  const triageBlock = input.reviewTriage ? renderReviewTriageBlock(input.reviewTriage, input.upstreamLinkMode) : "";
+  // #1005: rendered only when routing ran and the status carries a decision.
+  const routingBlock = reviewRouting ? renderReviewRoutingBlock(reviewRouting) : "";
+  // #1073: rendered only when the scorer ran; the whole block passes
+  // sanitizeForPublication before it can touch the body.
+  const confidenceBlock = input.confidence
+    ? sanitizeForPublication(
+      renderIndependentConfidenceBlock(input.confidence, input.upstreamLinkMode),
+      input.upstreamLinkMode,
+      input.conditionalPresence,
+    )
+    : "";
+  const markerContext: RunMarkerContext = {
+    headSha: input.headSha,
+    baseSha: input.baseSha,
+    reviewResult,
+    requiredChecks: input.requiredChecks,
+    reviewRoute: input.reviewRoute,
+    escalationReason: input.escalationReason,
+    cacheHitRatio: input.cacheHitRatio,
+    ...(incompleteReason !== "none" ? { incompleteReason } : {}),
+    ...(input.ciState !== undefined && input.ciState !== "" ? { ciState: input.ciState } : {}),
+    degradedGateBypass: input.degradedGateBypass === true,
+    ...(input.toolBudget !== undefined ? { toolBudget: input.toolBudget } : {}),
+    ...(input.toolBudgetSource !== undefined && input.toolBudgetSource !== "" ? { toolBudgetSource: input.toolBudgetSource } : {}),
+    ...(input.toolCalls !== undefined ? { toolCalls: input.toolCalls } : {}),
+    // #1597: the remaining partitions, additive marker keys.
+    ...(input.toolCallsIssued !== undefined ? { toolCallsIssued: input.toolCallsIssued } : {}),
+    ...(input.toolCallsSuccessful !== undefined ? { toolCallsSuccessful: input.toolCallsSuccessful } : {}),
+    ...(input.toolCallsRefused !== undefined ? { toolCallsRefused: input.toolCallsRefused } : {}),
+    ...(input.toolCallsDeduplicated !== undefined ? { toolCallsDeduplicated: input.toolCallsDeduplicated } : {}),
+    ...(input.toolRounds !== undefined ? { toolRounds: input.toolRounds } : {}),
+    ...(input.maxRounds !== undefined ? { maxRounds: input.maxRounds } : {}),
+    ...(input.contextBudget !== undefined ? { contextBudget: input.contextBudget } : {}),
+    ...(input.contextPeak !== undefined ? { contextPeak: input.contextPeak } : {}),
+    ...(input.toolStopReason !== undefined && input.toolStopReason !== "" ? { toolStopReason: input.toolStopReason } : {}),
+    // #1073: the scorer's marker keys, only when the scorer ran — disabled
+    // and skipped runs keep the pre-#1073 marker bytes exactly.
+    ...(input.confidence && input.confidence.status !== ""
+      ? { confidenceStatus: input.confidence.status === "scored" || input.confidence.status === "unscored" ? input.confidence.status : "" }
+      : {}),
+    ...(input.confidence && input.confidence.status === "scored" && /^[0-5]$/.test(input.confidence.score)
+      ? { confidenceScore: Number(input.confidence.score) }
+      : {}),
+    // #1455: the verifier's telemetry, only when the run measured it — the
+    // marker keeps its pre-#1455 bytes when the verifier was disabled, or
+    // when a call reported no usage.
+    ...(input.confidenceTelemetry !== undefined ? { confidenceTelemetry: input.confidenceTelemetry } : {}),
+    // #1449: the run's derived-obligation state, only when the run has one
+    // (the feature is enabled) — the marker keeps its pre-#1449 bytes when
+    // the run has no state. The marker builder validates the value against
+    // the three closed states and omits the key otherwise, so an unknown
+    // value is never published.
+    ...(input.derivedObligationState !== undefined ? { derivedObligationState: input.derivedObligationState } : {}),
+    ...(input.requiredEvidenceState !== undefined ? { requiredEvidenceState: input.requiredEvidenceState } : {}),
+    actionVersion: ACTION_VERSION,
+  };
+  if (input.partialCoverage) {
+    // #810: the marker records partial coverage additively; a complete run
+    // serializes byte-identically to the pre-#810 marker.
+    markerContext.coverage = "partial";
+    markerContext.coverageStopReason = input.partialCoverage.stop_reason;
+  } else if (input.coverageUnknown) {
+    // #873/#838: distinct from a confirmed #810 gap — the standalone
+    // `publish` CLI had no explicit run dir (or an unreadable harness) and
+    // so could not confirm coverage at all. No stop reason to report.
+    markerContext.coverage = "unknown";
+  }
+  const metadataMarker = buildRunMetadataMarker(markerContext);
+  const markers = emitReviewMarkers((() => {
+    const preamble: MarkerPreamble = { commentMarker: input.commentMarker, metadataMarker };
+    if (input.headSha) preamble.headSha = input.headSha;
+    if (input.broadFingerprint) preamble.broadFingerprint = input.broadFingerprint;
+    return preamble;
+  })());
+  // #1518: the published remediation handoff is built AFTER the inline
+  // comment build below, so it can carry exactly the replacements THIS run
+  // published. The items are the FINAL post-enforcement state (severity
+  // caps, suppression, blocker-verification demotion and thread-settlement
+  // re-emission are already in `input.findings`), and every publish mode
+  // reuses the same container.
+
+  // Structured findings → inline comments (both review modes, when enabled).
+  // #589: on a platform WITHOUT a native review surface the built comments
+  // can never be published (there is no inline-comment API to carry them),
+  // so the whole build — and every read behind it — is skipped: the body
+  // compensation below is the only findings channel there.
+  let inlineComments: NativeReviewComment[] = [];
+  // #1518: the replacements this run publishes as review comments, keyed by
+  // the finding's stable identity digest. A handoff item carries a
+  // suggestion ONLY when this map has that exact identity, so the handoff
+  // can never propose a replacement the action did not publish (a suppressed
+  // one, or one this run never published at all, never rides it).
+  let publishedPrescriptions: Map<string, string> = new Map();
+  if (nativeSurface.supported && input.mode !== "comment" && input.inlineFindings && input.findings !== undefined && input.findings !== null) {
+    // #762/#1107: usefulness feedback from the prior run's published
+    // prescriptions. Read immediately before the build and fail-open end to
+    // end, so the published review is unchanged when the read is unsupported or
+    // uncertain. A finding set that can carry no prescription — blank,
+    // fence-hostile, out-of-range, or marker-stripped-to-nothing — can never
+    // contain one, so the reaction read (and every permission request behind
+    // it) is skipped even when the enumeration below still runs;
+    // `hasPublishablePrescription` is the same predicate publication renders
+    // through, over the same diff, so the pre-check cannot be weaker.
+    // #1027: the same bounded enumeration also harvests the prior run's
+    // finding observations (identity markers, thread resolution, and the
+    // reaction tallies it already fetched) for the outcome ledger — no
+    // additional reaction or permission request is ever made for outcomes.
+    const feedbackState = await readFeedbackState(api, input.commentMarker, hasPublishablePrescription(input.findings, options.diffText), trustedOwnerForRun);
+    const feedback = feedbackState.snapshot;
+    const built = buildInlineComments({
+      findings: input.findings,
+      diffText: options.diffText,
+      max: input.inlineFindingsMax,
+      forgejoPositions: input.forgejoPositions,
+      linkMode: input.upstreamLinkMode,
+      rejectedPrescriptions: feedback.keys,
+    });
+    inlineComments = built.comments;
+    publishedPrescriptions = built.published;
+    try {
+      const at = new Date().toISOString();
+      // #1027: the identities this run actually PUBLISHES — parsed from the
+      // markers the built comments carry, so a finding the anchor validation
+      // skipped can never produce a `reported` event for a comment that does
+      // not exist.
+      const postedIdentities: string[] = [];
+      for (const comment of inlineComments) {
+        const body = typeof comment.body === "string" ? comment.body : "";
+        const identity = parseFindingIdentityMarker(body);
+        if (identity !== null && !postedIdentities.includes(identity)) postedIdentities.push(identity);
+      }
+      const prior: readonly PriorFindingObservation[] = feedbackState.observations.map((observation) => ({
+        findingId: observation.findingId,
+        commentId: observation.commentId,
+        resolved: observation.resolved,
+        reactions: observation.reactions,
+      }));
+      if (feedbackState.enumerated && (prior.length > 0 || postedIdentities.length > 0)) {
+        // The prior head: the OWNED managed sticky comment's metadata marker
+        // (proven action state). The caller-provided fallback is accepted only
+        // under the SAME proof rule — an unvalidated value would turn "head
+        // unprovable" into the strong "the code was fixed" claim, which is
+        // exactly the outcome the fail-closed read exists to withhold.
+        const fallback = isProvenHeadSha(input.priorHeadSha)
+          ? input.priorHeadSha
+          : null;
+        const priorHeadSha = feedbackState.priorHeadSha ?? fallback;
+        const events = deriveOutcomeEvents({
+          postedIdentities,
+          prior,
+          priorHeadSha,
+          currentHeadSha: input.headSha,
+          route: input.reviewRoute || null,
+          model: publicAnalysisEngine(input.analysisEngine) || null,
+          at,
+        });
+        if (events.length > 0) {
+          // The producer runs its own normalizer before serialization, so the
+          // artifact always parses under the same rules a reader applies.
+          // Past the cap the OLDEST events are dropped (the newest state is
+          // what readers aggregate), matching `MAX_LEDGER_EVENTS` and the
+          // reader-side cap — a run that overflowed would otherwise export
+          // the opposite end of its history than a reader keeps.
+          const normalized: OutcomeEvent[] = [];
+          for (const event of events) {
+            const safe = normalizeOutcomeEvent(event);
+            if (safe !== null) normalized.push(safe);
+          }
+          const capped = normalized.length > MAX_LEDGER_EVENTS
+            ? normalized.slice(normalized.length - MAX_LEDGER_EVENTS)
+            : normalized;
+          if (capped.length > 0) {
+            // #1128: the ENVELOPE head obeys the same proof rule as every
+            // event head, under the one shared predicate. Blanking it to ""
+            // looked like a safe degradation but is the opposite: the reader
+            // nulls the WHOLE ledger on an unproven envelope head, so the
+            // export was an artifact its own reader throws away. An
+            // unprovable head withholds the advisory artifact instead; the
+            // review itself still publishes, unchanged.
+            if (!isProvenHeadSha(input.headSha)) {
+              messages.push("Finding outcomes: artifact withheld — the run could not prove a hex head SHA, and the ledger must always parse under the same rules a reader applies");
+            } else {
+              const aggregate = aggregateOutcomeEvents(capped);
+              const ledger: OutcomeLedger = {
+                schema: FINDING_OUTCOMES_SCHEMA,
+                generated_at: at,
+                head_sha: input.headSha,
+                route: input.reviewRoute || null,
+                model: publicAnalysisEngine(input.analysisEngine) || null,
+                events: capped,
+                aggregate,
+              };
+              outcomes = serializeOutcomeLedger(ledger);
+              outcomesSummary = `Finding outcomes: ${aggregate.unique_findings} finding(s), ${aggregate.open} open, ${aggregate.resolved} resolved, ${aggregate.dismissed} dismissed, ${aggregate.reactions.helpful + aggregate.reactions.not_helpful} reaction(s)`;
+            }
+          }
+        }
+      }
+    } catch { outcomes = undefined; }
+    if (feedback.inspected > 0 || feedback.carried > 0) {
+      messages.push(
+        `Inline finding usefulness feedback: inspected ${feedback.inspected} prior comment(s), `
+          + `${feedback.logins} distinct rejection login(s), ${feedback.trusted} trusted rejection(s), `
+          + `${built.suppressed} suppressed prescription(s)`
+          + (feedback.carried > 0
+            ? `; ${feedback.carried} carried rejection key(s) inherited from this action's own prior comments`
+            : "")
+          + (feedback.overCap > 0
+            ? `; ${feedback.overCap} login(s) past the verification cap — none verified`
+            : ""),
+      );
+    }
+  }
+
+  // #1518: the published remediation handoff, built AFTER the inline-comment
+  // build so it can carry exactly the replacements THIS run published. The
+  // items are the FINAL post-enforcement findings (the severity caps, the
+  // suppression, the blocker-verification demotion and the thread-settlement
+  // re-emission are already in `input.findings`), never raw model output.
+  const handoffBlock = renderReviewHandoffBlock(buildReviewHandoff({
+    reviewId: input.reviewId ?? "",
+    headSha: input.headSha,
+    // #1596: the handoff is built from the AUTHORITATIVE disposition, so the
+    // machine-readable document can never contradict the native event and
+    // the recommendation line (which follow the disposition): an open
+    // blocker/major finding under a non-strict approve publishes
+    // request_changes/issues here too, never the raw approve/clean.
+    disposition,
+    verdict: input.verdict,
+    reviewResult,
+    requiredChecks: input.requiredChecks,
+    findings: input.findings,
+    unresolvedRequirementIds: input.unresolvedRequirementIds ?? [],
+    unresolvedRequiredChecks: input.unresolvedRequiredChecks ?? [],
+    // #1541: the count the enforcement pass produced before the shared id cap
+    // shortened those lists. It rides the published handoff so a consumer
+    // can tell that the cap dropped ids.
+    unresolvedRequirementIdsSourceTotal: input.unresolvedRequirementIdsSourceTotal,
+    unresolvedRequiredChecksSourceTotal: input.unresolvedRequiredChecksSourceTotal,
+    // #1521: the blocking obligation rows and the derived-obligation state
+    // ride the published handoff, so a controller sees what blocked the
+    // review and how complete the derived coverage was.
+    unresolvedReviewObligations: input.unresolvedReviewObligations ?? [],
+    derivedObligationState: input.derivedObligationState,
+    publishedPrescriptions,
+  }));
+  // #1521: the published review-obligations document — the COMPLETE set of
+  // review obligations that blocked this review, from the SAME rows the
+  // handoff projects. The handoff's own list is a compact, disclosed prefix
+  // of them; this document names every one, so a controller never has to
+  // guess what an opaque id refers to. The container is rendered and sized
+  // by `buildPublishedBody`, against the room the rest of the body leaves.
+  // It is published only when the run has at least one qualifying blocking
+  // row: no row means nothing to name, so no document is published and the
+  // body stays byte-identical.
+  const obligationsInput: ReviewObligationsInput = {
+    reviewId: input.reviewId ?? "",
+    headSha: input.headSha,
+    unresolvedReviewObligations: input.unresolvedReviewObligations ?? [],
+  };
+  // #1518: a suggestion may ride the handoff ONLY after the inline review
+  // submission that would publish it SUCCEEDS. The submission happens after
+  // (or with) the body's own publication, so every path that publishes a
+  // body while the inline comments are NOT proven published uses this
+  // suggestion-free variant: the body-only fallback of a native review and
+  // the recovery re-publication after a rejected inline batch. A failed
+  // submission must never leave a published handoff advertising a
+  // replacement no review comment carries.
+  const handoffBlockSansSuggestions = publishedPrescriptions.size === 0
+    ? handoffBlock
+    : renderReviewHandoffBlock(buildReviewHandoff({
+      reviewId: input.reviewId ?? "",
+      headSha: input.headSha,
+      // #1596: the suggestion-free variant carries the SAME authoritative
+      // disposition as the suggestion-carrying one — the two documents must
+      // never disagree about the verdict-level words either.
+      disposition,
+      verdict: input.verdict,
+      reviewResult,
+      requiredChecks: input.requiredChecks,
+      findings: input.findings,
+      unresolvedRequirementIds: input.unresolvedRequirementIds ?? [],
+      unresolvedRequiredChecks: input.unresolvedRequiredChecks ?? [],
+      // #1541: the same counts as the suggestion-carrying variant above.
+      unresolvedRequirementIdsSourceTotal: input.unresolvedRequirementIdsSourceTotal,
+      unresolvedRequiredChecksSourceTotal: input.unresolvedRequiredChecksSourceTotal,
+      // #1521: the same rows and state as the suggestion-carrying variant
+      // above — the two documents must never disagree about what blocked
+      // the review.
+      unresolvedReviewObligations: input.unresolvedReviewObligations ?? [],
+      derivedObligationState: input.derivedObligationState,
+      publishedPrescriptions: new Map(),
+    }));
+
+  const cleanupRequested = input.mode !== "comment"
+    && resolveCleanupFlag(input.cleanupPreviousNativeReviews, input.mode) === "true";
+  // #589: a platform that declares no native pull-review surface has no
+  // native reviews to dismiss, minimize, resolve threads for, or retire
+  // inline comments from — the managed top-level record's in-place update IS
+  // the replacement. Running the cleanup sweep there would only read empty
+  // native listings and emit misleading "superseded"/"no checkpoint"
+  // diagnostics, so the whole pass is skipped with ONE deterministic
+  // degradation note per publish run. The flag is still resolved above so an
+  // invalid value fails the same way on every platform.
+  const cleanupEnabled = cleanupRequested && nativeSurface.supported;
+  if (cleanupRequested && !nativeSurface.supported) {
+    messages.push(`NOTE: Skipping native review cleanup (dismissal, minimization, inline-comment retirement, review-thread resolution): ${surfaceReason}; the managed review record is updated in place`);
+  }
+  const cleanupLog: CleanupLog = (line) => messages.push(line);
+  let previousReviews: Awaited<ReturnType<PublishPlatformApi["listReviews"]>> = [];
+  if (cleanupEnabled) {
+    try { previousReviews = await api.listReviews(); }
+    catch { messages.push("WARN: Could not snapshot previous reviews; cleanup skipped"); }
+  }
+  let fallbackSubmission = false;
+
+  try {
+    if (input.mode === "comment") {
+      // #752: counts where the verdict is stated, under the strict policy.
+      const counts = strict ? severityCountsLabel(input.findings) : "";
+      const suffix = counts ? ` · ${counts}` : "";
+      // #1596: the recommendation line IS the disposition's, never the
+      // model's: the deterministic disposition owns what the action
+      // recommends, and the coverage reason detail stays in the coverage-gap
+      // notice below the header (the state block), not in the recommendation
+      // itself — one wording, one meaning, in every mode.
+      const prefix = disposition.recommendation + suffix;
+      const body = buildPublishedBody({
+        markers,
+        handoffBlock,
+        obligations: obligationsInput,
+        header: prefix,
+        analysisEngine: input.analysisEngine,
+        sanitizedMarkdown: sanitized,
+        coverageNotice,
+        // #588: the `comment` mode publishes no findings natively on any
+        // platform, so it compensates nothing for a missing native surface.
+        stateBlock: stateSection("", false),
+        triageBlock: triageBlock || undefined,
+        routingBlock: routingBlock || undefined,
+        confidenceBlock: confidenceBlock || undefined,
+      });
+      const result = await api.upsertStickyComment(input.commentMarker, body);
+      if (!result.ok) {
+        return { status: "failed", messages, error: `sticky comment publication failed: ${result.error ?? "unknown error"}` };
+      }
+    } else if (input.mode === "review_comment") {
+      // #588: on a platform without a native review surface the findings
+      // have no native channel, so the body states the degradation BEFORE
+      // the untrusted review text and publishes the findings table itself.
+      const platformNotice = nativeSurface.supported
+        ? ""
+        : `\n> **Native inline comments are unavailable on this platform**: ${surfaceReason}. The findings are published in this review body instead of as native review comments.\n`;
+      const body = buildPublishedBody({
+        markers,
+        handoffBlock,
+        obligations: obligationsInput,
+        header: "# AI Automated Review",
+        // #1596: the native modes have no recommendation in their header, so
+        // the action-owned recommendation line rides here — above every
+        // model-authored surface, where the model prose would otherwise be
+        // the only statement of what the action decided.
+        recommendation: disposition.recommendation,
+        analysisEngine: input.analysisEngine,
+        sanitizedMarkdown: sanitized,
+        coverageNotice,
+        stateBlock: stateSection(platformNotice),
+        triageBlock: triageBlock || undefined,
+        routingBlock: routingBlock || undefined,
+        confidenceBlock: confidenceBlock || undefined,
+      });
+      const result = await api.upsertStickyComment(input.commentMarker, body);
+      if (!result.ok) {
+        return { status: "failed", messages, error: `sticky comment publication failed: ${result.error ?? "unknown error"}` };
+      }
+      stickyCommentId = result.commentId;
+      stickyUpdatedAt = result.updatedAt;
+      stickyBody = body;
+      // #1093: inline findings reviews are created ONLY when there are inline
+      // findings — a clean re-review must not publish an empty native review
+      // just so cleanup has a checkpoint. The sticky comment (with its
+      // response timestamp) is the replacement checkpoint instead.
+      if (nativeSurface.supported) {
+        if (inlineComments.length > 0) {
+          const inlineBody = `${input.commentMarker}\n_Inline findings from the automated review (summary in the sticky comment)._`;
+          // #1518: a throw is a failed submission too — the recovery below
+          // must run for it exactly as for an `ok: false` result, or the
+          // already-published handoff would keep advertising suggestions no
+          // review comment carries.
+          let submitted: { ok: boolean; error?: string; reviewId?: number | string };
+          try {
+            submitted = await api.createReview({ body: inlineBody, event: "COMMENT", commit_id: input.headSha, comments: inlineComments });
+          } catch (error) {
+            submitted = { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+          if (submitted.ok) {
+            nativeReviewId = submitted.reviewId;
+            messages.push(`Attached ${inlineComments.length} inline finding comment(s)`);
+          } else {
+            // The findings review is this run's replacement for the previous
+            // inline set; without it the sticky summary is NOT a complete
+            // replacement, so the sticky checkpoint must not authorize
+            // retiring the old owned comments.
+            stickyCheckpointUsable = false;
+            // #1027: the inline comments were never published, so their
+            // `reported` events must not reach the outcome ledger.
+            outcomes = undefined;
+            // #1282: the rejected batch carried findings no other channel
+            // publishes — under a non-strict verdict policy the sticky body
+            // was built without the findings table, so without compensation
+            // the rejection would drop every finding. Re-publish the sticky
+            // comment with the same bounded summary the #1249 body-only
+            // fallback appends (the strict policy renders the findings table
+            // into the body itself, so there is nothing to duplicate there).
+            // #1518: the recovery re-publishes whenever the body must change:
+            // a non-strict policy also appends the findings summary, and a
+            // strict policy still needs the suggestion-free handoff variant
+            // when the rejected batch carried prescriptions. A body that is
+            // byte-identical to what was published (strict, no published
+            // suggestion) re-publishes nothing — the #1282 behavior.
+            const compensated = !strict;
+            let recovered = false;
+            // #1554: the recovery body is rebuilt through the SAME guarded
+            // builder as the primary body, with the suggestion-free handoff
+            // variant and (non-strict) the bounded findings summary as the
+            // tail block — the raw-concatenation tail semantics make this
+            // byte-identical to the old
+            // `bodySansPublishedSuggestions(body) + summary` formula whenever
+            // the body fits AND the handoff block occurs once in the body
+            // (the normal case; the old string surgery also rewrote a
+            // handoff block echoed verbatim in the prose, which the rebuild
+            // does not — strictly safer, never looser), and it bounds the
+            // recovery publication under the same aggregate ceiling. The
+            // suggestion-free variant is the ONLY thing that differs from
+            // the primary build: the withheld-notice tail does not exist in
+            // this mode and the prose is identical.
+            const recoveryBody = buildPublishedBody({
+              markers,
+              handoffBlock: handoffBlockSansSuggestions,
+              obligations: obligationsInput,
+              header: "# AI Automated Review",
+              // #1596: the recovery body carries the same action-owned
+              // recommendation line as the primary body — a recovered
+              // publication must state the same disposition.
+              recommendation: disposition.recommendation,
+              analysisEngine: input.analysisEngine,
+              sanitizedMarkdown: sanitized,
+              coverageNotice,
+              stateBlock: stateSection(platformNotice),
+              triageBlock: triageBlock || undefined,
+              routingBlock: routingBlock || undefined,
+              confidenceBlock: confidenceBlock || undefined,
+              tailBlock: compensated ? renderFindingsSummary(input.findings, input.upstreamLinkMode) : "",
+            });
+            if (recoveryBody !== body) {
+              const recovery = await api.upsertStickyComment(input.commentMarker, recoveryBody);
+              if (recovery.ok) {
+                recovered = true;
+                stickyCommentId = recovery.commentId;
+                stickyUpdatedAt = recovery.updatedAt;
+                stickyBody = recoveryBody;
+              } else {
+                messages.push(`WARN: findings-summary recovery on the sticky comment failed: ${recovery.error ?? "unknown error"}`);
+              }
+            }
+            messages.push(
+              "WARN: inline findings review submission failed; summary comment was still published"
+                + (recovered
+                  ? compensated
+                    ? " with the findings summary appended to the review body"
+                    : " with the remediation handoff suggestions withdrawn"
+                  : ""),
+            );
+          }
+        }
+      } else {
+        // #1027/#588: with no native review surface this run's inline comments
+        // are never published, so nothing derived from their identity markers
+        // may reach the outcome ledger.
+        outcomes = undefined;
+        if (findingCount > 0) {
+          // #588: no native review surface — the managed record IS the complete
+          // publication (the findings are in its body), so no native review is
+          // created and the sticky checkpoint stays usable.
+          messages.push(`NOTE: ${findingCount} finding(s) were published in the review body instead of as native review comments (no native review surface: ${surfaceReason})`);
+        }
+      }
+    } else {
+      // #1161: `review_verdict` and `review_blockers` both publish a native
+      // review; only `review_verdict` can ever approve.
+      if (input.mode === "review_verdict" && !validVerdict) {
+        // #1145: verdict mode must publish a verdict. A run that reaches this
+        // point without a valid final verdict is an explicit action failure —
+        // never a COMMENT disguised as a completed advisory review. The
+        // blockers-only mode keeps #1161's advisory "No review verdict"
+        // comment: that mode's published output IS a comment.
+        return {
+          status: "failed",
+          messages,
+          error: `review_verdict mode requires a final verdict of approve or request_changes, got "${input.verdict}" — refusing to publish a COMMENT substitute (#1145)`,
+        };
+      }
+      // #588: on a platform without a native review surface there is no
+      // native event to carry the recommendation, so the body states it —
+      // BEFORE the untrusted review text, so no model content can swallow it
+      // (a model blockquote can still LOOK similar; that exposure is the
+      // pre-existing one of every action-owned notice in this body, and the
+      // action's own marker stays the authoritative one). The verdict itself
+      // never changes: the recommendation is published as advisory text only.
+      // #1596: the advisory word is the DISPOSITION's, not the verdict's —
+      // an open blocker under a non-strict approve reads as REQUEST CHANGES
+      // here too, never as an APPROVE beside the blocking recommendation.
+      const platformNotice = nativeSurface.supported
+        ? ""
+        : validVerdict && (disposition.kind === "request_changes" || disposition.kind === "approve")
+          ? `\n> **Automated recommendation: ${disposition.kind === "request_changes" ? "REQUEST CHANGES" : "APPROVE"}** — advisory only: ${surfaceReason}. The review is published as a managed top-level review record; no native approval, blocking request, or inline comment was submitted.\n`
+          : `\n> **Native review verdicts are unavailable on this platform**: ${surfaceReason}. The review is published as a managed top-level review record; no native approval, blocking request, or inline comment was submitted.\n`;
+      // #1554: the withholding notices below used to be appended to the
+      // finished body; they are now decided BEFORE the build and ride it as
+      // the tail block, so the aggregate publish-boundary guard counts their
+      // bytes too and a trimmed review prose can never push a notice past
+      // the forge's comment ceiling. Exactly one notice fires, or none — the
+      // branches stay mutually exclusive exactly as the appends were, and
+      // each branch passes the same string literal the append used, so a
+      // fitting body keeps today's bytes exactly.
+      // #1596: when a proven blocker owns the disposition, this publication
+      // IS a blocking request (native event REQUEST_CHANGES, recommendation
+      // REQUEST CHANGES) — the advisory-withholding wordings below ("this
+      // review is advisory rather than a clean approval", "a clean review
+      // is published as an advisory record") would contradict it beside it.
+      // The withholding reason still rides the step messages (unchanged);
+      // only the published advisory notice is suppressed.
+      const blockingPublication = disposition.kind === "request_changes";
+      let withheldNotice = "";
+      if (!validVerdict) {
+        // #1161: a missing or invalid verdict is a failed run, not a clean
+        // review — it must never publish as an approval or as a blocking
+        // request, and it must not read as a successful clean review.
+        // (#1145: in `review_verdict` this run already failed above — the
+        // branch is reachable only in the blockers-only mode, whose published
+        // output is an advisory comment.)
+        withheldNotice = "\n> **No review verdict**: this run produced no valid verdict (model failure or an invalid verdict payload), so neither an approval nor a blocking request is published.\n";
+        messages.push(`Publishing advisory review for #${input.prNumber} (no valid verdict produced)`);
+      } else if (input.finalDisposition === undefined && input.finalDispositionRefused === true) {
+        // #1656 audit round 2: the disposition record was unreadable — the
+        // publication states the refusal instead of any conclusion.
+        if (!blockingPublication) {
+          withheldNotice = "\n> **Review unavailable**: the run's disposition record could not be read, so no conclusion (approval or block) is certified.\n";
+        }
+        messages.push(`Review unavailable for #${input.prNumber} (disposition record unreadable; no conclusion certified)`);
+      } else if (input.finalDisposition !== undefined && input.finalDisposition.kind === "unavailable" && input.finalDisposition.reason === "degraded_no_evidence") {
+        // #1656: a degraded no-evidence fallback verdict certifies nothing —
+        // the authoritative disposition reads UNAVAILABLE, so the publication
+        // states that no conclusion (approval or block) could be certified.
+        if (!blockingPublication) {
+          withheldNotice = "\n> **Review unavailable**: this run's verdict came from a degraded no-evidence fallback, so no review conclusion (approval or block) is certified.\n";
+        }
+        messages.push(`Review unavailable for #${input.prNumber} (degraded no-evidence fallback; no conclusion certified)`);
+      } else if (input.mode === "review_verdict" && input.verdict === "approve" && guardrails.scopeBlocked) {
+        // #1161: the cross-repository scope policy is the only thing that
+        // withholds an approval here (the deprecated allow_approve input
+        // no longer gates anything). A withheld approval stays advisory:
+        // a blocking REQUEST_CHANGES would invent an issue the model did
+        // not find.
+        const scope = guardrails.isForkPr === null
+          ? "the fork status of this pull request could not be determined, so it is treated as a cross-repository (fork) pull request"
+          : "this is a cross-repository (fork) pull request";
+        // #752: a review with open findings or a coverage gap must not
+        // call itself clean, even when its verdict is an approve.
+        const advisory = reviewResult === "clean"
+          ? "this clean review is advisory"
+          : "this review is advisory rather than a clean approval — the findings and coverage notes above are informational";
+        if (!blockingPublication) {
+          withheldNotice = `\n> **Approval withheld by scope policy**: ${scope} and native approvals for fork pull requests are disabled (\`approve-forks: ${input.approveForks}\`), so ${advisory}.\n`;
+        }
+        messages.push(
+          `Withholding native approval for #${input.prNumber} (cross-repository PR, approve_forks=${input.approveForks}, is_fork=${guardrails.isForkPr ?? "unknown"})`,
+        );
+      } else if (input.finalDisposition !== undefined && input.finalDisposition.kind === "incomplete" && input.finalDisposition.reason === "material_unknown" && input.mode === "review_verdict" && input.verdict === "approve") {
+        // #1656: the abstention notice names the material unknowns the
+        // disposition withheld certification for — one authority, the same
+        // reasons the recommendation line carries. An `approval_withheld`
+        // abstention (fork scope policy, advisory surface) renders the
+        // scope notice above or no notice at all — the review itself
+        // completed, so it never reads as a coverage gap.
+        const gap = dispositionReasonText(input.finalDisposition);
+        if (!blockingPublication) {
+          withheldNotice = `\n> **Approval withheld — review incomplete**: ${gap} No blocking code defect was proven; this run needs review and no native approval is certified.\n`;
+        }
+        messages.push(`Withholding native approval for #${input.prNumber} (review incomplete: ${gap})`);
+      } else if (input.finalDisposition === undefined && input.mode === "review_verdict" && input.verdict === "approve" && guardrails.derivedBlocked === true) {
+        // #1449: the derived-obligation state withholds the native approval
+        // at the publish boundary too — a native `review_verdict` approval
+        // must not be a way around the obligation contract. The withholding
+        // stays ADVISORY, exactly like the scope-policy case above: the
+        // native event becomes a COMMENT, never a blocking REQUEST_CHANGES,
+        // because an incomplete review must not invent an issue.
+        const state = input.derivedObligationState ?? "unresolved";
+        const gap = state === "unavailable"
+          ? "the derived architectural obligations could not be fully derived, so their verification coverage is unknown"
+          : "a derived architectural obligation was not discharged by this review";
+        // #752: a review with open findings or a coverage gap must not
+        // call itself clean, even when its verdict is an approve.
+        const advisory = reviewResult === "clean"
+          ? "this clean review is advisory"
+          : "this review is advisory rather than a clean approval — the findings and coverage notes above are informational";
+        if (!blockingPublication) {
+          withheldNotice = `\n> **Approval withheld by derived-obligation state**: ${gap}, so ${advisory}.\n`;
+        }
+        messages.push(
+          `Withholding native approval for #${input.prNumber} (derived obligation state: ${state})`,
+        );
+      } else if (input.finalDisposition === undefined && input.mode === "review_verdict" && input.verdict === "approve" && guardrails.requiredEvidenceBlocked === true) {
+        // #1505: unresolved required review evidence withholds the native
+        // approval at the publish boundary too — an approve verdict over
+        // evidence the review could not gather is an abstention, not a
+        // trust certificate. The withholding stays ADVISORY, exactly like
+        // the derived/scope cases above: the native event becomes a
+        // COMMENT, never a blocking REQUEST_CHANGES, because an incomplete
+        // review must not invent an issue.
+        const state = input.requiredEvidenceState ?? "unresolved";
+        const gap = state === "unavailable"
+          ? "the required-evidence state could not be read, so the review's required-evidence coverage is unknown"
+          : "required review evidence was not gathered by this review (budget, capability, or provider availability)";
+        // #752: a review with open findings or a coverage gap must not
+        // call itself clean, even when its verdict is an approve.
+        const advisory = reviewResult === "clean"
+          ? "this clean review is advisory"
+          : "this review is advisory rather than a clean approval — the findings and coverage notes above are informational";
+        if (!blockingPublication) {
+          withheldNotice = `\n> **Approval withheld by required-evidence state**: ${gap}, so ${advisory}.\n`;
+        }
+        messages.push(
+          `Withholding native approval for #${input.prNumber} (required-evidence state: ${state})`,
+        );
+      } else if (input.finalDisposition === undefined && input.mode === "review_verdict" && input.verdict === "approve" && input.degradedGateBypass === true) {
+        // #1447: degraded review state is an abstention, never a trusted
+        // native approval, even if the surviving coverage fields look clean.
+        if (!blockingPublication) {
+          withheldNotice = "\n> **Approval withheld by degraded review state**: this run bypassed a normal review gate, so it needs review; no native approval is certified.\n";
+        }
+        messages.push(
+          `Withholding native approval for #${input.prNumber} (degraded review state)`,
+        );
+      } else if (input.finalDisposition === undefined && input.mode === "review_verdict" && input.verdict === "approve" && coverageIncomplete) {
+        // #1447: incomplete or unprovable review coverage is an abstention.
+        // Keep the authoritative verdict output as `approve`, but withhold the
+        // native APPROVE event. The event below becomes COMMENT on platforms
+        // that support native reviews; platforms without that surface already
+        // publish a managed advisory record.
+        const gap = incompleteReason === "requirement_trace"
+          ? "an in-scope requirement lacks fully verified enforcement or test evidence"
+            : incompleteReason === "both"
+              ? "execution coverage is incomplete and an in-scope requirement lacks fully verified enforcement or test evidence"
+            : input.coverageUnknown
+              ? "this review's tool-loop coverage could not be verified (the run directory or its coverage artifact was unavailable to confirm it)"
+              : "required-check coverage or the tool-loop investigation did not finish";
+        if (!blockingPublication) {
+          withheldNotice = `\n> **Approval withheld by incomplete review coverage**: ${gap}. This run needs review; no native approval is certified.\n`;
+        }
+        messages.push(
+          `Withholding native approval for #${input.prNumber} (incomplete review coverage; reason=${incompleteReason})`,
+        );
+      }
+      if (input.mode === "review_blockers" && input.verdict === "approve" && !blockingPublication) {
+        // #1161: the mode is blockers-only — a review without blockers is
+        // published as an advisory comment and never as an approval. (A
+        // missing/invalid verdict is covered by the "No review verdict"
+        // notice above: it is a failed run, not a clean review.)
+        withheldNotice = `\n> **Advisory review (blockers-only mode)**: \`publish-mode: review_blockers\` publishes blocking findings only; a clean review is published as an ${advisoryNoun} and is never published as an approval.\n`;
+        messages.push(`Publishing advisory review for #${input.prNumber} (blockers-only mode; no approval published)`);
+      }
+      const body = buildPublishedBody({
+        markers,
+        handoffBlock,
+        obligations: obligationsInput,
+        header: "# AI Automated Review",
+        // #1596: the action-owned recommendation line — the disposition's
+        // own wording, above every model-authored surface.
+        recommendation: disposition.recommendation,
+        note: "_Full PR review._",
+        analysisEngine: input.analysisEngine,
+        sanitizedMarkdown: sanitized,
+        coverageNotice,
+        stateBlock: stateSection(platformNotice),
+        triageBlock: triageBlock || undefined,
+        routingBlock: routingBlock || undefined,
+        confidenceBlock: confidenceBlock || undefined,
+        // #1554: the withheld notice (exactly the string the append used,
+        // leading and trailing newlines included) rides the guarded build, so
+        // a prose trim can never push it past the forge's comment ceiling.
+        tailBlock: withheldNotice,
+      });
+      if (!nativeSurface.supported) {
+        // #588: the platform has no native pull-review surface, so the
+        // review is published as its managed top-level record. The body's
+        // platform notice (above, before the untrusted text) states the
+        // degradation: no native approval, blocking request, or inline
+        // comment was submitted, and the recommendation is advisory. The
+        // managed record IS the complete publication.
+        const result = await api.upsertStickyComment(input.commentMarker, body);
+        if (!result.ok) {
+          return { status: "failed", messages, error: `managed review record publication failed: ${result.error ?? "unknown error"}` };
+        }
+        // #1027/#588: the inline comments are never published on this path,
+        // so nothing derived from their identity markers may reach the
+        // outcome ledger.
+        outcomes = undefined;
+        stickyCommentId = result.commentId;
+        stickyUpdatedAt = result.updatedAt;
+        stickyBody = body;
+        messages.push(`Published the review as a managed top-level review record (no native review surface: ${surfaceReason}); no native approval or blocking request was submitted`);
+      } else {
+        // #1447: REQUEST_CHANGES remains the concrete-defect event. APPROVE
+        // is emitted only when trusted-approval eligibility is complete;
+        // COMMENT is the explicit abstention for incomplete/unknown coverage,
+        // scope/derived withholding, or blockers-only advisory output.
+        // #1596: the event is the disposition's — one derived statement, so
+        // the native event can never contradict the published recommendation
+        // line or the prose.
+        const event: NativeReviewEvent = disposition.nativeEvent;
+        // #1249: the body-only fallback must not lose the findings the inline
+        // comments carried. Under the strict policy the findings table is
+        // already part of the body, so the fallback body is unchanged (no
+        // duplicate reporting); under any other policy the bounded findings
+        // summary is appended, or nothing when there are no findings.
+        // #1518: the fallback review carries NO inline comments, so its body
+        // must not advertise any published prescription either — the
+        // suggestion-free handoff variant rides it instead.
+        // #1554: the fallback body is rebuilt through the SAME guarded
+        // builder as the primary body, with the suggestion-free handoff
+        // variant and (non-strict) the bounded findings summary joined to the
+        // withheld notice as the tail block — the raw-concatenation tail
+        // semantics make this byte-identical to the old
+        // `bodySansPublishedSuggestions(body) + summary` formula whenever the
+        // body fits AND the handoff block occurs once in the body (the
+        // normal case; the old string surgery also rewrote a handoff block
+        // echoed verbatim in the prose, which the rebuild does not —
+        // strictly safer, never looser), and it bounds the fallback
+        // publication under the same aggregate ceiling. (The notice rides
+        // the fallback because it rode the primary body the old formula
+        // derived the fallback from.)
+        const fallbackBody = buildPublishedBody({
+          markers,
+          handoffBlock: handoffBlockSansSuggestions,
+          obligations: obligationsInput,
+          header: "# AI Automated Review",
+          // #1596: the fallback body carries the same action-owned
+          // recommendation line as the primary body.
+          recommendation: disposition.recommendation,
+          note: "_Full PR review._",
+          analysisEngine: input.analysisEngine,
+          sanitizedMarkdown: sanitized,
+          coverageNotice,
+          stateBlock: stateSection(platformNotice),
+          triageBlock: triageBlock || undefined,
+          routingBlock: routingBlock || undefined,
+          confidenceBlock: confidenceBlock || undefined,
+          tailBlock: strict ? withheldNotice : withheldNotice + renderFindingsSummary(input.findings, input.upstreamLinkMode),
+        });
+        // #1596: the messages follow the EVENT the disposition chose, not
+        // `canApprove`: an open blocker under a non-strict approve submits a
+        // blocking review even when approval eligibility itself held.
+        if (event === "APPROVE") {
+          messages.push(`Submitting native approval for #${input.prNumber}`);
+        } else if (event === "REQUEST_CHANGES") {
+          messages.push(`Submitting blocking findings for #${input.prNumber}`);
+        }
+        const submitted = await submitNativeReview(api, {
+          event,
+          body,
+          fallbackBody,
+          commitId: input.headSha,
+          comments: inlineComments,
+        });
+        fallbackSubmission = submitted.fellBack;
+        if (submitted.fellBack) {
+          const compensated = !strict && fallbackBody !== body;
+          messages.push(
+            "WARN: commit-bound review submission failed; falling back to plain review"
+              + (compensated ? " with the findings summary appended to the review body" : ""),
+          );
+          // #1027: the plain fallback carries no inline comments, so nothing
+          // this run derived for them was ever published.
+          outcomes = undefined;
+        }
+      if (!submitted.ok) {
+        // #1576: the attestation must distinguish "the native APPROVE
+        // submission itself failed" (unavailable) from other publication
+        // failures — the attempted event rides the result either way.
+        if (event === "APPROVE") {
+          for (const line of APPROVAL_FAILURE_GUIDANCE) messages.push(line);
+          return {
+            status: "failed",
+            messages,
+            error: `native approval failed for #${input.prNumber}`,
+            native: { event, submitted: false, ...(submitted.fellBack ? { fellBack: true as const } : {}) },
+          };
+        }
+        return {
+          status: "failed",
+          messages,
+          error: `native review submission failed: ${submitted.error ?? "unknown error"}`,
+          native: { event, submitted: false, ...(submitted.fellBack ? { fellBack: true as const } : {}) },
+        };
+      }
+      nativeReviewId = submitted.reviewId;
+      // #1576: a verdict-bearing native review landed — the ONLY event that
+      // can certify the `approved` attestation downstream. The body-only
+      // fallback (#1249) is disclosed, never hidden, because it landed
+      // without a commit binding.
+      nativeSubmission = { event, submitted: true, ...(submitted.fellBack ? { fellBack: true as const } : {}) };
+      messages.push(`Submitted native review (${event}) with ${submitted.inlineCount} inline comment(s)`);
+      }
+    }
+  } catch (error) {
+    return {
+      status: "failed",
+      messages,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  // Retire old inline findings only after a complete replacement at the expected head.
+  if (cleanupEnabled) {
+    // #1093: what proves this run fully replaced the previous publication.
+    // review-verdict/inline-finding runs use the native review they created;
+    // a review_comment run with no inline findings uses the sticky summary
+    // comment plus its publication timestamp (a clean re-review creates no
+    // native review at all). Missing both: no cleanup (fail closed).
+    type ReplacementCheckpoint =
+      | { kind: "review"; reviewId: number | string }
+      | { kind: "sticky"; commentId: number | string; updatedAt: string; body: string };
+    const replacementCheckpoint: ReplacementCheckpoint | undefined =
+      nativeReviewId !== undefined
+        ? { kind: "review", reviewId: nativeReviewId }
+        : stickyCheckpointUsable && stickyCommentId !== undefined && stickyUpdatedAt !== undefined && stickyBody !== undefined
+          ? { kind: "sticky", commentId: stickyCommentId, updatedAt: stickyUpdatedAt, body: stickyBody }
+          : undefined;
+    // #1656: the retirement gate keeps its own coverage-completeness signal —
+    // publication hygiene (when this run may retire the previous run's
+    // inline comments and threads), not disposition semantics: advisory-only
+    // bookkeeping diagnostics never made a replacement incomplete.
+    const replacementCoverageComplete = !input.partialCoverage && !input.coverageUnknown
+      && reviewResult !== "partial" && incompleteReason === "none" && input.degradedGateBypass !== true;
+    const replacementComplete = replacementCoverageComplete && !fallbackSubmission && replacementCheckpoint !== undefined;
+    // #1114/#1144: verification below (head, trusted owner, supersession
+    // ordering, still-current revalidation) is what proves staleness — not
+    // coverage completeness. A published checkpoint therefore authorizes
+    // hiding every proven-superseded managed review (minimization, plus
+    // dismissal of a stale verdict state) even when the replacement is
+    // incomplete: the newest published managed review is the only visible
+    // one. The destructive effects (inline-comment retirement, thread
+    // resolution) stay behind the strict complete-replacement gate.
+    if (replacementCheckpoint !== undefined) {
+      try {
+        const verifiedHead = await api.getHeadSha();
+        if (verifiedHead !== input.headSha) {
+          messages.push("  WARN: Head changed after publication; leaving previous inline comments and review bodies unchanged");
+        } else {
+          // #1093: ownership decisions run under the shared forge-agnostic
+          // owner-identity policy (login proof, or - for Forgejo Authorized
+          // Integration - the audience-derived user id). Unproven identity
+          // fails closed: nothing is deleted.
+          // #1116: the run's single shared resolution — the same proof the
+          // carry-marker and outcome-identity reads already used (or that
+          // this path proves first for everyone), so the Forgejo reaction
+          // self-write probe fires once per run, not once per read.
+          const { owner, reason } = await trustedOwnerForRun();
+          if (owner === null) {
+            // #1144: an unproven identity hides no previous managed review
+            // body and retires no inline comment — both effects are skipped.
+            messages.push("WARN: Could not verify authenticated owner (identity reason: " + reason + "); no previous managed review bodies hidden and no inline comments retired");
+          } else {
+            const previous = previousReviews.filter((r) => ownerMatchesIdentity(r.user, owner));
+            const reviewInstant = (r: { submitted_at?: string; updated_at?: string }): string => {
+              if (typeof r.submitted_at === "string" && r.submitted_at !== "") return r.submitted_at;
+              return typeof r.updated_at === "string" && r.updated_at !== "" ? r.updated_at : "";
+            };
+            let olderManaged: typeof previous;
+            if (replacementCheckpoint.kind === "review") {
+              const newestId = BigInt(String(replacementCheckpoint.reviewId));
+              olderManaged = previous.filter((r) => {
+                if (!isManagedBody(typeof r.body === "string" ? r.body : "", input.commentMarker)) return false;
+                try { return BigInt(String(r.id)) < newestId; } catch { return false; }
+              });
+            } else {
+              const checkpointMs = Date.parse(replacementCheckpoint.updatedAt);
+              olderManaged = Number.isNaN(checkpointMs)
+                ? []
+                : previous.filter((r) => {
+                  if (!isManagedBody(typeof r.body === "string" ? r.body : "", input.commentMarker)) return false;
+                  const instant = reviewInstant(r);
+                  const stamp = instant === "" ? Number.NaN : Date.parse(instant);
+                  return !Number.isNaN(stamp) && stamp < checkpointMs;
+                });
+            }
+            if (olderManaged.length > 100) {
+              messages.push("WARN: Previous managed review snapshot exceeds cleanup bound; cleanup skipped");
+            } else {
+              const stillCurrent = async () => {
+                if (await api.getHeadSha() !== input.headSha) return false;
+                if (replacementCheckpoint.kind === "review") {
+                  const latest = await api.listReviews();
+                  const replacement = latest.find((r) => String(r.id) === String(replacementCheckpoint.reviewId));
+                  if (!replacement || !isManagedBody(typeof replacement.body === "string" ? replacement.body : "", input.commentMarker)) return false;
+                  const newest = latest
+                    .filter((r) => isManagedBody(typeof r.body === "string" ? r.body : "", input.commentMarker))
+                    .reduce<bigint | null>((max, r) => { try { const id = BigInt(String(r.id)); return max === null || id > max ? id : max; } catch { return max; } }, null);
+                  return newest === BigInt(String(replacementCheckpoint.reviewId));
+                }
+                // Sticky checkpoint: the sticky comment must still exist, still
+                // be the managed body owned by this run, and must not have been
+                // re-published after the checkpoint - and no managed review of
+                // ANY author may be newer than the checkpoint (a foreign
+                // model's review supersedes the run too). A review without a
+                // usable timestamp fails closed.
+                const checkpointMs = Date.parse(replacementCheckpoint.updatedAt);
+                if (Number.isNaN(checkpointMs)) return false;
+                const latest = await api.listReviews();
+                const stickyLatest = (await api.listIssueComments()).find((c) => String(c.id) === String(replacementCheckpoint.commentId));
+                if (!stickyLatest || !isManagedBody(typeof stickyLatest.body === "string" ? stickyLatest.body : "", input.commentMarker)) return false;
+                if (!ownerMatchesIdentity(stickyLatest.user, owner)) return false;
+                // The sticky body must be byte-identical to what THIS run
+                // published: an overlapping run re-publishing in the same
+                // second (refreshed timestamp equal to the checkpoint) with a
+                // different body would otherwise pass for this run's state.
+                if (stickyLatest.body !== replacementCheckpoint.body) return false;
+                const refreshedMs = Date.parse(stickyLatest.updated_at ?? "");
+                // A newer instant means the sticky was re-published after
+                // this checkpoint (an overlapping run owns the replacement);
+                // a missing/older one is unproven. Either way: fail closed.
+                if (Number.isNaN(refreshedMs) || refreshedMs !== checkpointMs) return false;
+                return !latest.some((r) => {
+                  if (!isManagedBody(typeof r.body === "string" ? r.body : "", input.commentMarker)) return false;
+                  const instant = reviewInstant(r);
+                  const stamp = instant === "" ? Number.NaN : Date.parse(instant);
+                  // Fail closed on ties too: a competing managed review
+                  // submitted in the SAME second as the checkpoint cannot be
+                  // proven older than it.
+                  return Number.isNaN(stamp) || stamp >= checkpointMs;
+                });
+              };
+              if (await stillCurrent()) {
+                if (replacementComplete) {
+                  // #1099: the identity resolved above is threaded into retirement
+                  // (one resolution, one Forgejo reaction probe per publish run).
+                  await retireManagedInlineComments(api, olderManaged, input.commentMarker, cleanupLog, { owner, reason }, stillCurrent);
+                  if (await stillCurrent()) {
+                    const managedIds = await cleanupManagedReviews(api, input.prNumber, input.commentMarker, cleanupLog, [], olderManaged);
+                    if (api.platform === "github") await resolveSupersededThreads(api, managedIds, cleanupLog);
+                    else messages.push(`NOTE: Skipping review-thread resolution (platform=${api.platform}; no GraphQL API)`);
+                  }
+                } else {
+                  // #1144: the checkpoint proves a newer managed publication
+                  // at the current head, so every older managed review from
+                  // this identity is proven superseded: its body is hidden
+                  // and its stale APPROVED/CHANGES_REQUESTED verdict
+                  // dismissed even though this run's replacement is partial
+                  // or used the fallback submission path. Only the
+                  // destructive inline-comment retirement and thread
+                  // resolution above stay gated on complete coverage.
+                  messages.push("NOTE: Replacement is not complete (incomplete coverage or fallback submission); previous inline comments left in place, hiding superseded managed review bodies");
+                  // #1144: the replacement this run published is never a
+                  // cleanup target, even if a future call site would offer
+                  // it: the ordering already excludes it, this makes it
+                  // explicit.
+                  const excluded = replacementCheckpoint.kind === "review"
+                    ? [String(replacementCheckpoint.reviewId)]
+                    : [];
+                  await hideSupersededManagedReviews(api, olderManaged, input.commentMarker, cleanupLog, { owner, reason }, excluded, stillCurrent);
+                }
+              } else messages.push("WARN: A newer review superseded this run; cleanup skipped");
+            }
+          }
+        }
+      } catch { messages.push("WARN: Cleanup failed safely; replacement review remains published"); }
+    } else {
+      // #1093: distinguish "cleanup never had a checkpoint" from the other
+      // skip reasons so operators can tell retirement did not run at all
+      // (e.g. a failed inline-findings submission, or a forge response
+      // without a usable sticky timestamp).
+      messages.push("WARN: No replacement checkpoint (no native review id and no sticky publication timestamp); previous inline comments left in place");
+    }
+  }
+
+  // #1254: Re-review label cleanup: best-effort, never fails the run. The
+  // built-in adapters never reject (they return false), but the contract is
+  // enforced here too: an unexpected rejection after a successful publication
+  // is swallowed, never turned into a failed publish.
+  if (input.rerunLabel) {
+    try {
+      if (!(await api.removeLabel(input.rerunLabel))) {
+        messages.push("WARN: Re-review label cleanup did not complete (best-effort; publication result unchanged)");
+      }
+    } catch {
+      messages.push("WARN: Re-review label cleanup failed unexpectedly (best-effort; publication result unchanged)");
+    }
+  }
+
+  // #1116: the tally line ships only with the ledger it counts — every drop
+  // path above (failed submission, #588 managed record) removed the artifact,
+  // and the summary must not survive its export.
+  if (outcomes !== undefined && outcomesSummary !== undefined) messages.push(outcomesSummary);
+  return {
+    status: "published",
+    messages,
+    ...(outcomes !== undefined ? { outcomes } : {}),
+    // #1576: the verdict-bearing native submission record, when one landed.
+    ...(nativeSubmission !== undefined ? { native: nativeSubmission } : {}),
+  };
+}

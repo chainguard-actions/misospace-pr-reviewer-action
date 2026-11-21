@@ -1,49 +1,297 @@
-# misospace/pr-reviewer-action
+<div align="center">
 
-Review pull requests with OpenAI- or Anthropic-compatible models and post an optional sticky comment.
+# 🤖 pr-reviewer-action
 
-Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/misospace/pr-reviewer-action](https://github.com/misospace/pr-reviewer-action).
+**AI pull request reviews with any OpenAI- or Anthropic-compatible model — cloud or self-hosted.**
 
-## Versions
+*Point it at your llama.cpp box or your Anthropic key. Either way, every PR gets a real review.*
 
-| Version | Tag | Upstream commit | Hardening report |
-|---------|-----|-----------------|------------------|
-| v1.2.9 | [`v1.2.9`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.2.9) | [`4126a27`](https://github.com/misospace/pr-reviewer-action/commit/4126a2701a5e9adcf7c48ac6eb678e2e3a2bb2a0) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v1.2.9/HARDENING.md) |
-| v1.3.0 | [`v1.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.3.0) | [`3479bf5`](https://github.com/misospace/pr-reviewer-action/commit/3479bf51ab9133414ae07af783bff985d3929884) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v1.3.0/HARDENING.md) |
-| v1.3.1 | [`v1.3.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v1.3.1) | [`7189223`](https://github.com/misospace/pr-reviewer-action/commit/7189223d79151d0508bdb1c60b6e60097e998ce5) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v1.3.1/HARDENING.md) |
-| v2.0.0 | [`v2.0.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.0) | [`7e25f7d`](https://github.com/misospace/pr-reviewer-action/commit/7e25f7d0d8651e936f3158477b0a364f27ed7383) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.0.0/HARDENING.md) |
-| v2.0.2 | [`v2.0.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.2) | [`529f5e8`](https://github.com/misospace/pr-reviewer-action/commit/529f5e897d0f0f6b203ccb74102ecc586bee538a) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.0.2/HARDENING.md) |
-| v2.0.3 | [`v2.0.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.0.3) | [`b06e61d`](https://github.com/misospace/pr-reviewer-action/commit/b06e61dde363d369173d82c7126f7b71e5c40c63) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.0.3/HARDENING.md) |
-| v2.1.0 | [`v2.1.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.0) | [`6ccb182`](https://github.com/misospace/pr-reviewer-action/commit/6ccb1823b99a0da09e9946dccd7437648d7771e1) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.0/HARDENING.md) |
-| v2.1.1 | [`v2.1.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.1) | [`41d9ffa`](https://github.com/misospace/pr-reviewer-action/commit/41d9ffadf39c7f317ef3cb6885d9f48447dcad23) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.1/HARDENING.md) |
-| v2.1.10 | [`v2.1.10`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.10) | [`6f4fb72`](https://github.com/misospace/pr-reviewer-action/commit/6f4fb724b222f6d9a83096d6b41cd636ef3a044e) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.10/HARDENING.md) |
-| v2.1.11 | [`v2.1.11`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.11) | [`d38d634`](https://github.com/misospace/pr-reviewer-action/commit/d38d63486d81156724191a438719bdd0431952c4) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.11/HARDENING.md) |
-| v2.1.2 | [`v2.1.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.2) | [`a177c34`](https://github.com/misospace/pr-reviewer-action/commit/a177c3478b52a6f8402ebbe9a0ba59c61cf028ed) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.2/HARDENING.md) |
-| v2.1.3 | [`v2.1.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.3) | [`16da477`](https://github.com/misospace/pr-reviewer-action/commit/16da47790168e70ca1f5f94821375f5b6e44a2c2) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.3/HARDENING.md) |
-| v2.1.5 | [`v2.1.5`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.5) | [`071a139`](https://github.com/misospace/pr-reviewer-action/commit/071a13976b80df2d5ea0e45285bcafcdae2c8a9e) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.5/HARDENING.md) |
-| v2.1.7 | [`v2.1.7`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.7) | [`258ac49`](https://github.com/misospace/pr-reviewer-action/commit/258ac494ff48261cba9a62dce384b35ed73404ba) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.7/HARDENING.md) |
-| v2.1.8 | [`v2.1.8`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.8) | [`a14a8bb`](https://github.com/misospace/pr-reviewer-action/commit/a14a8bb4e15ac6765eba782b2b21c7bcb351ffee) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.8/HARDENING.md) |
-| v2.1.9 | [`v2.1.9`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.1.9) | [`1cb6bed`](https://github.com/misospace/pr-reviewer-action/commit/1cb6bed7a29f0d528ff5ba56bcf57092bf096af1) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.1.9/HARDENING.md) |
-| v2.2.0 | [`v2.2.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.2.0) | [`99e7764`](https://github.com/misospace/pr-reviewer-action/commit/99e7764a4906f94d99c249231d2016c3cda8997e) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.2.0/HARDENING.md) |
-| v2.2.1 | [`v2.2.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.2.1) | [`54dfb1a`](https://github.com/misospace/pr-reviewer-action/commit/54dfb1aac20e1e410ad8f71dc3681b888500a1ec) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.2.1/HARDENING.md) |
-| v2.3.0 | [`v2.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.0) | [`f089f7c`](https://github.com/misospace/pr-reviewer-action/commit/f089f7c41375bef3b0e41c277d65e4d104b5641b) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.3.0/HARDENING.md) |
-| v2.3.1 | [`v2.3.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.1) | [`398d92d`](https://github.com/misospace/pr-reviewer-action/commit/398d92dea2644f8b9ea139f135e4fb4c6d60d6b0) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.3.1/HARDENING.md) |
-| v2.3.2 | [`v2.3.2`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.2) | [`b21c335`](https://github.com/misospace/pr-reviewer-action/commit/b21c335693194d7ae9b7ac77bc4e04a66e3c8e61) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.3.2/HARDENING.md) |
-| v2.3.3 | [`v2.3.3`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.3.3) | [`f1605b9`](https://github.com/misospace/pr-reviewer-action/commit/f1605b97871cc821302a8b4827f9058a4d6cd7cb) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.3.3/HARDENING.md) |
-| v2.4.0 | [`v2.4.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.4.0) | [`acb9476`](https://github.com/misospace/pr-reviewer-action/commit/acb9476d7358801d854f9c57366bbfbef401acd5) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.4.0/HARDENING.md) |
-| v2.5.0 | [`v2.5.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v2.5.0) | [`a962cdf`](https://github.com/misospace/pr-reviewer-action/commit/a962cdfc21c378a3b8cf2d8b194c787408e60e6b) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v2.5.0/HARDENING.md) |
-| v3.0.0 | [`v3.0.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.0.0) | [`2c1db88`](https://github.com/misospace/pr-reviewer-action/commit/2c1db8864069b1c747728ce935f469849d32c4c0) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.0.0/HARDENING.md) |
-| v3.0.1 | [`v3.0.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.0.1) | [`22c7da6`](https://github.com/misospace/pr-reviewer-action/commit/22c7da6cbc914d2bc235ca2e928d32b6408fcfff) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.0.1/HARDENING.md) |
-| v3.1.0 | [`v3.1.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.1.0) | [`aa12ad9`](https://github.com/misospace/pr-reviewer-action/commit/aa12ad9909b1ee8a5a7fe00dceeb1a8c97ab27dd) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.1.0/HARDENING.md) |
-| v3.2.0 | [`v3.2.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.2.0) | [`c86f3e9`](https://github.com/misospace/pr-reviewer-action/commit/c86f3e94191c9078e92714b10f39deb8d3466268) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.2.0/HARDENING.md) |
-| v3.3.0 | [`v3.3.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.3.0) | [`829f395`](https://github.com/misospace/pr-reviewer-action/commit/829f395f7154b4d87c229500fd09b30a8ad2224d) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.3.0/HARDENING.md) |
-| v3.4.0 | [`v3.4.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.4.0) | [`e78e531`](https://github.com/misospace/pr-reviewer-action/commit/e78e531cee6c7b10279be68454f3f7051fd85048) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.4.0/HARDENING.md) |
-| v3.4.1 | [`v3.4.1`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.4.1) | [`768a132`](https://github.com/misospace/pr-reviewer-action/commit/768a1320d67f14b99737633a5f8ba58449c3caeb) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.4.1/HARDENING.md) |
-| v3.5.0 | [`v3.5.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.5.0) | [`593f1b7`](https://github.com/misospace/pr-reviewer-action/commit/593f1b7b41bb05aa18d1f9278205e7204b1505ab) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.5.0/HARDENING.md) |
-| v3.6.0 | [`v3.6.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.6.0) | [`e207a7d`](https://github.com/misospace/pr-reviewer-action/commit/e207a7d11d2ee41f77493b2314e30e7ca694da50) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.6.0/HARDENING.md) |
-| v3.7.0 | [`v3.7.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.7.0) | [`5b18395`](https://github.com/misospace/pr-reviewer-action/commit/5b1839535748f3afd1bd3ef04e8009302cba9aa6) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.7.0/HARDENING.md) |
-| v3.8.0 | [`v3.8.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.8.0) | [`0a2d273`](https://github.com/misospace/pr-reviewer-action/commit/0a2d2732f7358e509e6a85e11160eb25cc5b1b80) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.8.0/HARDENING.md) |
-| v3.9.0 | [`v3.9.0`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/tree/v3.9.0) | [`25dae60`](https://github.com/misospace/pr-reviewer-action/commit/25dae600b49c50c18d9b05cc8812943a1f5412ec) | [`HARDENING.md`](https://github.com/chainguard-actions/misospace-pr-reviewer-action/blob/v3.9.0/HARDENING.md) |
+[![CI](https://github.com/misospace/pr-reviewer-action/actions/workflows/ci.yaml/badge.svg)](https://github.com/misospace/pr-reviewer-action/actions/workflows/ci.yaml)
+[![Latest release](https://img.shields.io/github/v/release/misospace/pr-reviewer-action)](https://github.com/misospace/pr-reviewer-action/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**[Quick start](#-quick-start)** · **[Documentation](docs/README.md)** · **[Inputs](docs/inputs.md)** · **[Troubleshooting](docs/troubleshooting.md)** · **[Migrating from v2](docs/v3-migration.md)**
+
+</div>
+
+---
+
+The action reviews each pull request with the model you point it at. It collects the diff, linked issues, CI results, repository standards and evidence; lets the model read the checkout through a bounded, read-only tool loop; and publishes structured findings with a verdict derived from them, as a native review or a sticky comment.
+
+## ✨ Highlights
+
+- 🏠 **Local-model-first**: ollama, llama.cpp, vLLM, LiteLLM, or any OpenAI/Anthropic-compatible endpoint, with an optional fallback model.
+- 🔎 **Gathers its own evidence**: a native tool loop reads files, greps, follows git history and calls GitHub APIs or MCP servers before the verdict, with a budget that scales with the PR.
+- 🧭 **Deterministic classification**: rule-based risk flags and required checks keep smaller models focused; specialist passes run only when the change warrants them.
+- ⚖️ **Verdicts you can audit**: request changes only for open blocker/major findings, and a review that couldn't read everything says so and never approves.
+- 💸 **Token-saving**: an unchanged diff skips the model entirely and carries the prior verdict forward.
+- 🛡️ **Safe by default**: standards and prompts read from the base branch, read-only tools, secret redaction, approvals off unless you select `publish-mode: review_verdict`, cross-repository approvals off unless `approve-forks: true`, fork PRs isolated.
+
+## 🚀 Quick start
+
+```yaml
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: misospace/pr-reviewer-action@v3
+        with:
+          ai-base-url: ${{ vars.AI_BASE_URL }}
+          ai-api-key: ${{ secrets.AI_API_KEY }}
+          ai-model: ${{ vars.AI_MODEL }}
+```
+
+That is the whole setup: an OpenAI-compatible endpoint (set `ai-api-format: anthropic` for an Anthropic-compatible one), its key, and a model. The defaults are the recommended configuration: the native tool loop gathers evidence from the checkout, specialist leads run when the change warrants them, CI results are folded in as evidence, and findings post as a non-blocking review anchored to the diff. `github-token` defaults to the job token. The `if:` guard on the job is a cheap early exit, not the authority — the action's precheck skips draft PRs deterministically, so a workflow that forgot it still never reviews a draft.
+
+### Specialist model overrides
+
+Deep-review specialists inherit the primary model by default. These workflow inputs opt into a shared specialist profile and optional model-only role overrides; the profile's endpoint and credentials are shared by all three roles.
+
+| Input | Purpose |
+|---|---|
+| `ai-specialist-model` | Enable a specialist model profile; blank keeps the current primary-profile behavior. |
+| `ai-specialist-base-url` | Optional profile endpoint; blank inherits the primary endpoint. Requires `ai-specialist-model`. |
+| `ai-specialist-api-format` | Optional profile format (`openai` or `anthropic`); blank inherits the primary format. Requires `ai-specialist-model`. |
+| `ai-specialist-api-key` | Optional profile key; blank inherits the primary key. Requires `ai-specialist-model`. |
+| `ai-specialist-correctness-model` | Model-only override for the correctness role. |
+| `ai-specialist-security-model` | Model-only override for the security role. |
+| `ai-specialist-tests-model` | Model-only override for the tests role. |
+
+Role overrides share the profile transport and are ignored with a warning for `DEEP_REVIEW_EXECUTION=combined_scout`, which makes a single shared model call. See [Models and routing](docs/models-and-routing.md#specialist-profile-overrides) for precedence and examples.
+
+**Requirements:** it is a JavaScript action (`runs.using: node24`), so GitHub-hosted runners need nothing installed; the runner provides Node. The repository under review must be checked out (`fetch-depth: 0` gives the history context). `checks: read` lets the review wait for CI; without it the CI evidence is skipped. On Forgejo, use runner 9 or newer with a job image that has Node 22+ and `git`.
+
+### Independent confidence scorer (opt-in)
+
+Set `ai-confidence-model` and the review runs one extra, bounded model call. It independently verifies whether the change is safe to merge, and reports a merge-readiness score from 0 to 5 with a risk band. Default off: without the model the scorer costs nothing and nothing confidence-related appears anywhere.
+
+| Input | Purpose |
+|---|---|
+| `ai-confidence-model` | Enable the scorer; blank (default) keeps every confidence surface off. |
+| `ai-confidence-base-url` | Optional scorer endpoint; blank inherits the primary endpoint. |
+| `ai-confidence-api-format` | `openai` or `anthropic`; blank (default) inherits the primary format — except under `require-dedicated`, where the family is dedicated configuration and a blank is refused (`unscored`, cause `dedicated_format_missing`, #1481). |
+| `ai-confidence-api-key` | Scorer endpoint key. A distinct endpoint never inherits the primary key. |
+| `ai-confidence-isolation` | `inherit-primary` (default) or `require-dedicated`. `require-dedicated` refuses the same-endpoint inheritance: a scorer model without its own `ai-confidence-base-url` publishes `confidence-status: unscored` (cause `dedicated_config_missing`) instead of silently dialing the primary endpoint under the primary credential. The mode likewise refuses a missing dedicated model (`dedicated_model_missing`) and a missing dedicated wire family (`dedicated_format_missing`, #1481). The review itself is unaffected. |
+| `ai-confidence-tokens-param` | OpenAI token-limit field for the verifier's requests: `max_tokens` or `max_completion_tokens` (ignored on the anthropic wire). Explicit always wins; blank under `inherit-primary` keeps the run's `ai-tokens-param` convention, and blank under `require-dedicated` resolves the verifier-owned `max_tokens` — the dedicated verifier never inherits the review lane's field (#1481). |
+| `ai-confidence-timeout-sec` | Wall-clock budget for the scorer call, default 120. |
+| `ai-confidence-reasoning-effort` | Optional effort token; blank omits the field entirely. |
+| `ai-confidence-max-tokens` | Completion budget for the scorer's answer, default 4096. Reasoning models spend part of it thinking, so it must leave room for the hidden reasoning *and* the final JSON answer. |
+| `ai-confidence-prompt-tokens` | Prompt budget for the scorer's one call, default 98304 (~96k). The estimate is bytes/4; the diff is truncated in-band when the prompt exceeds it, and the call is refused (`unscored`) rather than sent over the budget. |
+| `ai-confidence-model-context-tokens` | Optional declared context window of the scorer model. When set, both budgets are clamped so prompt + completion fit the window; a window too small for even the smallest real request disables the scorer with a warning. |
+| `ai-confidence-anthropic-effort-support` | Operator-only assertion that an Anthropic-format scorer endpoint accepts `output_config.effort`. Never inferred from the model name and never inherited from another lane; unasserted, the effort bytes are simply absent and the run says so. |
+| `ai-confidence-structured-output-support` | Operator-only assertion that the scorer endpoint accepts structured output with the scorer's own JSON schema, on either wire format. Unasserted (default), the request bytes are unchanged. |
+| `ai-confidence-enable-for-forks` | Operator-only; default `false` keeps the scorer off cross-repository (fork) PRs, because the prompt carries the review's own privileged output to a separate endpoint under a privileged credential. |
+
+**Local models:** point `ai-confidence-base-url` at your server's OpenAI-compatible URL (e.g. `http://localhost:11434/v1` for ollama) with `ai-confidence-api-format: openai`; Anthropic-compatible local proxies take `ai-confidence-api-format: anthropic`. A keyless scorer endpoint may only be loopback (`localhost`, `127.0.0.1`, `::1`) — any other distinct endpoint must set `ai-confidence-api-key`, because the primary lane's key never rides a different URL.
+
+**Cost ceilings:** exactly one extra model call per published review — bounded (`ai-confidence-max-tokens` completion, default 4096; `ai-confidence-prompt-tokens` prompt, default ~96k; no tools, no corpus), one wire attempt, no retries. The call is capped by `ai-confidence-timeout-sec` (default 120s). Any failure — timeout, HTTP 429/5xx, malformed answer, or a prompt that does not fit the declared budgets — degrades to `confidence-status: unscored`. The review itself is unchanged — same verdict, findings, required checks, and approval — but the published body gains the additive advisory `Independent confidence` section and the review marker gains the confidence keys.
+
+**What a score means:** an independent merge-safety verification of *the change*, not a self-assessment of how well the review covered its own conclusions. The verifier reads the PR description and the diff itself. It asks whether the change is safe to merge, from the evidence the review carries. The score answers that question, and it is not a probability that the code is correct. `cannot_verify` fails closed to `unscored`: when the supplied evidence is too incomplete to verify, the verifier declines instead of guessing a score. The score never changes the verdict, the findings, the required checks, or publication. Deterministic caps outrank the model. A blocker finding caps the score at 2. A major finding or incomplete review coverage caps it at 3. A concern the verifier itself raises caps it at 4.
+
+**Independence:** the scorer resolving to the same endpoint and model that wrote the review is correlated self-grading, not independent evidence — the action warns about it. Point `ai-confidence-base-url` at a different backend for a genuine second opinion. Workflows that REQUIRE that independence set `ai-confidence-isolation: require-dedicated` (#1478): the verifier's endpoint, credential, model, wire family, and OpenAI token-limit field then resolve only from the workflow's own dedicated configuration (#1481) — a missing dedicated endpoint (`dedicated_config_missing`), model (`dedicated_model_missing`), or wire family (`dedicated_format_missing`) fails visibly as `unscored` instead of silently inheriting the primary transport, and the dedicated verifier's token field defaults to the verifier-owned `max_tokens` rather than the review lane's `ai-tokens-param`.
+
+**Where results appear:** the five `confidence-*` step outputs, an `Independent confidence` row in the step summary, an advisory section in the published review, the additive confidence keys in the review marker, and the `confidence-score.json` / `confidence-request.json` / `confidence-response.json` run artifacts. Disabled runs keep all of it absent.
+
+The review marker also carries the verifier's own evidence. `confidence_cause` says why the verifier did not score, for example a timeout or a rate limit. `confidence_latency_ms` says how long the provider took to answer the verifier's call. `confidence_prompt_tokens`, `confidence_completion_tokens`, and `confidence_total_tokens` say how many tokens the call used. A key is absent when the run has no value for it.
+
+## ⚙️ How it works
+
+```mermaid
+flowchart LR
+    A[Precheck<br/>diff fingerprint] -->|unchanged| Z[Skip review 💤]
+    A -->|changed| B[CI wait + specialist passes<br/><i>in parallel</i>]
+    B --> C[Collect context<br/>diff · issues · standards · evidence]
+    C --> D[Tool loop<br/>read-only evidence gathering]
+    D --> E[Review<br/>primary / smart / fallback model]
+    E --> F[Enforce<br/>strict verdict · coverage]
+    F --> G[Publish<br/>native review / comment]
+```
+
+## 🖥️ Platform support
+
+The action works on **GitHub** and **Forgejo** (1.4.x). **Tangled** support is experimental. Set `platform: auto` (default) to detect the platform from `TANGLED_REPO_DID` (the Tangled repository owner DID, checked first), `GITHUB_SERVER_URL` and `FORGEJO_API_URL`, or set it explicitly to `github` / `forgejo` / `tangled`. An explicit `tangled` requires `TANGLED_REPO_DID`.
+
+| Feature | GitHub | Forgejo | Tangled (experimental) |
+|---|---|---|---|
+| PR diff, files, metadata | ✅ Full | ✅ Full (REST backend) | ✅ Full — ticket + immutable patch revision from the repo account on the knot, and the diff/files derived from the revision's trusted base/head over the Git read surface |
+| Managed sticky comment | ✅ Full | ✅ Full | ✅ Full — one managed AT-Proto review record bound to the ticket, published only after the knot-proven current-head check passes |
+| Native review comments (`review_comment`) | ✅ Full | ⚠️ Degraded — REST-based; no inline line anchors | ❌ Unsupported — Tangled has no inline review object |
+| Native review verdicts (`review_verdict`) | ✅ Full | ⚠️ Degraded — approve/request_changes via REST | ❌ Unsupported — Tangled has no native verdict object |
+| Native blocking reviews (`review_blockers`) | ✅ Full | ⚠️ Degraded — request_changes/comment via REST | ❌ Unsupported — the verdict stays in the review body |
+| Cleanup: dismiss stale reviews | ✅ Full | ✅ Full (REST) | ❌ Unsupported — the managed record is updated in place |
+| Cleanup: minimizeComment (hide outdated) | ✅ Full | ⚠️ Incomplete-replacement path: author-side deletion of superseded non-verdict (COMMENTED/DISMISSED) non-official reviews that carry no inline findings (REST); verdict reviews degrade to dismissal and are never deleted (verdict deletion could reactivate a stale verdict upstream); findings-bearing reviews stay visible (no GraphQL) | ❌ Unsupported — Tangled has no review cleanup surface |
+| CI status check polling | ✅ Full | ✅ Commit-status polling (Forgejo REST; own single-job status auto-discovered by run-jobs API) | ❌ Unsupported — the runner turns the CI gate off |
+| Evidence providers | ✅ Full | ✅ Full | ⚠️ Degraded — the provider commands read the checkout. A provider that calls the GitHub API does not work |
+| Tool harness | ✅ Full | ✅ Full | ⚠️ Degraded — the `gh_api` and `repo_contents` tools fail |
+| Reviewer-requested smart escalation | ✅ Full | ✅ Full | ✅ Full — the engine path is shared, and a Tangled run reaches a verdict |
+
+Forgejo Authorized Integrations can reuse managed sticky comments with repository and issue permissions; `read:user` is not required. The action matches the integration owner's ID from its Forgejo-generated audience against comment author IDs. If a prior managed comment has no usable author ID and ownership cannot be established, publication fails closed.
+
+### 🧪 Tangled (experimental)
+
+Tangled is not GitHub Actions, so `action.yml` is not the Tangled entry point. A Tangled review runs on the host-neutral runner, `node dist/index.js tangled`, in one plain Node process. The runner pins the platform to `tangled` and refuses a `github` or `forgejo` platform instead of falling back to another forge.
+
+A Tangled run completes end-to-end on the stock adapter on the current record model ([#1690](https://github.com/misospace/pr-reviewer-action/issues/1690)): the run resolves one `org.tangled.track.ticket` pull request plus its newest immutable `org.tangled.review.patch` revision from the repository account on the knot, derives the reviewed diff/files from that revision's trusted base/head over the Git read surface, and publishes the managed review record bound to the ticket. Publication stays fail-closed: the trustworthy current-head read ([#1165](https://github.com/misospace/pr-reviewer-action/issues/1165)) must prove the pull did not advance, because a review that cannot prove that is never published. That read needs `TANGLED_REPO_KNOT` and `TANGLED_REPO_REPO_DID`, so for an open pull that is not a proven draft the runner checks this before the review starts: a missing value stops the run with a diagnostic naming it ([#1692](https://github.com/misospace/pr-reviewer-action/issues/1692), [#1696](https://github.com/misospace/pr-reviewer-action/issues/1696)). The metadata read itself needs the same knot and repository account, so when that gap is what makes the metadata unreadable, the named error still comes first ([#1696](https://github.com/misospace/pr-reviewer-action/issues/1696)). A closed or proven-draft pull does not need that configuration.
+
+Read [Tangled (experimental)](docs/tangled.md) for the setup, the configuration, the identity model and the full support matrix. The copyable Spindle workflow example is [`examples/tangled-workflow.yml`](examples/tangled-workflow.yml).
+
+**PR reviewability metadata is capability-checked, not version-guessed.** A successfully read PR must explicitly report a boolean `draft` value to be reviewable: `draft: true` skips as `pr-draft`, while a readable payload with a missing or malformed draft bit fails closed as `pr-draft-unknown`. A failed PR metadata lookup on the ordinary shared-admission path is an operational failure and fails the run rather than producing a green skip; the human-triggered re-review command keeps its retriable `comment-pr-lookup-failed` behavior. We intentionally do not claim a Forgejo version floor for the `draft` field: deployments and API compatibility layers vary, and the runtime checks the capability directly. If an instance repeatedly reports `pr-draft-unknown`, its pull-request endpoint must be upgraded or configured to return an explicit boolean `draft`.
+
+> **Note:** On Forgejo, features requiring GitHub's GraphQL API (review minimization) are skipped with a clear log line. CI auto-discovery requires Forgejo v16.0+ (the first release with the run-jobs API) and excludes a pending status only when that API proves this is a single-job run. If the job has an `html_url`, its path must exactly match the status `target_url` path on the runner's origin. Forgejo v16 jobs omit `html_url`; in that case the job's `run_id` must match the queried run, and the status must target a job page for the runner's repository and run number. `FORGEJO_RUN_NUMBER`/`GITHUB_RUN_NUMBER` identify candidate status URLs; `FORGEJO_RUN_ID` (or `GITHUB_RUN_ID` fallback) is used only to query the jobs API. Multi-job, mismatched, and unavailable cases leave statuses visible; older Forgejo instances warn immediately and fall back to bounded waiting, so set `CI_STATUS_CONTEXT` to avoid self-deadlock; a whitespace-only value is treated as unset and enables auto-discovery. Multi-job reviewer workflows also need `CI_STATUS_CONTEXT`. The core review pipeline and all REST-based features work fully.
+
+### 🛑 Terminal provider failures (quota exhausted, retired model)
+
+A provider error body can state a **permanent** condition: the account's quota is spent, billing is hard-limited, or the model is retired/deprecated/removed. No later attempt fixes any of them, so both retry layers consult one shared classifier and stop immediately, letting the run reach the configured fallback (`ai-fallback-model`) in seconds instead of after minutes of silent retries.
+
+Allowlisted as terminal — nothing else is:
+
+| Reason | Recognized evidence |
+|---|---|
+| `quota_exhausted` | Structured codes `insufficient_quota`, `quota_exceeded`, `usage_limit_reached`, `billing_hard_limit_reached`, `billing_not_active`, `credit_exhausted`, `plan_exhausted`, `token_plan_usage_limit_reached`; prose such as `insufficient quota`, `insufficient balance`, `insufficient credit`, `you exceeded your current quota`, `billing hard limit has been reached`, `token plan usage limit reached`, `token plan usage limit has been reached`, `upgrade your token plan or purchase credits`, and `please upgrade your plan or buy credits`. The last phrase counts only when the same message also names the token plan or the provider name `minimax`. LiteLLM/MiniMax code `2056` is never decisive on its own — a bare `2056` in any body is just an unrelated number — so the token-plan sentences beside it are what count. |
+| `model_unavailable` | Structured codes `model_not_found`, `model_deprecated`, `model_retired`, `model_unavailable`, `model_removed`, `deprecated_model`, `unknown_model`, `DeploymentNotFound`; prose such as `has been retired`, `has been deprecated`, `is deprecated and will be removed`, `model not found`, `does not exist or you do not have access`, `no access to this model`, `unknown model`. |
+
+Deliberately **not** terminal (these stay retryable): `rate limit`, `too many requests`, `resource_exhausted`, RPM/TPM phrasing, `try again later`, `retry after/later/in`, `model is loading`, `model is busy`, `model is temporarily unavailable`, `server overloaded`, unknown provider bodies, and any phrase whose own text says the condition is temporary.
+
+Three deliberate boundaries worth knowing:
+
+- **Prose evidence is 4xx-only.** A 5xx body is server-composed text that routinely echoes request content back, so allowing prose to end a 5xx retry budget would let request content decide it. Structured codes still count at any status — a provider has to *construct* `insufficient_quota` to send it.
+- **A generic phrase needs its anchor.** The phrase `please upgrade your plan or buy credits` is ordinary plan-upgrade prose. It counts as terminal only when the same message also names the token plan or the provider name `minimax`. Without the anchor, another provider's plan message must not become permanent MiniMax exhaustion.
+- **A 4xx body that quotes the review corpus and happens to contain an allowlisted phrase is accepted** as the provider's own claim. Rejecting an echo structurally would mean a leading-sentence or delimiter heuristic, which cannot be told apart from a real provider message without risking the false negative this feature exists to prevent. The consequence is bounded: an immediate, truthfully-logged fallback (availability recovery) — never a verdict change, a gate bypass, or a fabricated outcome.
+
+Telling the two apart in the log — a terminal stop is named; a transient retry is just slow:
+
+```text
+terminal provider failure: quota_exhausted (litellm_minimax_token_plan) HTTP 429; bypassing same-request retries
+Primary: transport failures exhausted (HTTP 429: …) [terminal quota_exhausted (litellm_minimax_token_plan) HTTP 429; bypassing retries]
+::error::Primary: model endpoint returned a non-retryable HTTP status [terminal=quota_exhausted]; failing over without retrying (…)
+Primary: terminal=quota_exhausted; bypassing retries; trying fallback: <model> @ <base-url> (openai)
+```
+
+No Action input controls this: the signatures are a fixed allowlist. Every failure the classifier leaves alone (an unrecognized 429, a 5xx, a network/timeout failure) is **ambiguous**, and ambiguous primary failures are hard-bounded (#1305): at most **one short retry** (tier sleeps capped at 5 s), then the run hands off promptly to the configured fallback (`ai-fallback-model`). `ai-primary-retries` remains a total-attempt cap but can no longer buy more than that allowance, and `ai-primary-retry-delay-sec` is honoured only when smaller than the 5 s cap — primary-to-fallback latency never depends on classifying provider prose correctly. Residual per-attempt latency is the transport's own same-request retry tree (3 attempts, 1 s/2 s, a provider `Retry-After` honoured up to 30 s) and each attempt's configured `ai-request-timeout-sec`. Specialist lanes latch too — once an endpoint/model/format/credential lane answers terminally, later calls on that same lane short-circuit without a wire request (`lane terminally unavailable (<reason>)`). The credential is part of the lane key (as a truncated digest, never the key), because quota exhaustion is an account condition: a differently keyed lane against the same endpoint has its own budget and is not latched.
+
+## 📚 Documentation
+
+| Topic | Page |
+|---|---|
+| Every input and output, with defaults | [Inputs and outputs](docs/inputs.md) |
+| What the reviewer sees and how to steer it (standards, prompts, evidence, CI) | [Context and evidence](docs/context-and-evidence.md) |
+| The native tool loop, budgets and partial coverage | [Tool loop](docs/tool-loop.md) |
+| Specialist passes and `deep-review: auto` | [Deep review](docs/deep-review.md) |
+| Verdict policies, publish modes, re-reviews | [Verdicts and publishing](docs/verdicts-and-publishing.md) |
+| Endpoints, fallback and fast/smart routing | [Models and routing](docs/models-and-routing.md) |
+| Review marker fields and the step summary | [Telemetry](docs/telemetry.md) |
+| Default-off experimental features | [Opt-in features](docs/opt-in-features.md) |
+| Local model issues and common misconfigurations | [Troubleshooting](docs/troubleshooting.md) |
+| Repository-owned config file | [Repository config](docs/repository-config.md) |
+| Reviewing on Tangled (experimental) | [Tangled](docs/tangled.md) |
+| Reviewing on GitLab (adapters shipped, daemon wiring pending) | [GitLab](docs/gitlab.md) |
+| Reviewing pull requests from forks | [Fork reviews](docs/fork-review.md) |
+| Upgrading from v2 | [v2 → v3 migration](docs/v3-migration.md) |
+
+Copyable workflows: [`examples/workflow-self-hosted.yml`](examples/workflow-self-hosted.yml) and [`examples/workflow-cloud.yml`](examples/workflow-cloud.yml).
+
+## 📌 Version pinning and releases
+
+The action is versioned with Git tags. `@v3` is a floating major tag; for reproducible runs, pin a release tag or its commit SHA (Renovate keeps either current):
+
+```yaml
+- uses: misospace/pr-reviewer-action@v3.1.0
+# or
+- uses: misospace/pr-reviewer-action@aa12ad9909b1ee8a5a7fe00dceeb1a8c97ab27dd # v3.1.0
+```
+
+Release tags point at a build commit that contains `dist/`; `main` does not carry the bundle. Releases are cut by merging the standing `release: X.Y.Z` pull request that release-please maintains.
+
+### 🗓️ Versioning policy
+
+- **Patch** (`Z`): bug fixes, docs, performance work and internal refactors.
+- **Minor** (`Y`): new inputs, outputs, tools or modes, and deliberate changes to the reviewer's operating point (such as the v3.1.0 tool budget). Release notes call out anything that changes review behavior.
+- **Major** (`X`): anything that can require editing your workflow, such as removing or renaming inputs/outputs or dropping platform support.
+- **Deprecations** keep working, with a log warning, for the rest of the current major.
+- **`source-vX.Y.Z` tags** mark each release's source commit on `main` for release tooling. They have no `dist/`, so never pin to them.
+- **Pre-releases** (`vX.Y.Z-rc.N`) never move the floating major tag.
+
+Published release notes get rewritten from the raw changelog — see [`docs/release-notes.md`](docs/release-notes.md) for the house style and the procedure.
+
+Subscribe to [GitHub Releases](https://github.com/misospace/pr-reviewer-action/releases) to follow changes.
+
+### 🚚 v3 breaking changes
+
+If you used `review_scope: auto|incremental|full` in v2, remove the input in v3. There is no replacement: every changed review uses the full current PR. Keep `skip-if-diff-unchanged` for the zero-token unchanged-review skip; it retains the prior overall verdict. The `ai-review` label, a `/ai-review` PR comment, or `force-review: "true"` still forces a fresh full review. Comment re-review is for triage-or-higher commenters only (fork PRs get a reply pointing at the fork review workflow) and an empty `rereview-command` disables it — see [Verdicts and publishing](docs/verdicts-and-publishing.md#comment-command).
+
+Stop reading the removed incremental outputs (`effective_review_scope`, `previous_head_sha`, `previous_base_sha`, `baseline_clean`) and remove `escalate_on_dirty_baseline` if configured. Previous findings and evidence are not carried into a new review. No replacement scope or dirty-baseline setting is needed.
+
+## 🧪 Development
+
+A clean checkout is one noninteractive command:
+
+```bash
+scripts/bootstrap.sh
+```
+
+It verifies (and if needed installs) the pinned [mise](https://mise.jdx.dev) launcher, installs the locked toolchain, and runs `npm ci`. Everything is user-scoped and digest-verified — no privileged installs, no global config or git-hook changes. It runs no tests, formatters or generators, and it is idempotent and convergent: a re-run re-checks the prerequisites and re-runs `npm ci`, so it is safe to repeat. It fails with a clear message if `pgrep`/`pkill` (procps) are missing, because process-tree cleanup and gate preflight refuse to run without them.
+
+The Node version pin lives in [`.mise/config.toml`](.mise/config.toml), where it tracks CI's `node-version: '26'` and the `@types/node` major in `package.json`; [`.mise/mise.lock`](.mise/mise.lock) pins its download checksums. The shipped action still declares the `node24` runtime (`runs.using`), because the Actions runner has no `node26` selector yet; CI re-runs the full suite on Node 24 (`validate-runtime-floor`) so the Node-26 typings can never green-light an API the shipped runtime lacks. The launcher is installed into a user-scoped directory that is often not on `PATH`, so bootstrap prints the exact `export PATH=…` line to run (and to add to your shell rc). Reuse that environment with `mise exec -- <command>`, or run:
+
+```bash
+mise run check   # fast static validation (typecheck)
+mise run test    # the shipped v3 runtime, end-to-end against mock platform and model servers
+```
+
+`npm ci && npm run typecheck && npm test` stays authoritative for CI and for anyone without mise (as does `npm run build` for the release bundle — `dist/` is not committed).
+
+The Python suites are auxiliary tooling, not the shipped action, and their interpreter is not part of the bootstrap contract. Run them on the same 3.14 interpreter CI pins — `setup-python` installs `requirements.txt` into the user-scoped mise directory on demand, and `test-python` runs the suites:
+
+```bash
+mise run setup-python && mise run test-python
+```
+
+Contributor and agent docs (code map, architecture, eval runbooks) start at [`AGENTS.md`](AGENTS.md); evaluation is in [`docs/evals.md`](docs/evals.md).
+
+## 🔐 Security
+
+See [SECURITY.md](SECURITY.md) for the threat model, controls, and operational guidance.
+
+### Fork PR reviews
+
+Pull requests from forks are reviewed by a separate, privilege-separated
+workflow (`ai-pr-review-fork.yaml`): default-deny behind the maintainer-only
+`ai-review-fork` label, local models only, no fork code ever checked out or
+executed in the privileged run, and bounded compute. The same-repository
+dogfood reviewer skips fork PRs cleanly. See
+[docs/fork-review.md](docs/fork-review.md) for the threat model, the
+authorization flow, and the required `FORK_*` configuration.
+
+## 📄 License
+
+[MIT](LICENSE)
+
+---
+
+<div align="center">
+
+Built for homelabs and production alike — if this action reviews your PRs well, consider **[starring the repo ⭐](https://github.com/misospace/pr-reviewer-action)**
+
+<sub>[⬆ Back to top](#-pr-reviewer-action)</sub>
+
+</div>
 
 ## Privacy
 

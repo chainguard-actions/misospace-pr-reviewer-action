@@ -1,0 +1,19 @@
+# ShellCheck configuration for pr-reviewer-action
+# https://www.shellcheck.net/wiki/Options
+
+# Treat all scripts as bash (we use [[, arrays, etc.)
+shell=bash
+
+# Disabled codes and why:
+#
+#   SC2016 - Expressions don't expand in single quotes.
+#            The release test suites pass assertions to `check` as single-
+#            quoted strings that are `eval`ed later on purpose.
+#
+#   SC2034 - Variable appears unused.
+#            Variables read only inside those eval'd assertion strings.
+#
+#   SC1091 - Not following sourced files.
+#            Test suites source tests/_lib/assert.sh relative to their own
+#            directory, which shellcheck cannot resolve without -x.
+disable=SC2016,SC2034,SC1091

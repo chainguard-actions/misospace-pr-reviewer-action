@@ -1,0 +1,969 @@
+/** Deterministic, bounded requirement-ledger extractor — v3 port of
+ * `pr_reviewer/requirement_ledger.py` (#624 logic, #675 migration).
+ *
+ * Builds the explicit, stable list of requirements a review must check —
+ * acceptance-criteria items, normative (MUST/SHALL) statements, and
+ * sequencing invariants — from already-bounded review inputs, with
+ * content-derived ids and full provenance. Pure line-based parsing: no model
+ * calls, no network, no command execution; all input is treated as untrusted
+ * and malformed sources degrade to a shorter ledger (this module never
+ * throws).
+ *
+ * Design invariants preserved from the Python module:
+ * - **Stable ids from content**: `req-` + sha256(casefolded post-truncation
+ *   text)[:12] — the id is the id of exactly the text a reader can see.
+ * - **Deterministic ordering**: source priority (standards, linked_issues,
+ *   pr_body), then document order; casefolded-duplicate text merges into the
+ *   first entry, provenance appended.
+ * - **Bounded**: MAX_REQUIREMENTS entries, MAX_REQUIREMENT_CHARS text cap
+ *   (visible … marker), MAX_SOURCES documents with capacity reserved for the
+ *   standards and PR-body docs, hard UTF-8 byte cap on the rendered view.
+ * - **Fence-safe rendering**: control characters escaped, code-span
+ *   delimiters strictly longer than any backtick run in the text, leading
+ *   `#` escaped — hostile input can never forge a heading or break out of a
+ *   fence.
+ */
+
+import { createHash } from "node:crypto";
+import { escapeControlChars } from "../context/fence.js";
+import { boundedChildRefs, LINKED_AS_CLOSING_LINE, LINKED_AS_CONTEXT_LINE, LINKED_AS_NON_CLOSING_LINE, MAX_DECOMPOSITION_LINES_PER_ISSUE, parseDecompositionLine } from "../precheck/linked-issues.js";
+import { pythonJsonStringify } from "../precheck/metadata.js";
+import { HARNESS_SOURCE, obligationText } from "./obligations.js";
+import { MAX_REQUIREMENT_TEXT_CHARS, normalizeRequirementText, requirementIdOfText } from "./requirement-id.js";
+
+export const ARTIFACT_VERSION = 1;
+
+/** Hard caps (defaults per #624). The text cap is the shared
+ * {@link MAX_REQUIREMENT_TEXT_CHARS} — one source of truth for the id recipe
+ * intake and the ledger both apply (#1750). */
+export const MAX_REQUIREMENTS = 48;
+export const MAX_REQUIREMENT_CHARS = MAX_REQUIREMENT_TEXT_CHARS;
+export const MAX_LEDGER_MARKDOWN_BYTES = 8192;
+export const MAX_SOURCES = 32;
+
+/** #1749: bounds for the forge-label provenance carried on `linked_issues`
+ * provenance entries — the linked issue's own labels, read from the
+ * embedded projection in `linked-issues.md` and re-bounded at every
+ * serialization boundary (parse, tolerant reload), so a hostile label list
+ * cannot grow a ledger entry without limit. */
+export const MAX_LINKED_ISSUE_LABELS = 8;
+export const MAX_LINKED_ISSUE_LABEL_CHARS = 64;
+/** #1749 follow-up (review round): bounds the disclosure list of context-
+ * excluded linked documents — the honest exclusion COUNT is always disclosed,
+ * refs are listed up to this cap in the raw spellings the intake rendered.
+ * Honest intake renders at most
+ * eight linked-issue documents, so the cap never bites real input; it exists
+ * so a hostile `linked-issues.md` heading barrage cannot grow the artifact
+ * without limit. Per-ref length cap keeps one forged heading bounded too. */
+export const MAX_CONTEXT_EXCLUDED_REFS = 16;
+export const MAX_CONTEXT_EXCLUDED_REF_CHARS = 128;
+
+export const TRUNCATION_MARKER = "…";
+
+/** Source priority order: decides scan order, merged-entry position, and
+ * provenance order. */
+export const SOURCE_PRIORITY: readonly string[] = ["standards", "linked_issues", "pr_body"];
+
+export const LEDGER_KINDS: readonly string[] = ["acceptance", "normative", "invariant"];
+
+export interface LedgerProvenance {
+  source: string;
+  ref: string;
+  line: number;
+  /** #1749: linked-issue relationship provenance, present on `linked_issues`
+   * entries ONLY when known. `closing` records the reference shape the PR
+   * itself used (a closing-keyword ref vs an `Implements`/`Addresses`/title-
+   * `(#N)` contract link, or a plain `Refs`/`Ref` context link); `labels`
+   * carries the linked issue's bounded forge-label
+   * list. The trace scope consumes both to tell an issue the PR claims to
+   * close (whose acceptance criteria stay mandatory) from a non-closing
+   * parent/umbrella/context link (whose acceptance set is not automatically
+   * this PR's merge contract). Absent fields mean unknown — the scope
+   * predicate fails closed on them. */
+  closing?: boolean;
+  labels?: string[];
+  /** #1750: trusted criterion→child ownership evidence — the canonical
+   * `repo#N` identities of the child work that the linked umbrella's OWN
+   * body decomposition (task-list items referencing child issues) associates
+   * with THIS criterion, parsed from intake-rendered `(decomposition: …)`
+   * metadata lines and attached only to the entry whose content id the line
+   * names. Present ONLY when a well-formed association exists; absent means
+   * no trusted ownership evidence, and the scope predicate fails closed on
+   * it (the criterion stays in scope — umbrella label + non-closing ref
+   * alone is never ownership evidence). */
+  childRefs?: string[];
+}
+
+/** The typed canonical requirement-ledger entry (#675). Internal fields are
+ * camelCase (#669); the persisted artifact shape is produced only by
+ * `entryToArtifact` — which is load-bearing for the sha, since v2 computes
+ * it over the snake_case canonical JSON of the entries. */
+export interface RequirementLedgerEntry {
+  id: string;
+  text: string;
+  kind: "acceptance" | "normative" | "invariant";
+  verificationRequired: boolean;
+  truncated: boolean;
+  provenance: LedgerProvenance[];
+}
+
+export interface RequirementLedger {
+  version: number;
+  sha: string;
+  requirements: RequirementLedgerEntry[];
+  truncation: {
+    truncated: boolean;
+    omittedRequirements: number;
+    omittedSources: number;
+  };
+  /** #1749 follow-up (review round): disclosure of linked documents excluded
+   * as `context reference` sources — `count` is the honest total excluded,
+   * `refs` lists their refs exactly as the intake heading rendered them (raw
+   * spellings like `#42` or `Owner/Repo#42`, never casefolded — the ledger does
+   * not know the document's repository and must not invent a canonical form;
+   * bounded, deduplicated, document
+   * order; fewer than `count` once {@link MAX_CONTEXT_EXCLUDED_REFS} is
+   * reached). Present ONLY when at least one document was excluded; absent
+   * (not empty) otherwise, so a no-context artifact keeps its exact legacy
+   * byte shape. Informational disclosure only: it never enters `requirements`
+   * or provenance, never feeds the sha, is never reported as truncation, and
+   * enforcement must not consume it. It exists so the exclusion is visible in
+   * `requirement-ledger.json` and the rendered ledger instead of silent. */
+  contextExcluded?: { count: number; refs: string[] };
+}
+
+// ---------------------------------------------------------------------------
+// camelCase → persisted snake_case artifact boundary (#669)
+// ---------------------------------------------------------------------------
+
+/** Serialize one entry to the persisted v2-identical snake_case form. */
+export function entryToArtifact(entry: RequirementLedgerEntry): Record<string, unknown> {
+  return {
+    id: entry.id,
+    text: entry.text,
+    kind: entry.kind,
+    verification_required: entry.verificationRequired,
+    truncated: entry.truncated,
+    provenance: entry.provenance,
+  };
+}
+
+/** Serialize the internal ledger to the persisted v2-identical snake_case
+ * artifact (`requirement-ledger.json`): same keys, same values, same sha.
+ * #1749 follow-up (review round): the optional context-exclusion disclosure
+ * rides as `context_excluded` and is emitted ONLY when non-empty — an
+ * artifact with no context exclusions is byte-identical to the legacy shape. */
+export function ledgerToArtifact(ledger: RequirementLedger): Record<string, unknown> {
+  return {
+    version: ledger.version,
+    sha: ledger.sha,
+    requirements: ledger.requirements.map(entryToArtifact),
+    truncation: {
+      truncated: ledger.truncation.truncated,
+      omitted_requirements: ledger.truncation.omittedRequirements,
+      omitted_sources: ledger.truncation.omittedSources,
+    },
+    ...(ledger.contextExcluded !== undefined && ledger.contextExcluded.refs !== undefined
+      ? { context_excluded: { count: ledger.contextExcluded.count, refs: [...ledger.contextExcluded.refs] } }
+      : {}),
+  };
+}
+
+/** Heading texts (casefolded, stripped) whose list items are acceptance
+ * criteria. Exact match: "requirements for v2" is NOT a requirements
+ * heading. */
+const ACCEPTANCE_HEADINGS: ReadonlySet<string> = new Set([
+  "acceptance criteria",
+  "requirements",
+  "invariants",
+  "success criteria",
+  "required checks",
+]);
+
+/** #1095: headings whose sections are advisory or process commentary, not
+ * requirement sources — a merge-order note under "## Dependencies" or a
+ * maintenance caveat under "## Notes / Risk" reads like a MUST but demands
+ * no checkout predicate, and promoting it into the ledger held a clean
+ * refactor at CHANGES_REQUESTED (miso-gallery#543 via review 5549785027:
+ * three "requirement not enforced" majors synthesized from a Dependencies
+ * bullet and a PR-body risk note). Exact match on the normalized heading,
+ * mirroring ACCEPTANCE_HEADINGS: narrow by construction, and anything not
+ * listed keeps extracting exactly as before. While the scanner is inside
+ * such a section, list items carry no normative weight — the one exception
+ * is the uppercase MUST/SHALL form ({@link UPPER_NORMATIVE_RE}), the
+ * strongest signal the extractor has, which is never silently discarded. A
+ * genuine requirement belongs under an acceptance/requirements heading,
+ * which this set never shadows. */
+const ADVISORY_HEADINGS: ReadonlySet<string> = new Set([
+  "dependencies",
+  "dependency",
+  "notes",
+  "note",
+  "risks",
+  "risk",
+  "notes risk",
+  "risk notes",
+  "caveats",
+  "caveat",
+  "limitations",
+  "limitation",
+  "rollout",
+]);
+
+/** Normalize a heading for the advisory check: lowercase, punctuation
+ * collapsed to spaces, whitespace squeezed — so "## Notes / Risk" and
+ * "## Risk Notes:" both normalize into the exact-match set. */
+function isAdvisoryHeading(heading: string): boolean {
+  const normalized = heading.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (ADVISORY_HEADINGS.has(normalized)) return true;
+  // #1702: linked issues often document organic reproductions (with
+  // run/version metadata in the heading). The reproductions are historical
+  // evidence, not fresh acceptance criteria. In particular, a lowercase
+  // "must" describing what an unrelated prior run must not change cannot
+  // become a code-verifiable requirement for the CURRENT PR.
+  //
+  // Match only the exact subject heading, optionally followed by a bounded
+  // parenthetical qualifier. Other headings and the uppercase MUST/SHALL
+  // escape hatch in scanDocument remain untouched.
+  const plain = heading.replace(/\s*\([^()]{0,120}\)\s*$/, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ").trim();
+  return plain === "reproduction" || plain === "reproductions"
+    || plain === "organic reproduction" || plain === "organic reproductions";
+}
+
+// Uppercase normative tokens apply to any line; word boundaries keep
+// "MUSTARD" / "SHELL" from matching.
+const UPPER_NORMATIVE_RE = /\b(MUST NOT|MUST|SHALL NOT|SHALL)\b/;
+// The lowercase form is normative only on list items (documented rule);
+// matched against the casefolded line so "Must" in a bullet is also caught.
+const LOWER_NORMATIVE_RE = /\b(must not|must|shall|required to)\b/;
+const ORDERING_RE = /\b(before|after|prior to|until|then)\b/;
+
+const HEADING_RE = /^\s{0,3}#{1,6}\s+(.*)$/;
+const FENCE_RE = /^(`{3,}|~{3,})/;
+const LIST_ITEM_RE = /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s*)?|\d+[.)]\s+)/;
+// The same shapes, used to strip the marker from the normalized text.
+const MARKER_STRIP_RE = /^\s*(?:[-*+]\s+\[[ xX]\]\s*|[-*+]\s+|\d+[.)]\s+)/;
+const WS_RE = /\s+/g;
+const BACKTICK_RUN_RE = /`+/g;
+const ID_RE = /^req-[0-9a-f]{12}$/;
+
+const LEDGER_HEADER = "## Requirement Ledger";
+
+/** Python `str.splitlines()` replica: splits on \n, \r, \r\n, \v, \f,
+ * \x1c, \x1d, \x1e, \x85, U+2028, U+2029 and drops the terminators — so
+ * hostile input cannot smuggle lines past a plain `\n` split. */
+export function pySplitLines(text: string): string[] {
+  if (text === "") return [];
+  const lines: string[] = [];
+  let start = 0;
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const code = text.charCodeAt(i);
+    const isBreak =
+      code === 0x0a ||
+      code === 0x0d ||
+      code === 0x0b ||
+      code === 0x0c ||
+      code === 0x1c ||
+      code === 0x1d ||
+      code === 0x1e ||
+      code === 0x85 ||
+      code === 0x2028 ||
+      code === 0x2029;
+    if (isBreak) {
+      lines.push(text.slice(start, i));
+      i = code === 0x0d && text.charCodeAt(i + 1) === 0x0a ? i + 2 : i + 1;
+      start = i;
+    } else {
+      i += 1;
+    }
+  }
+  if (start < n) lines.push(text.slice(start));
+  return lines;
+}
+
+/** Content-derived entry id (first 12 hex of sha256 of casefolded text). */
+function requirementId(text: string): string {
+  return requirementIdOfText(text);
+}
+
+/** First 16 hex of sha256 over the canonical JSON of the entries array.
+ * Hashes the PERSISTED snake_case artifact form (v2 hashes the identical
+ * serialization), so the sha bytes are unchanged by the internal camelCase
+ * representation. */
+function computeSha(entries: RequirementLedgerEntry[]): string {
+  const canonical = pythonJsonStringify(entries.map(entryToArtifact), ",", ":");
+  return createHash("sha256").update(Buffer.from(canonical, "utf8")).digest("hex").slice(0, 16);
+}
+
+export function emptyLedger(): RequirementLedger {
+  return {
+    version: ARTIFACT_VERSION,
+    sha: computeSha([]),
+    requirements: [],
+    truncation: { truncated: false, omittedRequirements: 0, omittedSources: 0 },
+  };
+}
+
+/** Normalize one line; `null` when it is empty after normalization. The id is
+ * derived from this (post-truncation) text. The squeeze+truncate step is the
+ * shared {@link normalizeRequirementText} — intake applies it to
+ * decomposition task-item content to derive the ids it renders (#1750), so
+ * both sides of that seam normalize identically by construction. */
+function normalizeLine(raw: string): { text: string; truncated: boolean } | null {
+  return normalizeRequirementText(raw.replace(MARKER_STRIP_RE, ""));
+}
+
+interface ScannedLine {
+  normalized: string;
+  truncated: boolean;
+  kind: "acceptance" | "normative" | "invariant";
+  line: number;
+}
+
+/** Extract entries from one document. Lines inside ``` / ~~~ fences are
+ * skipped (requirements are never extracted from code fences), and so are
+ * advisory/process sections (#1095: see {@link ADVISORY_HEADINGS}).
+ * Line numbers are 1-based. */
+function scanDocument(text: string): ScannedLine[] {
+  const found: ScannedLine[] = [];
+  let inFence = false;
+  let fenceChar = "";
+  let heading = "";
+  let inAdvisorySection = false;
+  let lineno = 0;
+  for (const raw of pySplitLines(text)) {
+    lineno += 1;
+    const fence = FENCE_RE.exec(raw.trim());
+    if (inFence) {
+      if (fence !== null && (fence[1] ?? "").charAt(0) === fenceChar) inFence = false;
+      continue;
+    }
+    if (fence !== null) {
+      inFence = true;
+      fenceChar = (fence[1] ?? "").charAt(0);
+      continue;
+    }
+    const headingMatch = HEADING_RE.exec(raw);
+    if (headingMatch !== null) {
+      heading = (headingMatch[1] ?? "").trim();
+      inAdvisorySection = isAdvisoryHeading(heading);
+      continue;
+    }
+    // #1095: advisory/process sections contribute no requirements — EXCEPT an
+    // uppercase MUST/SHALL, the extractor's strongest normative signal (#624),
+    // which keeps its teeth everywhere. A lowercase "must" on a list item is
+    // the #543 promotion shape (a Dependencies merge note, a PR-body risk
+    // caveat); an uppercase MUST is a deliberate normative statement and is
+    // never silently discarded.
+    if (inAdvisorySection && !UPPER_NORMATIVE_RE.test(raw)) continue;
+    const isListItem = LIST_ITEM_RE.test(raw);
+    let kind: ScannedLine["kind"] | null = null;
+    if (isListItem && ACCEPTANCE_HEADINGS.has(heading.toLowerCase())) {
+      kind = "acceptance";
+    } else if (UPPER_NORMATIVE_RE.test(raw) || (isListItem && LOWER_NORMATIVE_RE.test(raw.toLowerCase()))) {
+      kind = "normative";
+    }
+    if (kind === null) continue;
+    const normalized = normalizeLine(raw);
+    if (normalized === null) continue;
+    if (ORDERING_RE.test(normalized.text.toLowerCase())) kind = "invariant";
+    found.push({ normalized: normalized.text, truncated: normalized.truncated, kind, line: lineno });
+  }
+  return found;
+}
+
+/** #1749: bound one linked issue's forge-label list for provenance — trim,
+ * drop empties, deduplicate, cap count and per-label length (codepoint-safe,
+ * so a long label never splits a surrogate pair). `undefined` when nothing
+ * usable survives, so the provenance field stays absent rather than empty. */
+function boundedLinkedIssueLabels(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (names.length >= MAX_LINKED_ISSUE_LABELS) break;
+    if (typeof item !== "string") continue;
+    const name = item.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(Array.from(name).slice(0, MAX_LINKED_ISSUE_LABEL_CHARS).join(""));
+  }
+  return names.length > 0 ? names : undefined;
+}
+
+/** #1749 follow-up (review round): bound the disclosed context-exclusion refs of
+ * context-excluded documents — trim, drop empties, deduplicate (first
+ * occurrence keeps position, document order), cap count and per-ref length
+ * (codepoint-safe, so a forged long heading never splits a surrogate pair).
+ * Shared by extraction and the tolerant reload so both serialization
+ * boundaries re-bounded identically. */
+function boundedContextRefs(values: readonly unknown[]): string[] {
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  for (const item of values) {
+    if (refs.length >= MAX_CONTEXT_EXCLUDED_REFS) break;
+    if (typeof item !== "string") continue;
+    const ref = item.trim();
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    refs.push(Array.from(ref).slice(0, MAX_CONTEXT_EXCLUDED_REF_CHARS).join(""));
+  }
+  return refs;
+}
+
+/** #1749 follow-up (review round): re-read the persisted `context_excluded`
+ * disclosure tolerantly — a malformed disclosure is ignored (undefined),
+ * never a failure, and a legacy artifact simply has none. A positive
+ * integer `count` with a garbage `refs` list keeps the count disclosure with
+ * an empty ref list; disclosure shape is informational only. */
+function tolerantContextExcluded(value: unknown): { count: number; refs: string[] } | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const rec = value as Record<string, unknown>;
+  const rawCount = rec.count;
+  if (typeof rawCount !== "number" || !Number.isInteger(rawCount) || rawCount <= 0) return undefined;
+  return { count: rawCount, refs: boundedContextRefs(Array.isArray(rec.refs) ? rec.refs : []) };
+}
+
+/** Parse rendered `linked-issues.md` into (ref, body) documents. Each
+ * `## <repo>#<number>` heading (or any heading, as a fallback ref) owns the
+ * fenced JSON blocks that follow it; a block decodes to a dict with a string
+ * `body` to contribute that body for scanning. Malformed blocks are skipped
+ * fail-soft.
+ *
+ * #1749: the relationship metadata the intake renders between the heading
+ * and the fence is parsed too — an exact-match `(linked as: …)` line records
+ * the reference shape the PR itself used, and the embedded projection's
+ * `labels` array (the linked issue's forge labels) is carried bounded. Both
+ * fields are OPTIONAL provenance: a document without them keeps the exact
+ * legacy `{ref, body}` shape, and the scope predicate fails closed on the
+ * unknown relationship.
+ *
+ * #1749 follow-up: a `(linked as: context reference)` line marks a document
+ * the PR linked ONLY by a plain `Refs`/`Ref` reference. The document is
+ * returned with `contextOnly: true` and its body is never scanned for
+ * requirements — a valid context link stays valid PR syntax (the issue is
+ * still fetched, fenced into `linked-issues.md`, and hashed into the
+ * selection signature upstream), but the referenced issue's acceptance
+ * criteria are not this PR's merge contract. Absent metadata keeps the
+ * contract-carrying reading (fail closed — unknown is never context).
+ *
+ * #1750: the exact-structure `(decomposition: req-<id> -> <child refs>)`
+ * ownership lines are parsed into a per-document id→childRefs map. Strictly
+ * structural (a malformed line parses to nothing and contributes no
+ * association), bounded to at most {@link MAX_DECOMPOSITION_LINES_PER_ISSUE}
+ * accepted lines per document, and FIRST line per id wins — honest intake
+ * renders exactly one line per criterion, so repeats never merge or replace.
+ * The map keys are the ledger's own content ids, so the association can only
+ * ever attach to the entry the id names; issue content itself never leaves
+ * the fence. */
+function parseLinkedIssueDocuments(markdown: string): { ref: string; body: string; closing?: boolean; labels?: string[]; contextOnly?: boolean; decompositions?: ReadonlyMap<string, readonly string[]> }[] {
+  const documents: { ref: string; body: string; closing?: boolean; labels?: string[]; contextOnly?: boolean; decompositions?: ReadonlyMap<string, readonly string[]> }[] = [];
+  let currentRef = "";
+  let currentClosing: boolean | undefined = undefined;
+  let currentContext = false;
+  let decompositions: Map<string, string[]> | null = null;
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLines: string[] = [];
+  for (const raw of pySplitLines(markdown)) {
+    const fence = FENCE_RE.exec(raw.trim());
+    if (inFence) {
+      if (fence !== null && (fence[1] ?? "").charAt(0) === fenceChar) {
+        inFence = false;
+        let obj: unknown = null;
+        try {
+          obj = JSON.parse(fenceLines.join("\n"));
+        } catch {
+          obj = null;
+        }
+        if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
+          const record = obj as Record<string, unknown>;
+          const body = record.body;
+          if (typeof body === "string" && body.trim()) {
+            const labels = boundedLinkedIssueLabels(record.labels);
+            documents.push({
+              ref: currentRef,
+              body,
+              // The relationship line is intake-authored and exact-matched
+              // outside the fence; absent means unknown (fail closed
+              // downstream), never a guess.
+              ...(currentClosing !== undefined ? { closing: currentClosing } : {}),
+              ...(currentContext ? { contextOnly: true } : {}),
+              ...(labels !== undefined ? { labels } : {}),
+              ...(decompositions !== null && decompositions.size > 0 ? { decompositions } : {}),
+            });
+          }
+        }
+      } else {
+        fenceLines.push(raw);
+      }
+      continue;
+    }
+    if (fence !== null) {
+      inFence = true;
+      fenceChar = (fence[1] ?? "").charAt(0);
+      fenceLines = [];
+      continue;
+    }
+    const heading = HEADING_RE.exec(raw);
+    if (heading !== null) {
+      currentRef = (heading[1] ?? "").trim();
+      currentClosing = undefined;
+      currentContext = false;
+      decompositions = null;
+      continue;
+    }
+    if (currentRef !== "") {
+      const line = raw.trim();
+      if (line === LINKED_AS_CLOSING_LINE) {
+        currentClosing = true;
+      } else if (line === LINKED_AS_NON_CLOSING_LINE) {
+        currentClosing = false;
+      } else if (line === LINKED_AS_CONTEXT_LINE) {
+        // #1749 follow-up: an explicit plain-reference relationship. The
+        // document stays parsed (callers must be able to see it exists) but
+        // its body never becomes requirement-ledger entries — see
+        // `extractRequirementLedger`.
+        currentContext = true;
+      } else {
+        // #1750: the ownership-evidence lines. Only well-formed lines count;
+        // the budget bounds ACCEPTED associations, and the first line for an
+        // id wins.
+        const decomposition = parseDecompositionLine(line);
+        if (decomposition !== null) {
+          if (decompositions === null) decompositions = new Map();
+          if (!decompositions.has(decomposition.requirementId)
+            && decompositions.size < MAX_DECOMPOSITION_LINES_PER_ISSUE) {
+            decompositions.set(decomposition.requirementId, decomposition.childRefs);
+          }
+        }
+      }
+    }
+  }
+  return documents;
+}
+
+/** The PR title + body as one scannable document, or null. */
+function prDocumentText(prJson: unknown): string | null {
+  if (prJson === null || prJson === undefined) return null;
+  let rec: Record<string, unknown> | null = null;
+  if (typeof prJson === "string") {
+    try {
+      const parsed: unknown = JSON.parse(prJson);
+      rec = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  } else if (typeof prJson === "object" && !Array.isArray(prJson)) {
+    rec = prJson as Record<string, unknown>;
+  }
+  if (rec === null) return null;
+  const title = typeof rec.title === "string" ? rec.title : "";
+  const body = typeof rec.body === "string" ? rec.body : "";
+  const text = title ? `${title}\n${body}` : body;
+  return text || null;
+}
+
+export interface LedgerInput {
+  /** PR JSON as a decoded object or a raw JSON string (tolerated). */
+  prJson?: unknown;
+  linkedIssuesMarkdown?: string | null | undefined;
+  standardsText?: string | null | undefined;
+  standardsRef?: string | null | undefined;
+  /** Harness-authored verification obligations (#796): appended after the
+   * extracted sources (they always outrank obligations), subject to the same
+   * MAX_REQUIREMENTS cap, dedup, and char bounds. */
+  harnessObligations?: readonly import("./obligations.js").HarnessObligation[] | undefined;
+}
+
+/** One bounded input document to scan. #1749: linked-issue documents carry
+ * the optional relationship provenance parsed from `linked-issues.md`.
+ * #1750: plus the document's trusted criterion→child decomposition map (id →
+ * canonical child refs). */
+interface SourceDoc {
+  source: string;
+  ref: string;
+  text: string;
+  closing?: boolean;
+  labels?: string[];
+  decompositions?: ReadonlyMap<string, readonly string[]>;
+}
+
+/** #1749: build one provenance entry, carrying the linked-issue relationship
+ * provenance (`closing`/`labels`) only on `linked_issues` entries and only
+ * when known — every other source, and unknown state, keeps the exact
+ * legacy `{source, ref, line}` shape. #1750: the ownership evidence attaches
+ * to exactly the entry whose content id a decomposition line named — the id
+ * is computed from the same normalized text the entry was built from, so a
+ * metadata line can never associate another entry's criterion. */
+function provenanceFor(doc: SourceDoc, line: number, entryId?: string): LedgerProvenance {
+  const provenance: LedgerProvenance = { source: doc.source, ref: doc.ref, line };
+  if (doc.source !== "linked_issues") return provenance;
+  if (doc.closing !== undefined) provenance.closing = doc.closing;
+  if (doc.labels !== undefined) provenance.labels = doc.labels;
+  const childRefs = entryId !== undefined ? doc.decompositions?.get(entryId) : undefined;
+  if (childRefs !== undefined) provenance.childRefs = [...childRefs];
+  return provenance;
+}
+
+/** Build the version-1 requirement ledger from bounded review inputs. Never
+ * throws on malformed input; ids are computed from post-truncation
+ * normalized text; duplicate text (casefolded) merges into one entry whose
+ * provenance is appended in source-priority, document order, and whose
+ * position is set by the first occurrence. */
+export function extractRequirementLedger(input: LedgerInput = {}): RequirementLedger {
+  const { prJson = null, linkedIssuesMarkdown = null, standardsText = null, standardsRef = null } = input;
+  let resolvedRef = typeof standardsRef === "string" ? standardsRef : "";
+  if (!resolvedRef.trim()) resolvedRef = "standards";
+
+  const documents: SourceDoc[] = [];
+  // #1749 follow-up (review round): every context-excluded document leaves a
+  // trace here — the honest total count plus its bounded canonical ref — so
+  // the exclusion is disclosed in the ledger artifact (`contextExcluded`,
+  // persisted as `context_excluded`) instead of silent. Informational only:
+  // never a requirement, never provenance, never truncation accounting.
+  let contextExcludedCount = 0;
+  const contextExcludedRefs: unknown[] = [];
+  if (typeof standardsText === "string") documents.push({ source: "standards", ref: resolvedRef, text: standardsText });
+  if (typeof linkedIssuesMarkdown === "string") {
+    for (const doc of parseLinkedIssueDocuments(linkedIssuesMarkdown)) {
+      // #1749 follow-up: a plain `Refs`/`Ref` context link is valid PR
+      // syntax, and its issue stays fenced review context in
+      // `linked-issues.md` (the model still reads it) — but the relationship
+      // was recorded as context, so its body is not a requirement source:
+      // the referenced issue's acceptance criteria are not this PR's merge
+      // contract. This is a deliberate relationship exclusion, not capacity
+      // truncation: the document is dropped BEFORE source-capacity counting,
+      // never appears in `omittedSources`, and a criterion it shares with a
+      // closing/implementation document still enters through THAT source.
+      // Only the explicit context metadata line excludes; unknown state
+      // keeps the contract-carrying reading (fail closed). The exclusion is
+      // never silent: the document's ref is disclosed in `contextExcluded`
+      // (count always honest, refs bounded and deduplicated).
+      if (doc.contextOnly) {
+        contextExcludedCount += 1;
+        if (contextExcludedRefs.length < MAX_CONTEXT_EXCLUDED_REFS) contextExcludedRefs.push(doc.ref);
+        continue;
+      }
+      documents.push({
+        source: "linked_issues",
+        ref: doc.ref,
+        text: doc.body,
+        ...(doc.closing !== undefined ? { closing: doc.closing } : {}),
+        ...(doc.labels !== undefined ? { labels: doc.labels } : {}),
+        ...(doc.decompositions !== undefined ? { decompositions: doc.decompositions } : {}),
+      });
+    }
+  }
+  const prText = prDocumentText(prJson);
+  if (prText !== null) documents.push({ source: "pr_body", ref: "pr", text: prText });
+
+  // Reserve capacity for the fixed source classes (the standards doc and the
+  // PR doc — at most two) before bounding the variable linked-issue set, so
+  // one noisy linked-issue source cannot crowd out the others. Kept
+  // linked-issue docs are the leading ones in document order; the scan order
+  // (standards, linked_issues, pr_body) and the entry ordering/ids/dedup/
+  // caps are unchanged.
+  const reservedCount = documents.filter((doc) => doc.source !== "linked_issues").length;
+  const linkedCount = documents.length - reservedCount;
+  const liCapacity = Math.max(0, MAX_SOURCES - reservedCount);
+  const keptDocs: SourceDoc[] = [];
+  let keptLinked = 0;
+  for (const doc of documents) {
+    if (doc.source === "linked_issues") {
+      if (keptLinked < liCapacity) {
+        keptDocs.push(doc);
+        keptLinked += 1;
+      }
+    } else {
+      keptDocs.push(doc);
+    }
+  }
+  const omittedSources = linkedCount - keptLinked;
+
+  const entries: RequirementLedgerEntry[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const doc of keptDocs) {
+    for (const found of scanDocument(doc.text)) {
+      const key = found.normalized.toLowerCase();
+      const index = indexByKey.get(key);
+      if (index === undefined) {
+        indexByKey.set(key, entries.length);
+        const entryId = requirementId(found.normalized);
+        entries.push({
+          id: entryId,
+          text: found.normalized,
+          kind: found.kind,
+          verificationRequired: found.kind === "invariant",
+          truncated: found.truncated,
+          provenance: [provenanceFor(doc, found.line, entryId)],
+        });
+      } else {
+        // Merged duplicate: the first occurrence owns the entry (position,
+        // kind, flags); provenance is appended.
+        entries[index]?.provenance.push(provenanceFor(doc, found.line, entries[index]?.id));
+      }
+    }
+  }
+
+  // Harness obligations (#796) go LAST: deterministic extraction always
+  // outranks them, and the MAX_REQUIREMENTS cap drops them first when the
+  // extracted set is full. Each obligation is an ordinary invariant entry
+  // (strict coverage contract applies unchanged), provenance is the changed
+  // site the question is anchored to, and duplicates of already-extracted
+  // requirements are dropped (first occurrence owns the entry).
+  // Eligible (non-duplicate) obligations the cap drops are omissions too,
+  // and must show in the truncation metadata like any other drop.
+  const omittedKeys = new Set<string>();
+  for (const obligation of input.harnessObligations ?? []) {
+    const { text, truncated } = obligationText(obligation);
+    const key = text.toLowerCase();
+    const index = indexByKey.get(key);
+    if (index !== undefined || omittedKeys.has(key)) continue;
+    if (entries.length >= MAX_REQUIREMENTS) {
+      omittedKeys.add(key);
+      continue;
+    }
+    indexByKey.set(key, entries.length);
+    entries.push({
+      id: requirementId(text),
+      text,
+      kind: "invariant",
+      verificationRequired: true,
+      truncated,
+      provenance: [{ source: HARNESS_SOURCE, ref: obligation.source || "harness", line: obligation.line }],
+    });
+  }
+
+  const omitted = Math.max(0, entries.length - MAX_REQUIREMENTS) + omittedKeys.size;
+  const kept = entries.length > MAX_REQUIREMENTS ? entries.slice(0, MAX_REQUIREMENTS) : entries;
+  // #1749 follow-up (review round): disclose the context-link exclusions here
+  // — the relationship exclusion never disappears silently. Absent (not
+  // empty) when nothing was excluded, so no-context artifacts keep the exact
+  // legacy byte shape; `count` is the honest total even past the ref cap;
+  // refs re-bounded through the same helper the tolerant reload applies.
+  // This is NOT truncation — the documents were never requirement-source
+  // candidates — so `truncation` stays exactly as before.
+  const contextExcluded = boundedContextRefs(contextExcludedRefs);
+  return {
+    version: ARTIFACT_VERSION,
+    sha: computeSha(kept),
+    requirements: kept,
+    truncation: {
+      // Source-capacity drops are truncation too: the omitted linked-issue
+      // docs never become entries, and that omission must be visible.
+      truncated: omitted > 0 || omittedSources > 0,
+      omittedRequirements: omitted,
+      omittedSources,
+    },
+    ...(contextExcludedCount > 0
+      ? { contextExcluded: { count: contextExcludedCount, refs: contextExcluded } }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tolerant ledger loading
+// ---------------------------------------------------------------------------
+
+function isValidId(value: unknown): value is string {
+  return typeof value === "string" && ID_RE.test(value);
+}
+
+/** Rebuild one entry from untrusted persisted-artifact data (v2 snake_case
+ * schema — the deserialization boundary), or null when unusable. */
+function tolerantEntry(item: unknown): RequirementLedgerEntry | null {
+  if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
+  const rec = item as Record<string, unknown>;
+  const text = rec.text;
+  if (typeof text !== "string" || !text.trim()) return null;
+  // A forged/malformed id is replaced by the content-derived one.
+  const entryId = isValidId(rec.id) ? rec.id : requirementId(text);
+  let kind = rec.kind;
+  if (typeof kind !== "string" || !LEDGER_KINDS.includes(kind)) kind = "normative";
+  const provenance: LedgerProvenance[] = [];
+  const rawProvenance = rec.provenance;
+  if (Array.isArray(rawProvenance)) {
+    for (const prov of rawProvenance) {
+      if (prov === null || typeof prov !== "object" || Array.isArray(prov)) continue;
+      const prec = prov as Record<string, unknown>;
+      const source =
+        typeof prec.source === "string" && SOURCE_PRIORITY.includes(prec.source) ? prec.source : "pr_body";
+      const ref = typeof prec.ref === "string" ? prec.ref : "";
+      const rawLine = prec.line;
+      const line = typeof rawLine === "number" && Number.isInteger(rawLine) && rawLine >= 0 ? rawLine : 0;
+      // #1749: the linked-issue relationship provenance survives the
+      // deserialization boundary under the same strict bounds the parse
+      // applies — present only when well-formed, never guessed.
+      // #1750: the ownership evidence re-bounds the same way; an over-count
+      // list drops WHOLLY ({@link boundedChildRefs}) because a truncated
+      // owner list could silently lose the very child the PR references.
+      const closing = typeof prec.closing === "boolean" ? prec.closing : undefined;
+      const labels = boundedLinkedIssueLabels(prec.labels);
+      const childRefs = boundedChildRefs(prec.childRefs);
+      provenance.push({
+        source,
+        ref,
+        line,
+        ...(closing !== undefined ? { closing } : {}),
+        ...(labels !== undefined ? { labels } : {}),
+        ...(childRefs !== undefined ? { childRefs } : {}),
+      });
+    }
+  }
+  return {
+    id: entryId,
+    text,
+    kind: kind as RequirementLedgerEntry["kind"],
+    // Python `bool(item.get(...))` truthiness — any truthy value counts.
+    verificationRequired: Boolean(rec.verification_required),
+    truncated: Boolean(rec.truncated),
+    provenance,
+  };
+}
+
+/** Tolerantly rebuild a ledger from untrusted data; unusable input → empty.
+ * The sha is always recomputed from the surviving entries so a tampered
+ * artifact can never carry a mismatched signature. */
+export function loadLedgerFromValue(data: unknown): RequirementLedger {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return emptyLedger();
+  const rec = data as Record<string, unknown>;
+  const requirements: RequirementLedgerEntry[] = [];
+  if (Array.isArray(rec.requirements)) {
+    for (const item of rec.requirements) {
+      const entry = tolerantEntry(item);
+      if (entry !== null) requirements.push(entry);
+    }
+  }
+  let truncated = false;
+  let omitted = 0;
+  let omittedSources = 0;
+  const truncation = rec.truncation;
+  if (truncation !== null && typeof truncation === "object" && !Array.isArray(truncation)) {
+    const trec = truncation as Record<string, unknown>;
+    truncated = Boolean(trec.truncated);
+    const rawOmitted = trec.omitted_requirements;
+    if (typeof rawOmitted === "number" && Number.isInteger(rawOmitted) && rawOmitted > 0) omitted = rawOmitted;
+    const rawOmittedSources = trec.omitted_sources;
+    if (typeof rawOmittedSources === "number" && Number.isInteger(rawOmittedSources) && rawOmittedSources > 0) {
+      omittedSources = rawOmittedSources;
+    }
+  }
+  // #1749 follow-up (review round): the informational context-exclusion
+  // disclosure survives a well-formed round trip and is re-bounded here the
+  // same way extraction bounds it. Absence (every legacy artifact) is fine;
+  // a malformed disclosure is IGNORED, never an error, and it never touches
+  // `requirements` or provenance. Both serializations are accepted.
+  const contextExcluded = tolerantContextExcluded(rec.context_excluded ?? rec.contextExcluded);
+  return {
+    version: ARTIFACT_VERSION,
+    sha: computeSha(requirements),
+    requirements,
+    truncation: { truncated, omittedRequirements: omitted, omittedSources },
+    ...(contextExcluded !== undefined ? { contextExcluded } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fence-safe markdown rendering
+// ---------------------------------------------------------------------------
+
+/** Wrap text in a code span whose delimiter is strictly longer than any
+ * backtick run in it, so hostile text cannot terminate the span. */
+function codeSpan(text: string): string {
+  if (!text.includes("`")) return `\`${text}\``;
+  let maxRun = 1;
+  for (const match of text.matchAll(BACKTICK_RUN_RE)) {
+    maxRun = Math.max(maxRun, (match[0] ?? "`").length);
+  }
+  const delim = "`".repeat(maxRun + 1);
+  return `${delim} ${text} ${delim}`;
+}
+
+/** Render one entry as a single markdown bullet (control-safe). */
+function requirementLine(entry: RequirementLedgerEntry): string {
+  let text = escapeControlChars(entry.text);
+  // Escape a leading '#' so entry text can never forge a markdown heading.
+  if (text.startsWith("#")) text = `\\${text}`;
+  const entryId = isValidId(entry.id) ? entry.id : "req-" + "0".repeat(12);
+  const kind = LEDGER_KINDS.includes(entry.kind) ? entry.kind : "normative";
+  const refs: string[] = [];
+  for (const prov of entry.provenance) {
+    if (typeof prov !== "object" || prov === null) continue;
+    if (typeof prov.ref === "string" && prov.ref) refs.push(prov.ref);
+    else if (typeof prov.source === "string" && prov.source) refs.push(prov.source);
+    else refs.push("unknown");
+  }
+  const via = escapeControlChars(refs.length > 0 ? refs.join(", ") : "unknown");
+  return `- (${entryId}) ${codeSpan(text)} [${kind}] (via ${codeSpan(via)})`;
+}
+
+/** Shrink text char-safely so its UTF-8 length is <= maxBytes (never splits a
+ * multibyte character). */
+function fitToBytes(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let i = text.length;
+  while (i > 0 && Buffer.byteLength(text.slice(0, i), "utf8") > maxBytes) i -= 1;
+  return text.slice(0, i);
+}
+
+/** Render a fence-safe markdown view of a ledger. Requirements render as
+ * ``- (id) `text` [kind] (via ref)`` list items. When maxBytes is given a
+ * hard UTF-8 byte cap applies: trailing whole entries are dropped (never a
+ * character mid-codepoint) until the budget holds, the omission is always
+ * visible, and a single oversized entry is shrunk char-safely.
+ * #1749 follow-up (review round): when the ledger carries the context-
+ * exclusion disclosure it renders as one bounded meta line (same parenthetical
+ * shape as the length note), so the review corpus shows that linked documents
+ * were excluded as context instead of vanishing silently. Absent disclosure
+ * keeps the rendered view byte-identical to before. */
+export function renderRequirementLedgerMarkdown(
+  ledger: unknown,
+  maxBytes: number | null = MAX_LEDGER_MARKDOWN_BYTES,
+): string {
+  const entries: RequirementLedgerEntry[] = [];
+  const record =
+    ledger !== null && typeof ledger === "object" && !Array.isArray(ledger)
+      ? (ledger as Record<string, unknown>)
+      : null;
+  const raw = record === null ? null : record.requirements;
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const entry = tolerantEntry(item);
+      if (entry !== null) entries.push(entry);
+    }
+  }
+  // Both serializations tolerated; a malformed disclosure renders nothing
+  // (informational only — it can never break or reshape the ledger view).
+  const contextExcluded =
+    record === null ? undefined : tolerantContextExcluded(record.context_excluded ?? record.contextExcluded);
+
+  const build = (kept: RequirementLedgerEntry[], omitted: number): string => {
+    const lines: string[] = [LEDGER_HEADER, ""];
+    for (const entry of kept) lines.push(requirementLine(entry));
+    if (omitted > 0) lines.push(`(+${omitted} requirements omitted for length)`);
+    if (contextExcluded !== undefined) {
+      const listed = contextExcluded.refs.map((ref) => codeSpan(escapeControlChars(ref))).join(", ");
+      const more = contextExcluded.count - contextExcluded.refs.length;
+      const tail = listed === "" ? "" : `: ${listed}${more > 0 ? ` (+${more} more)` : ""}`;
+      lines.push(`(+${contextExcluded.count} linked documents excluded as context references${tail})`);
+    }
+    return `${lines.join("\n")}\n`;
+  };
+
+  if (maxBytes === null) return build(entries, 0);
+  const cap = Math.max(1, Math.trunc(maxBytes));
+  let shown = entries.length;
+  let doc = build(entries.slice(0, shown), 0);
+  while (Buffer.byteLength(doc, "utf8") > cap && shown > 0) {
+    shown -= 1;
+    doc = build(entries.slice(0, shown), entries.length - shown);
+  }
+  if (Buffer.byteLength(doc, "utf8") > cap) doc = fitToBytes(doc, cap);
+  return doc;
+}

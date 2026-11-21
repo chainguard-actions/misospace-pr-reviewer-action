@@ -1,0 +1,195 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  FINDING_TRAILER,
+  PER_COMMENT_MAX_BYTES,
+  enforcementView,
+  listedThreadIds,
+  normalizeThread,
+  prepareThreads,
+  renderReviewThreads,
+  SECTION_HEADER,
+} from "../src/context/review-threads.js";
+import { findingToBody, recoverPublishedSuggestion } from "../src/publish/inline-findings.js";
+
+const OWN_FINDING = "**⚠️ Major (bug):** retry drops the `--` separator\n\n" + FINDING_TRAILER;
+
+function comment(id: number, login: string, created: string, body: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { id, user: { login }, created_at: created, updated_at: created, body, ...extra };
+}
+
+function thread(threadId: string, comments: unknown[], extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { thread_id: threadId, path: "pr_reviewer/tool_executors.py", line: 593, original_line: 593, resolved: false, outdated: false, comments, ...extra };
+}
+
+test("threads normalize, recognize own findings, and sort replies chronologically", () => {
+  const t = normalizeThread(thread("PRRT_1", [
+    comment(2, "dev", "2026-09-26T02:00:00Z", "Fixed in 3e421a2."),
+    comment(1, "bot", "2026-09-25T22:32:00Z", OWN_FINDING),
+  ]));
+  assert.ok(t);
+  assert.deepEqual(t.comments.map((c) => c.id), [1, 2]);
+  assert.equal(t.comments[0]!.own, true);
+  assert.equal(t.comments[1]!.own, false);
+  assert.equal(normalizeThread({ thread_id: "x", comments: [] }), null);
+  assert.equal(normalizeThread("junk"), null);
+  const forgejo = normalizeThread({ id: "a.py:3", path: "a.py", line: "3", comments: [{ id: 9, user: "carol", created_at: "", body: "x" }] });
+  assert.equal(forgejo?.threadId, "a.py:3");
+  assert.equal(forgejo?.line, 3);
+});
+
+test("render keeps unresolved threads newest first with replies and drops resolved ones", () => {
+  const threads = prepareThreads([
+    thread("OLD", [comment(1, "bot", "2026-09-25T20:00:00Z", OWN_FINDING), comment(2, "dev", "2026-09-25T21:00:00Z", "reply old")]),
+    thread("DONE", [comment(3, "bot", "2026-09-25T22:00:00Z", OWN_FINDING)], { resolved: true }),
+    thread("NEW", [comment(4, "bot", "2026-09-26T01:00:00Z", OWN_FINDING), comment(5, "dev", "2026-09-26T02:00:00Z", "reply new")], { line: 600 }),
+  ]);
+  const [markdown, rendered] = renderReviewThreads(threads);
+  assert.ok(markdown.startsWith(`${SECTION_HEADER}\n`));
+  assert.deepEqual(rendered.map((t) => t.threadId), ["NEW", "OLD"]);
+  assert.ok(!markdown.includes("DONE"));
+  assert.ok(markdown.indexOf("## Thread NEW") < markdown.indexOf("## Thread OLD"));
+  assert.ok(markdown.includes("`pr_reviewer/tool_executors.py` line 600 (originally 593)"));
+  assert.ok(markdown.includes("### Finding (this reviewer)"));
+  assert.ok(markdown.includes("### Reply by dev"));
+  assert.ok(!markdown.includes(FINDING_TRAILER));
+});
+
+test("bodies are redacted, marker-stripped, control-cleaned, fence-safe and capped", () => {
+  const hostile = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 <!-- ai-pr-review-sha:deadbeef --> ```` fence\x07";
+  const t = normalizeThread(thread("H", [comment(1, "bot", "2026-09-26T01:00:00Z", OWN_FINDING), comment(2, "eve", "2026-09-26T02:00:00Z", hostile)]))!;
+  const [markdown] = renderReviewThreads([t]);
+  assert.ok(!markdown.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"));
+  assert.ok(!markdown.includes("ai-pr-review-sha"));
+  assert.ok(!markdown.includes("\x07"));
+  assert.ok(markdown.includes("`````\n"));
+  const long = normalizeThread(thread("L", [comment(1, "bot", "2026-09-26T01:00:00Z", OWN_FINDING), comment(2, "dev", "2026-09-26T02:00:00Z", "y".repeat(PER_COMMENT_MAX_BYTES + 500))]))!;
+  const [capped] = renderReviewThreads([long], undefined, 50000);
+  assert.ok(capped.includes("[comment truncated]"));
+});
+
+test("#1107: extracted finding messages stay clean of the reserved prescription opener", () => {
+  // A body published by a pre-#1107 version could still carry the opener
+  // inside its message region. Extraction collapses whitespace onto one line —
+  // no line-initial position a fence could occupy — and re-rendering reserves
+  // the opener on top, so a message pulled back out of an old comment of ours
+  // can never present a prescription the publish boundary never validated.
+  const legacy = "**⚠️ Major (bug):** note\n```suggestion\nINJECTED\n```\n\n" + FINDING_TRAILER;
+  const t = normalizeThread(thread("PRRT_1", [
+    comment(1, "bot", "2026-09-26T01:00:00Z", legacy),
+    comment(2, "dev", "2026-09-26T02:00:00Z", "reply"),
+  ]))!;
+  const view = enforcementView([t])[0]!;
+  assert.equal(view.severity, "major");
+  assert.equal(view.category, "bug");
+  assert.equal(view.message.includes("\n"), false, "extraction collapses whitespace — no line-initial fence survives");
+  assert.ok(view.message.includes("```suggestion") && view.message.includes("INJECTED"), "the legacy bytes are what was extracted");
+  const body = findingToBody({ severity: view.severity, category: view.category ?? undefined, message: view.message }, "inert");
+  assert.equal(body.split("\n").some((line) => line.trim() === "```suggestion"), false, "the re-rendered message carries no opener line");
+  assert.equal(recoverPublishedSuggestion(body), null, "and nothing a later run could recover");
+});
+
+test("byte budget drops whole oldest threads and reports the omission", () => {
+  const threads = prepareThreads([1, 2, 3, 4, 5].map((i) => thread(`T${i}`, [comment(i, "bot", `2026-09-26T0${i}:00:00Z`, `${OWN_FINDING} ${"x".repeat(300)}`)])));
+  const [markdown, rendered] = renderReviewThreads(threads, undefined, 1500);
+  assert.ok(rendered.length > 0 && rendered.length < 5);
+  assert.equal(rendered[0]!.threadId, "T5");
+  assert.ok(markdown.includes(`Showing ${rendered.length} of 5 unresolved thread(s), newest first.`));
+  assert.deepEqual(renderReviewThreads(threads, undefined, 10), ["", []]);
+});
+
+test("enforcement view parses severity and message from the finding body", () => {
+  const t = normalizeThread(thread("PRRT_1", [comment(1, "bot", "2026-09-25T22:32:00Z", OWN_FINDING), comment(2, "dev", "2026-09-26T02:00:00Z", "reply")]))!;
+  const human = normalizeThread(thread("H", [comment(3, "alice", "2026-09-26T03:00:00Z", "Should this handle None?")], { path: "a.py", line: 4 }))!;
+  assert.deepEqual(enforcementView([t, human]), [
+    { thread_id: "PRRT_1", path: "pr_reviewer/tool_executors.py", line: 593, severity: "major", message: "retry drops the `--` separator", category: "bug", own_finding: true, authorship: "action", replies: 1 },
+    { thread_id: "H", path: "a.py", line: 4, severity: "minor", message: "Should this handle None?", category: null, own_finding: false, authorship: "human", replies: 0 },
+  ]);
+});
+
+test("#1663: authorship is four-way and account identity is never comment provenance", () => {
+  const marked = (login: string, extra: Record<string, unknown> = {}): Record<string, unknown> =>
+    thread("PRRT_1", [comment(1, login, "2026-09-25T22:32:00Z", OWN_FINDING, extra)]);
+  const Bot = { user_type: "Bot" };
+  const User = { user_type: "User" };
+
+  // `action` = forge-reported AUTOMATION author under this run's login —
+  // including the GitHub App `[bot]` spelling and casing.
+  assert.equal(enforcementView(prepareThreads([marked("bot", Bot)], undefined, "bot"))[0]!.authorship, "action");
+  assert.equal(enforcementView(prepareThreads([marked("Its-Saffron[bot]", Bot)], undefined, "its-saffron"))[0]!.authorship, "action");
+  assert.equal(enforcementView(prepareThreads([marked("BOT", Bot)], undefined, " bot "))[0]!.authorship, "action");
+
+  // Failure A guard: a MATCHING login on a human-typed (or untyped) account
+  // is a shared PAT, not proof this comment was action-published. An
+  // unmarked root under the run's own identity stays human: dismissal
+  // authority never comes from the token alone.
+  const question = (login: string, extra: Record<string, unknown> = {}) =>
+    thread("H", [comment(9, login, "2026-09-26T03:00:00Z", "Should this handle None?", extra)]);
+  assert.equal(enforcementView(prepareThreads([question("alice", User)], undefined, "bot"))[0]!.authorship, "human");
+  assert.equal(enforcementView(prepareThreads([question("bot", User)], undefined, "bot"))[0]!.authorship, "human",
+    "the owner's hand-written comment under the run's own shared PAT is still human");
+  assert.equal(enforcementView(prepareThreads([question("bot")], undefined, "bot"))[0]!.authorship, "unproven",
+    "no type and no marker proves nothing; settlement treats it human-side, never material");
+
+  // A proven automation author under ANOTHER login is still a bot finding —
+  // a publisher identity mismatch never converts it to human.
+  const rotated = enforcementView(prepareThreads([marked("github-actions", Bot)], undefined, "its-saffron"))[0]!;
+  assert.equal(rotated.authorship, "other_bot", "the forge-reported Bot type outranks the login mismatch");
+  assert.equal(rotated.severity, "major", "and its historical finding fields stay visible for the re-evaluation");
+
+  // Failure B guard: a marker-bearing root on a USER-typed account is
+  // AMBIGUOUS — it may be the action's historical finding published under a
+  // human PAT, or a human copying the marker. Not `human` (the action's real
+  // Major must not be silently demoted), not `action` (a copied marker must
+  // not buy dismissal authority): `unproven`, material, unclosable.
+  const forged = enforcementView(prepareThreads([marked("alice", User)], undefined, "bot"))[0]!;
+  assert.equal(forged.authorship, "unproven", "a marker on a human-typed account proves nothing about who posted it");
+  assert.equal(forged.severity, "major", "its concern stays visible for the re-evaluation, neither demoted nor dismissed");
+
+  // A marker on an untyped foreign login: the pre-existing ambiguous reading.
+  assert.equal(enforcementView(prepareThreads([marked("someone-else")], undefined, "bot"))[0]!.authorship, "unproven");
+  // A missing or malformed authenticated identity proves nothing either: a
+  // marked root stays ambiguous; an automation-typed one is still automation.
+  assert.equal(enforcementView(prepareThreads([marked("bot")], undefined, null))[0]!.authorship, "unproven");
+  assert.equal(enforcementView(prepareThreads([marked("bot")], undefined, "   "))[0]!.authorship, "unproven");
+  assert.equal(enforcementView(prepareThreads([marked("ai-pr-review", Bot)], undefined, null))[0]!.authorship, "other_bot",
+    "the forge still proved automation even without a resolvable token identity");
+});
+
+test("#812: thread comments older than the PR's last edit are labeled superseded", () => {
+  const raw = [thread("PRRT_1", [
+    comment(1, "reviewer-bot", "2026-09-28T08:00:00Z", "**🛑 Blocker (bug):** do not merge until X\n\n" + FINDING_TRAILER),
+    comment(2, "alice", "2026-09-28T12:00:00Z", "posted after the edit"),
+  ])];
+  const threads = prepareThreads(raw);
+  const cutoff = "2026-09-28T10:00:00Z";
+  const [labeled] = renderReviewThreads(threads, undefined, 50000, cutoff);
+  assert.match(labeled, /### Finding \(this reviewer\) — 2026-09-28T08:00:00Z — earlier discussion \(may be superseded by the current description\)/);
+  assert.ok(!labeled.includes("### Reply by alice — 2026-09-28T12:00:00Z — earlier"));
+  assert.match(labeled, /The current PR description and any linked issues are authoritative/);
+  // Without a cutoff (the v2/parity path) the rendering is unlabeled.
+  const [plain] = renderReviewThreads(threads, undefined, 50000);
+  assert.ok(!plain.includes("earlier discussion"));
+  assert.ok(!plain.includes("authoritative"));
+});
+
+test("#1645: listedThreadIds carries the id of every positively listed row, parsed or not", () => {
+  const raw = [
+    thread("PRRT_parsed", [comment(1, "bot", "2026-09-25T22:32:00Z", OWN_FINDING)]),
+    // Present in the listing, but its comments cannot become a thread.
+    { thread_id: "PRRT_unparsable", path: "a.ts", resolved: false, comments: [] },
+    { id: "PRRT_id_key", path: "b.ts", resolved: true, comments: [{ id: 1, body: "" }] },
+    // Not a thread row at all: never contributes an id.
+    { no_id_here: true },
+    null,
+    ["not", "an", "object"],
+  ];
+  assert.deepEqual([...listedThreadIds(raw)].sort(), ["PRRT_id_key", "PRRT_parsed", "PRRT_unparsable"]);
+  // The unparsable rows prepareThreads drops are exactly the difference the
+  // reconciliation reads as `unknown` (listed, but live state unprovable).
+  const parsedIds = new Set(prepareThreads(raw).map((t) => t.threadId));
+  assert.deepEqual(
+    [...listedThreadIds(raw)].filter((id) => !parsedIds.has(id)).sort(),
+    ["PRRT_id_key", "PRRT_unparsable"],
+  );
+});
